@@ -65,11 +65,11 @@ feed both gate values in through a stub instead, and read their limits from
 `thresholds.py`, so retuning a threshold moves the tests with it.
 
 CI runs the suite on every push and pull request across Python 3.10 through 3.14, so the
-version floor above is checked rather than claimed.
+version floor above is checked rather than claimed. Dependencies are pinned, so a green
+run a month from now means the same thing it means today.
 
-Still outstanding: `requirements.txt` pins nothing (`>=` only, so two checkouts — and two
-CI runs a week apart — can resolve different versions), and every number in
-`thresholds.py` is still the guide author's rather than yours.
+Still outstanding: every number in `thresholds.py` is the guide author's rather than
+yours.
 
 ## Files
 
@@ -91,6 +91,8 @@ CI runs a week apart — can resolve different versions), and every number in
 | `mock_judge.py` | — | Keyless stand-in for Jev so the funnel can be tested. Never trade against it. |
 | `prompts/` | bots | Paste-ready prompts: HANDOFF, SOCIAL, CHIEF, SIZE, FILLS, RISK. |
 | `tests/` | — | `python -m pytest -q`: filter order, question wire shape, pick gating, book, a full faked cycle. |
+| `requirements.in` | — | The five direct dependencies. Edit this one. |
+| `requirements.txt` | — | Compiled lock, fully pinned. Install this one. Never hand-edit. |
 
 ## Setup
 
@@ -115,6 +117,20 @@ The package is installed; the wrong Python is reading it. `python -m pytest` use
 active interpreter by definition and cannot pick the wrong one. If you want the bare name
 back, run `rehash` after `source .venv/bin/activate`, and confirm with
 `python -c "import sys; print(sys.executable)"`.
+
+### Dependencies
+
+`requirements.txt` is a compiled lock: every package pinned, transitive ones included,
+with markers so one file covers Python 3.10 through 3.14 on Linux and mac. Do not edit it
+by hand. Add or move a dependency in `requirements.in`, then recompile:
+
+```bash
+uv pip compile requirements.in -o requirements.txt --universal --python-version 3.10
+```
+
+Compiling at 3.10 rather than your local version is the point: `pytest` needs `tomli` and
+`exceptiongroup` below 3.11, and a lock frozen on a newer interpreter simply omits them.
+CI recompiles and diffs, so a `requirements.in` edit without a recompile fails the build.
 
 ### 1. The judge (one machine, holds the key)
 

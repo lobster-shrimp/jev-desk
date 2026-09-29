@@ -1,0 +1,14 @@
+# Direct dependencies and the range the desk is compatible with.
+# requirements.txt is compiled from this file and is the one you install.
+# Regenerate after any edit here:
+#
+#     uv pip compile requirements.in -o requirements.txt --universal --python-version 3.10
+#
+typesafe-sdk>=0.7
+fastapi>=0.110
+uvicorn>=0.29
+requests>=2.31
+websocket-client>=1.7
+
+# testing only, but the desk ships its tests, so it stays in the one file
+pytest>=8
