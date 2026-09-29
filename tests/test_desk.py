@@ -17,6 +17,7 @@ from filter import free_kill, trade_kill, chain_kill, soft_kill   # noqa: E402
 from pick import pick, summary                        # noqa: E402
 from mock_judge import mock_judge_fn                  # noqa: E402
 from questions import SETS                            # noqa: E402
+from thresholds import PICK_MIN_WORTH, PICK_MIN_CONF, NO_SOCIAL_CUT   # noqa: E402
 import main as shift                                  # noqa: E402
 import collect                                        # noqa: E402
 
@@ -91,21 +92,76 @@ def test_every_set_answers_in_wire_shape():
                 assert 0 <= a["noul"] <= 1
 
 
-def test_pick_builds_options_from_candidates_and_gates_on_worth():
-    survivors = []
-    for i in range(3):
+def _survivors(n=3):
+    out = []
+    for i in range(n):
         d = {**tok(i), "chain": "solana"}
         ans = {"shape": {"choice": "crowd", "probabilities": {"crowd": 0.7 + i / 10}},
                "concentration_is_exit_risk": {"noul": 0.2},
                "authority_risk": {"choice": "renounced"}}
-        survivors.append((d, ans))
-    s = summary(*survivors[0])
+        out.append((d, ans))
+    return out
+
+
+def _pick_judge(worth, conf, choice="T1", tickers=("T0", "T1", "T2"), seen=None):
+    """A stand-in for the pick call with both gate inputs set explicitly.
+
+    mock_judge is deterministic but its worth noul lands at 0.584, just under
+    PICK_MIN_WORTH, so driving these tests through it asserts nothing. Set the
+    two gate values here and the outcome is a fact, not a coin toss.
+    """
+    def judge(question_set, state):
+        assert question_set == "pick"
+        if seen is not None:
+            seen.append(state)
+        rest = round((1 - conf) / max(len(tickers) - 1, 1), 3)
+        return {"model": "stub-pick",
+                "answers": {
+                    "best": {"type": "choice", "choice": choice, "confidence": conf,
+                             "probabilities": {t: (conf if t == choice else rest)
+                                               for t in tickers}},
+                    "worth_trading_at_all": {"type": "noul", "noul": worth}},
+                "usage": {}}
+    return judge
+
+
+def test_summary_is_built_from_answers_not_the_dossier():
+    s = summary(*_survivors(1)[0])
     assert "solana" in s and "no usable X account" in s
-    order = pick(JUDGE, survivors)
-    if order is not None:
-        assert order["token"]["ticker"] in {"T0", "T1", "T2"}
-        assert order["size_factor"] == 0.6           # no social -> NO_SOCIAL_CUT
-        assert 0 <= order["confidence"] <= 1
+    assert "crowd 0.70" in s and "concentration risk 0.20" in s
+    assert "authority renounced" in s
+
+
+def test_pick_builds_one_option_per_candidate():
+    seen = []
+    pick(_pick_judge(worth=0.9, conf=0.9, seen=seen), _survivors())
+    assert len(seen) == 1                            # one call, all candidates at once
+    assert [c["ticker"] for c in seen[0]["candidates"]] == ["T0", "T1", "T2"]
+    assert all(c["summary"] for c in seen[0]["candidates"])
+
+
+def test_pick_returns_the_chosen_token_when_both_gates_pass():
+    order = pick(_pick_judge(worth=PICK_MIN_WORTH, conf=PICK_MIN_CONF), _survivors())
+    assert order is not None                         # both gates are inclusive at the limit
+    assert order["token"]["ticker"] == "T1"
+    assert order["token"]["address"] == "Addr1" and order["token"]["chain"] == "solana"
+    assert order["size_factor"] == NO_SOCIAL_CUT     # no X account on any candidate
+    assert order["confidence"] == PICK_MIN_CONF
+    assert order["runner_up"][0][0] in {"T0", "T2"}
+
+
+def test_pick_declines_below_either_gate():
+    s = _survivors()
+    assert pick(_pick_judge(worth=PICK_MIN_WORTH - 0.01, conf=0.9), s) is None
+    assert pick(_pick_judge(worth=0.9, conf=PICK_MIN_CONF - 0.01), s) is None
+
+
+def test_pick_declines_when_the_choice_is_not_a_candidate():
+    assert pick(_pick_judge(worth=0.9, conf=0.9, choice="GHOST"), _survivors()) is None
+
+
+def test_pick_declines_on_no_survivors():
+    assert pick(_pick_judge(worth=0.9, conf=0.9), []) is None
 
 
 def test_unknown_set_is_422_not_retry():
@@ -132,15 +188,25 @@ def test_book_one_position_and_reasoned_bench():
 
 
 # ---- the whole shift, faked collectors ---------------------------------------
+# The cycle fixture is deliberately mixed so that every stage of the funnel kills
+# something. A uniform fixture leaves the free/trade/chain counters at zero, and an
+# accounting assertion over three always-zero counters proves nothing.
+YOUNG   = (1, 2)      # -> free kill, "age"
+THIN    = (3,)        # -> free kill, "liquidity"
+NO_SELL = "T4"        # -> trade kill, "no_sells"
+WHALE   = "T5"        # -> chain kill, "top_wallet"
+
+
 class FakeFomo:
     def token(self): return "x"
     def tokens(self, ids):
         rows = {}
         for i, tid in enumerate(ids):
-            rows[tid] = {"symbol": f"T{i}", "mcap": 300_000 + i * 1000, "liq": 48_000,
+            rows[tid] = {"symbol": f"T{i}", "mcap": 300_000 + i * 1000,
+                         "liq": 1_000 if i in THIN else 48_000,
                          "vol24": 610_000, "price": 0.001, "holders": 310,
                          "change": {300: 0.04, 3600: 0.22, 14400: 0.4, 86400: 0.61},
-                         "created": NOW_MS - 42 * 60_000}
+                         "created": NOW_MS - (5 if i in YOUNG else 42) * 60_000}
         return rows
 
 
@@ -157,23 +223,35 @@ def test_run_once_shadow_never_takes_book(monkeypatch):
     book.release()
     ids = [f"Addr{i}:1399811149" for i in range(12)]
     monkeypatch.setattr(shift, "universe", lambda: ids)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
-                                                          "buys_h6": 900, "sells_h6": 400,
-                                                          "trades_h24": 4000})
-    monkeypatch.setattr(shift, "dossier", lambda t: {**t, "chain": "solana", "top_10_percent": 30,
-                                                     "top_wallet_percent": 0.02,
-                                                     "developer_holding_percentage": 2,
-                                                     "gt_score_details": None, "is_honeypot": None,
-                                                     "mint_authority": None, "freeze_authority": None,
-                                                     "description": "a token", "x_handle": None})
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {
+        "buys_h1": 540, "sells_h1": 0 if t["ticker"] == NO_SELL else 120,
+        "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", lambda t: {
+        **t, "chain": "solana", "top_10_percent": 30,
+        "top_wallet_percent": 0.2 if t["ticker"] == WHALE else 0.02,
+        "developer_holding_percentage": 2,
+        "gt_score_details": None, "is_honeypot": None,
+        "mint_authority": None, "freeze_authority": None,
+        "description": "a token", "x_handle": None})
     desk = FakeDesk()
     order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
     assert order is None                                   # shadow never returns an order
     assert book.held() is None                             # and never takes the book
     assert stats["seen"] == 12 and stats["judged"] >= 1
-    # every token either survived, was benched, or was killed with a named reason
-    killed = sum(sum(v.values()) for k, v in stats.items() if isinstance(v, dict))
-    assert killed + len(desk.shadow) * 0 <= 12
+    # each stage kills the tokens built to die there, and names the reason
+    assert stats["free"] == {"age": len(YOUNG), "liquidity": len(THIN)}
+    assert stats["trade"] == {"no_sells": 1}
+    assert stats["chain"] == {"top_wallet": 1}
+    # Every token leaves the funnel exactly once: benched on arrival, killed with a
+    # named reason at one of the three pre-judge stages, or judged. A judged token
+    # then either soft-kills or survives. No token may vanish unaccounted for.
+    killed = {k: sum(stats[k].values()) for k in ("free", "trade", "chain", "soft")}
+    assert (stats["benched"] + killed["free"] + killed["trade"] + killed["chain"]
+            + stats["judged"]) == stats["seen"]
+    assert killed["soft"] <= stats["judged"]
+    # shadow writes one row per would-be trade and sends nothing to the seats
+    assert desk.sent == []
+    assert len(desk.shadow) <= 1
 
 
 def test_held_position_means_no_scan(monkeypatch):

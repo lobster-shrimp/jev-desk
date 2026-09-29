@@ -29,14 +29,18 @@ week, read the rows where you disagree, move the numbers, and only then consider
 Shadow-first and unproven. The funnel runs end to end, but only against faked collectors
 and a mock judge. Nothing in this repo has been validated against a live market.
 
-What the 11 tests cover (`python -m pytest -q`, no network, no key):
+What the 16 tests cover (`python -m pytest -q`, no network, no key):
 
 - kill ordering and reason strings for all four filter stages
 - wire shape of the `market`, `solana`, `bsc` and `robinhood` question sets
-- `pick` option building, the `worth_trading_at_all` gate, the `NO_SOCIAL_CUT` factor
+- `pick`: one option per candidate, both gates at their inclusive limit, declines below
+  either gate, declines on an off-list choice, declines on no survivors, `NO_SOCIAL_CUT`
 - a malformed question set raising instead of retrying
 - book invariants: one position at a time, release, reasoned bench
-- two full cycles: shadow never takes the book, and a held position skips the scan
+- two full cycles: shadow never takes the book, and a held position skips the scan. The
+  cycle fixture is mixed on purpose so each stage kills something, and the test asserts
+  every token is accounted for exactly once across bench, the three named kill stages and
+  the judge.
 - `collect.normalise` and `collect.clean_handle`
 
 What is not covered:
@@ -54,13 +58,11 @@ What is not covered:
   Solana only, so that routing is untested.
 - **`desk.py` entirely** — bank, Telegram, seat handoff — and `run.py`'s flags.
 
-Two assertions are weaker than they look, and should be tightened before the suite is
-trusted as a gate:
-
-- `test_pick_builds_options_from_candidates_and_gates_on_worth` wraps its assertions in
-  `if order is not None`, so it passes vacuously whenever the gate declines.
-- the final line of `test_run_once_shadow_never_takes_book` multiplies a term by zero,
-  which makes the comparison a no-op.
+A note on the `pick` tests: `mock_judge` is deterministic, and for the three-candidate
+fixture its `worth_trading_at_all` lands at 0.584 against a `PICK_MIN_WORTH` of 0.60. Any
+test that drives `pick` through the mock therefore only ever sees `None`. The gate tests
+feed both gate values in through a stub instead, and read their limits from
+`thresholds.py`, so retuning a threshold moves the tests with it.
 
 Also outstanding: no CI, `requirements.txt` pins nothing (`>=` only, so installs float and
 two checkouts can resolve different versions), and every number in `thresholds.py` is
@@ -93,7 +95,7 @@ still the guide author's rather than yours.
 python3 -m venv .venv && source .venv/bin/activate      # python 3.10+
 pip install -r requirements.txt
 cp .env.example .env                                     # fill it in, then: set -a; source .env; set +a
-python -m pytest -q                                      # should print "11 passed" — no keys needed
+python -m pytest -q                                      # should print "16 passed" — no keys needed
 ```
 
 Always run tools as `python -m <tool>` rather than the bare executable. A bare `pytest`
