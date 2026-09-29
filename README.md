@@ -24,6 +24,48 @@ carries a referral link and unverifiable performance claims. Run it in shadow mo
 week, read the rows where you disagree, move the numbers, and only then consider
 `--live`. Nothing here is financial advice.
 
+## Project state
+
+Shadow-first and unproven. The funnel runs end to end, but only against faked collectors
+and a mock judge. Nothing in this repo has been validated against a live market.
+
+What the 11 tests cover (`python -m pytest -q`, no network, no key):
+
+- kill ordering and reason strings for all four filter stages
+- wire shape of the `market`, `solana`, `bsc` and `robinhood` question sets
+- `pick` option building, the `worth_trading_at_all` gate, the `NO_SOCIAL_CUT` factor
+- a malformed question set raising instead of retrying
+- book invariants: one position at a time, release, reasoned bench
+- two full cycles: shadow never takes the book, and a held position skips the scan
+- `collect.normalise` and `collect.clean_handle`
+
+What is not covered:
+
+- **Every network path.** `universe`, `shortlist`, `trade_counts` and `dossier` are
+  monkeypatched in the cycle tests. `fomo_api.py` — CDP, Privy extraction, refresh — has
+  no coverage at all, and the FOMO `filterTokens` envelope is undocumented and unverified.
+- **The real judge.** `judge.py` and `server.py` never run under test, so `DESK_SECRET`
+  auth and `/book/release` are unproven. `mock_judge.py` stands in everywhere.
+- **The `social` question set.** `FakeDesk.read_x` returns `None`, so the social branch in
+  `run_once` is never entered and every test token carries the `NO_SOCIAL_CUT`.
+- **Live mode.** Every cycle test passes `shadow=True` or exercises the held path, so the
+  `book.take(order)` at the end of `run_once` is never reached.
+- **Base.** `CHAIN_SET` routes net 8453 to the `bsc` set deliberately, but the fixtures are
+  Solana only, so that routing is untested.
+- **`desk.py` entirely** — bank, Telegram, seat handoff — and `run.py`'s flags.
+
+Two assertions are weaker than they look, and should be tightened before the suite is
+trusted as a gate:
+
+- `test_pick_builds_options_from_candidates_and_gates_on_worth` wraps its assertions in
+  `if order is not None`, so it passes vacuously whenever the gate declines.
+- the final line of `test_run_once_shadow_never_takes_book` multiplies a term by zero,
+  which makes the comparison a no-op.
+
+Also outstanding: no CI, `requirements.txt` pins nothing (`>=` only, so installs float and
+two checkouts can resolve different versions), and every number in `thresholds.py` is
+still the guide author's rather than yours.
+
 ## Files
 
 | file | seat | what it does |
