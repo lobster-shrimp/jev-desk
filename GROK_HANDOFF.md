@@ -177,21 +177,23 @@ Go live only with `CONFIRM_LIVE=yes python run.py --live`, after the week.
 
 ## 9. Settle before live
 
-1. **`prompts/RISK.txt` says RISK calls `book.release()`.** That is a Python function the
-   cloud bots cannot reach. They must `POST $BASE/book/release`. The README says so; the
-   prompt does not. Fix the prompt.
-2. **Every bot holds `DESK_SECRET`, and it authorises `/book/release`.** "Only RISK
+1. **Every bot holds `DESK_SECRET`, and it authorises `/book/release`.** "Only RISK
    releases" is a convention, not an enforced rule. Any seat, or anything that leaks the
    secret, can free the book mid-position. Consider a separate release secret.
-3. **Can a Grok Bot serve an HTTP endpoint?** `SOCIAL_URL` and `SEATS_WEBHOOK_URL` both
+2. **Can a Grok Bot serve an HTTP endpoint?** `SOCIAL_URL` and `SEATS_WEBHOOK_URL` both
    assume so. This was not checked. If they cannot, SOCIAL is permanently absent (every
    ticket shrinks by `NO_SOCIAL_CUT`) and orders only reach the seats through
    `outbox/orders/`.
-4. **Nothing exercises the FOMO order path.** FILLS sends real market orders and no test
+3. **Nothing exercises the FOMO order path.** FILLS sends real market orders and no test
    or dry run has.
-5. **RISK's volume source is unspecified.** The prompt needs `volume.h24` and `volume.h6`
+4. **RISK's volume source is unspecified.** The prompt needs `volume.h24` and `volume.h6`
    but does not say where they come from.
-6. **`order_id` is a per-second timestamp.** Two orders in the same second share an id.
+5. **`order_id` is a per-second timestamp.** Two orders in the same second share an id.
+
+Resolved: `prompts/RISK.txt` used to tell RISK to call the Python function
+`book.release()`, which the cloud bots cannot reach. It now has RISK `POST` to
+`/book/release` with `DESK_SECRET`, release only when flat, retry on failure, and report
+the book as still held rather than claim it is free if the call never returns 200.
 
 ## 10. If something breaks
 
