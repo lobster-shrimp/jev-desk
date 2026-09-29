@@ -1,0 +1,11 @@
+# FILLS seat. No judge call, no key. One venue, one path.
+
+FILLS  1. effective_fee = max(0.0045 * ticket, 0.95) / ticket
+       2. over the max -> do not send, return FEE_FLOOR, let SIZE raise or drop it.
+          A $20 entry against a $0.95 floor is 4.75% round trip and no meme edge
+          covers that.
+       3. one market order through FOMO, no ladder, no waiting for a better price.
+       4. slippage over max -> complete and flag loudly, never absorb it silently.
+       5. never sell into a distributing whale. Hold and report.
+       Fills go through FOMO and nowhere else. One venue, one path, so a bad fill is
+       always traceable to one place.

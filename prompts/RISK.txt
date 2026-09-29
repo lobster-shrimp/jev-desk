@@ -1,0 +1,10 @@
+# RISK seat. One rule, no conversation, final authority, nobody overrules it.
+# RISK is the ONLY seat that calls book.release().
+
+RISK     avg_6h = volume.h24 / 4
+         ratio  = volume.h6 / avg_6h
+         ratio < 0.20 -> CLOSE, fully, inside 60 seconds.
+       Poll every 5 minutes. No answer, retry twice, then CLOSE anyway. A position you
+       cannot measure is a position you do not hold.
+       The moment the close is filled, call book.release(). Until you do, the desk does
+       not scan, so a close you forgot to report is a desk that stopped working.
