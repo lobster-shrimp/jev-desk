@@ -64,9 +64,12 @@ test that drives `pick` through the mock therefore only ever sees `None`. The ga
 feed both gate values in through a stub instead, and read their limits from
 `thresholds.py`, so retuning a threshold moves the tests with it.
 
-Also outstanding: no CI, `requirements.txt` pins nothing (`>=` only, so installs float and
-two checkouts can resolve different versions), and every number in `thresholds.py` is
-still the guide author's rather than yours.
+CI runs the suite on every push and pull request across Python 3.10 through 3.14, so the
+version floor above is checked rather than claimed.
+
+Still outstanding: `requirements.txt` pins nothing (`>=` only, so two checkouts — and two
+CI runs a week apart — can resolve different versions), and every number in
+`thresholds.py` is still the guide author's rather than yours.
 
 ## Files
 
