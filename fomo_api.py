@@ -128,9 +128,12 @@ class Fomo:
                 raise FomoAuthError(f"FOMO {r.status_code}: log into fomo.family again")
         r.raise_for_status()
         body = r.json()
-        # be tolerant about the envelope: list of rows, or {id: row}, or {"data": [...]}
-        if isinstance(body, dict) and "data" in body:
-            body = body["data"]
+        # be tolerant about the envelope: list of rows, or {id: row}, or {"data": [...]} or {"responseObject": [...]}
+        if isinstance(body, dict):
+            if "responseObject" in body:
+                body = body["responseObject"]
+            elif "data" in body:
+                body = body["data"]
         if isinstance(body, dict):
             return {k: v for k, v in body.items() if isinstance(v, dict)}
         rows = {}
