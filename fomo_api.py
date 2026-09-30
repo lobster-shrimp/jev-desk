@@ -118,15 +118,37 @@ class Fomo:
         return out
 
     def _filter_tokens(self, chunk: list[str]) -> dict[str, dict]:
-        r = self.s.post(f"{FOMO_API}/proxy/filterTokens", json=chunk, timeout=30,
-                        headers={"Authorization": f"Bearer {self.token()}"})
-        if r.status_code in (401, 403):
-            log.info("FOMO bearer expired, refreshing out of Chrome")
-            r = self.s.post(f"{FOMO_API}/proxy/filterTokens", json=chunk, timeout=30,
-                            headers={"Authorization": f"Bearer {self.token(force=True)}"})
-            if r.status_code in (401, 403):
-                raise FomoAuthError(f"FOMO {r.status_code}: log into fomo.family again")
-        r.raise_for_status()
+        # Retry logic for transient network errors
+        max_retries = 1
+        for attempt in range(max_retries + 1):
+            try:
+                r = self.s.post(f"{FOMO_API}/proxy/filterTokens", json=chunk, timeout=30,
+                                headers={"Authorization": f"Bearer {self.token()}"})
+                if r.status_code in (401, 403):
+                    log.info("FOMO bearer expired, refreshing out of Chrome")
+                    r = self.s.post(f"{FOMO_API}/proxy/filterTokens", json=chunk, timeout=30,
+                                    headers={"Authorization": f"Bearer {self.token(force=True)}"})
+                    if r.status_code in (401, 403):
+                        raise FomoAuthError(f"FOMO {r.status_code}: log into fomo.family again")
+                # Retry on 502 Bad Gateway
+                if r.status_code == 502 and attempt < max_retries:
+                    log.warning("FOMO 502 Bad Gateway, retrying (attempt %d/%d)", attempt + 1, max_retries + 1)
+                    time.sleep(1)
+                    continue
+                r.raise_for_status()
+                break
+            except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
+                if attempt < max_retries:
+                    log.warning("Connection error on filterTokens: %s, retrying (attempt %d/%d)", 
+                               e, attempt + 1, max_retries + 1)
+                    # Close adapters to reset connection pool; session will reconnect on next request
+                    for adapter in self.s.adapters.values():
+                        adapter.close()
+                    time.sleep(1)
+                    continue
+                else:
+                    raise
+        
         body = r.json()
         # be tolerant about the envelope: list of rows, or {id: row}, or {"data": [...]} or {"responseObject": [...]}
         if isinstance(body, dict):
@@ -138,12 +160,45 @@ class Fomo:
             return {k: v for k, v in body.items() if isinstance(v, dict)}
         rows = {}
         for m in body or []:
-            tid = m.get("id") or m.get("tokenId") or (
-                f"{m.get('address')}:{m.get('networkId') or m.get('netId')}"
-                if m.get("address") else None)
-            if tid:
-                rows[tid] = m
+            # Handle nested token structure: live API returns {token: {address, networkId, symbol, ...}}
+            token_data = m.get("token") if isinstance(m.get("token"), dict) else None
+            if token_data:
+                # Nested structure - extract tid from token.address:token.networkId
+                tid = (f"{token_data.get('address')}:{token_data.get('networkId') or token_data.get('netId')}"
+                       if token_data.get('address') else None)
+                if tid:
+                    # Flatten the nested structure for _row processing
+                    rows[tid] = self._flatten_nested_token(m, token_data)
+            else:
+                # Flat structure (backward compatibility)
+                tid = m.get("id") or m.get("tokenId") or (
+                    f"{m.get('address')}:{m.get('networkId') or m.get('netId')}"
+                    if m.get("address") else None)
+                if tid:
+                    rows[tid] = m
         return rows
+
+    @staticmethod
+    def _flatten_nested_token(m: dict, token_data: dict) -> dict:
+        """Flatten nested {token: {...}} structure to flat dict for _row processing."""
+        flattened = dict(m)  # Copy top-level fields
+        # Map nested token fields to flat structure
+        flattened.update({
+            "address": token_data.get("address"),
+            "networkId": token_data.get("networkId") or token_data.get("netId"),
+            "symbol": token_data.get("symbol") or token_data.get("ticker"),
+            "marketCap": token_data.get("marketCap") or token_data.get("mcap"),
+            "liquidity": token_data.get("liquidity") or token_data.get("liq"),
+            "volume24": token_data.get("volume24") or token_data.get("volume24h"),
+            "priceUSD": token_data.get("priceUSD") or token_data.get("price"),
+            "holders": token_data.get("holders") or token_data.get("holderCount"),
+            "createdAt": token_data.get("createdAt") or token_data.get("created"),
+        })
+        # Copy change fields if present
+        for change_key in CHANGE_WINDOWS.keys():
+            if change_key in token_data:
+                flattened[change_key] = token_data[change_key]
+        return flattened
 
     @staticmethod
     def _row(m: dict) -> dict:

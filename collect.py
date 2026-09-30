@@ -48,8 +48,9 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2) -> list[str]:
                 resp = requests.get(f"{GT}/networks/{net}/new_pools",
                                     params={"page": page}, headers=UA, timeout=20)
                 if resp.status_code == 429:
-                    log.warning("GeckoTerminal 429 on %s page %s, stopping universe", net, page)
-                    return ids                  # back off a full minute upstream, do not retry here
+                    # Stop paging this network only, preserve IDs from other nets/pages
+                    log.warning("GeckoTerminal 429 on %s page %s, stopping pagination for this network", net, page)
+                    break
                 r = resp.json()
             except Exception as e:
                 log.warning("new_pools %s p%s failed: %s", net, page, e)
