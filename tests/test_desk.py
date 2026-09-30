@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import pathlib
+from unittest.mock import Mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -20,6 +21,7 @@ from questions import SETS                            # noqa: E402
 from thresholds import PICK_MIN_WORTH, PICK_MIN_CONF, NO_SOCIAL_CUT   # noqa: E402
 import main as shift                                  # noqa: E402
 import collect                                        # noqa: E402
+from fomo_api import Fomo                             # noqa: E402
 
 JUDGE = mock_judge_fn()
 NOW_MS = int(time.time() * 1000)
@@ -32,6 +34,88 @@ def tok(i, net=1399811149, **over):
          "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}, "age_minutes": 42}
     t.update(over)
     return t
+
+
+# ---- fomo_api parsing ---------------------------------------------------------
+def test_filter_tokens_parses_bare_list():
+    """_filter_tokens should handle a bare list response."""
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = [
+        {"id": "addr1:56", "symbol": "TKN1", "marketCap": 100000},
+        {"address": "addr2", "netId": 56, "symbol": "TKN2", "marketCap": 200000}
+    ]
+    fomo.s.post = Mock(return_value=mock_resp)
+    result = fomo._filter_tokens(["addr1:56", "addr2:56"])
+    assert len(result) == 2
+    assert "addr1:56" in result
+    assert "addr2:56" in result
+    assert result["addr1:56"]["symbol"] == "TKN1"
+
+
+def test_filter_tokens_parses_id_map():
+    """_filter_tokens should handle {id: row} dict response."""
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "addr1:56": {"symbol": "TKN1", "marketCap": 100000},
+        "addr2:56": {"symbol": "TKN2", "marketCap": 200000}
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    result = fomo._filter_tokens(["addr1:56", "addr2:56"])
+    assert len(result) == 2
+    assert result["addr1:56"]["symbol"] == "TKN1"
+
+
+def test_filter_tokens_parses_data_envelope():
+    """_filter_tokens should handle {"data": [...]} envelope."""
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "data": [
+            {"id": "addr1:56", "symbol": "TKN1", "marketCap": 100000},
+            {"address": "addr2", "netId": 56, "symbol": "TKN2", "marketCap": 200000}
+        ]
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    result = fomo._filter_tokens(["addr1:56", "addr2:56"])
+    assert len(result) == 2
+    assert result["addr1:56"]["symbol"] == "TKN1"
+
+
+def test_filter_tokens_parses_response_object_envelope():
+    """_filter_tokens should handle {"responseObject": [...]} envelope from live API."""
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "success": True,
+        "statusCode": 200,
+        "message": "Tokens filtered successfully",
+        "responseObject": [
+            {"id": "addr1:56", "symbol": "TKN1", "marketCap": 100000},
+            {"address": "addr2", "netId": 56, "symbol": "TKN2", "marketCap": 200000}
+        ]
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    result = fomo._filter_tokens(["addr1:56", "addr2:56"])
+    assert len(result) == 2
+    assert result["addr1:56"]["symbol"] == "TKN1"
+    assert result["addr2:56"]["symbol"] == "TKN2"
+
+
+def test_filter_tokens_handles_empty_response_object():
+    """_filter_tokens should return empty dict for empty responseObject."""
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "success": True,
+        "statusCode": 200,
+        "message": "No tokens found",
+        "responseObject": []
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    result = fomo._filter_tokens(["addr1:56"])
+    assert result == {}
 
 
 # ---- filter -------------------------------------------------------------------
