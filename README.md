@@ -256,3 +256,162 @@ BSC for the honeypot fact, `trade_counts` and `dossier` tolerate missing fields 
 of raising, a 422 from the judge stops the cycle instead of being swallowed, `--live`
 needs `CONFIRM_LIVE=yes`, and the single-survivor path applies the same `size_factor`
 cuts the pick path does.
+
+## External connections
+
+The desk connects to these external services:
+
+**FOMO prod-api.fomo.family filterTokens** — required for shortlist stage
+- Purpose: Fetches token metadata (mcap, liquidity, volume, holders, price changes) from FOMO's curated launches
+- Connection: `FOMO_BEARER` environment variable OR Chrome CDP at `CDP_URL` (default 127.0.0.1:9222)
+- Required for: Shadow mode and live trading
+- Failure: Cycle stops. 401/403 triggers automatic refresh from Chrome
+
+**Chrome CDP / Privy session** — required only if no FOMO_BEARER
+- Purpose: Extracts live Privy bearer token from logged-in Chrome profile's localStorage
+- Connection: `CDP_URL` (default 127.0.0.1:9222) to Chrome remote debugging port
+- Required for: FOMO access when `FOMO_BEARER` is not set
+- Failure: FOMO becomes unreachable
+- Note: If using `scripts/launch-fomo-chrome.sh`, this script starts Chrome with the correct profile and debugging port
+
+**GeckoTerminal api.geckoterminal.com** — required
+- Purpose: Universe scan (new_pools) and detailed dossiers (token info, pool data, social handles)
+- Connection: HTTPS, no auth, user-agent header
+- Required for: Every cycle (universe) and per-token dossier
+- Failure: 429 backs off one minute. Persistent 429 means reduce `pages=1` in universe call
+
+**DexScreener api.dexscreener.com** — required for trade counts in shortlist stage
+- Purpose: Provides buy/sell transaction counts for filtering
+- Connection: HTTPS, no auth
+- Required for: trade_kill stage
+- Failure: 429 means lower `DEX_BUDGET` in main.py
+
+**Solana mainnet RPC api.mainnet-beta.solana.com** — conditional
+- Purpose: Fetches on-chain concentration data (top holder percentages) for Solana tokens
+- Connection: HTTPS JSON-RPC, no auth
+- Required for: Solana dossiers only (not BSC/Base/Robinhood)
+- Failure: Dossier throws, token benched as `dossier_failed`
+
+**TypeSafe judge via local uvicorn** — required
+- Purpose: AI judgement calls for market/chain/social question sets
+- Connection: `JUDGE_URL` with `Authorization: Bearer $DESK_SECRET`, backed by `TYPESAFE_API_KEY`
+- Required for: Every token that passes free/trade/chain kills
+- Failure: Unreachable judge stops the cycle. 422 (malformed question) stops cycle permanently
+
+**Local judge/book FastAPI :8080** — required
+- Purpose: Serves `/judge` for bots plus `/book/held` and `/book/release` for RISK seat
+- Connection: Bots hit `JUDGE_URL` with `DESK_SECRET` bearer token
+- Required for: All judgement calls and book coordination
+- Failure: Judge unreachable stops cycle. Missing `/book/release` call freezes desk
+
+**Cloudflare Tunnel** — optional, for remote seats
+- Purpose: Exposes local :8080 judge/book server to xAI cloud where Grok Bots run
+- Connection: `cloudflared tunnel --url http://localhost:8080`
+- Required for: Remote Grok Bot seats (not needed if bots run on same machine)
+- Failure: Bots cannot reach judge
+
+**SOCIAL_URL** — optional X/Twitter seat
+- Purpose: SOCIAL bot endpoint that scrapes X profile data for social question set
+- Connection: `POST {"x_handle": "..."}` returns X block (followers, verified, age, bio)
+- Required for: social question set (adds ~0.10 to ticket sizing when present)
+- Failure: Unset or unreachable means `NO_SOCIAL_CUT` applied (0.60 size factor)
+
+**SEATS_WEBHOOK_URL** — optional live seat handoff
+- Purpose: CHIEF's inbox for finished orders
+- Connection: POST order JSON to webhook
+- Required for: Automated order handoff in `--live` mode
+- Failure: Unset means orders written to `outbox/orders/` for manual handoff
+
+**Telegram** — optional notifications
+- Purpose: Per-cycle status report (trade or no-trade summary)
+- Connection: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
+- Required for: Operator notifications
+- Failure: Silently skipped if not configured
+
+Environment variable reference: `BANK_USD`, `DESK_SECRET`, `JUDGE_URL`, `TYPESAFE_API_KEY`, `FOMO_BEARER`, `CDP_URL`, `SOCIAL_URL`, `SEATS_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DESK_DB`, `JUDGE_MOCK`, `CONFIRM_LIVE`
+
+## Activity workflow
+
+### Cycle flowchart
+
+```mermaid
+graph TB
+    A[run.py 15min loop] --> B{Book held?}
+    B -->|Yes| C[Skip cycle<br/>RISK owns desk]
+    B -->|No| D[universe<br/>GeckoTerminal new_pools<br/>3 chains x 2 pages]
+    D --> E[shortlist<br/>FOMO filterTokens<br/>20 tokens per call]
+    E --> F{Rate limit<br/>budget left?}
+    F -->|No| G[End cycle]
+    F -->|Yes| H[free_kill<br/>age/liquidity/volume/mcap]
+    H --> I{Pass?}
+    I -->|No| J[Bench token]
+    I -->|Yes| K[trade_counts<br/>DexScreener buys/sells]
+    K --> L{Pass trade_kill?}
+    L -->|No| J
+    L -->|Yes| M[dossier<br/>GeckoTerminal + chain RPC]
+    M --> N{Dossier OK?}
+    N -->|Fail| O[Bench as dossier_failed]
+    N -->|OK| P{Pass chain_kill?}
+    P -->|No| J
+    P -->|Yes| Q{X handle?}
+    Q -->|Yes| R[SOCIAL_URL<br/>X profile data]
+    Q -->|No| S[Judge: market + chain sets]
+    R --> T[Judge: market + chain + social]
+    T --> U{Pass soft_kill?}
+    S --> U
+    U -->|No| J
+    U -->|Yes| V[Survivors list]
+    V --> W{Any survivors?}
+    W -->|No| G
+    W -->|One| X[single-survivor order<br/>no pick needed]
+    W -->|Multiple| Y[pick<br/>JUDGE_URL best choice]
+    Y --> Z{Pick result?}
+    Z -->|None| G
+    Z -->|Order| AA{Shadow mode?}
+    X --> AA
+    AA -->|Yes| AB[Log to shadow.jsonl]
+    AA -->|No| AC[book.take<br/>Desk held]
+    AC --> AD[send_to_seats<br/>SIZE→FILLS→RISK]
+    AB --> AE[Optional: Telegram report]
+    AD --> AE
+    AE --> AF[Cycle complete]
+    C --> AF
+    G --> AE
+```
+
+### Cycle steps
+
+1. **Check book status**: If RISK is holding a position, skip the entire scan. The desk does not trade while a position is open.
+
+2. **Universe scan**: Query GeckoTerminal `new_pools` for fresh launches across Solana, BSC, and Robinhood chains. Two pages per chain = 6 GeckoTerminal slots.
+
+3. **Shortlist fetch**: Call FOMO `filterTokens` (20 tokens per call) for metadata: mcap, liquidity, volume, holders, price changes (5m/1h/24h), created timestamp.
+
+4. **Free kill stage**: Filter by age, liquidity, volume, mcap. No network calls. Surviving tokens cost one DexScreener slot each.
+
+5. **Trade kill stage**: Fetch buy/sell counts from DexScreener. Check trade activity thresholds. Budget: `DEX_BUDGET` calls per cycle (default 25).
+
+6. **Dossier stage**: Pull full token info from GeckoTerminal plus on-chain concentration from Solana RPC (if Solana). Budget: 3 GeckoTerminal slots. Failed dossiers bench the token as `dossier_failed`.
+
+7. **Chain kill stage**: Apply chain-specific filters (honeypot facts, concentration limits, graduated status).
+
+8. **Social lookup** (optional): If token has X handle and `SOCIAL_URL` is set, fetch X profile data. Missing social data applies `NO_SOCIAL_CUT` (0.60 size factor).
+
+9. **Judge stage**: POST question sets (market + chain, optionally social) to `JUDGE_URL`. TypeSafe backend scores each token. Budget: ~10 calls/cycle at $0.042/Mtok.
+
+10. **Soft kill stage**: Filter on judge answers (momentum, risk flags, social health).
+
+11. **Pick stage**: If multiple survivors, call judge with `pick` question set to choose best option. Single survivor skips pick. No survivors ends cycle.
+
+12. **Shadow or live**: Shadow mode logs order to `outbox/shadow.jsonl`. Live mode calls `book.take()` (desk now held) and sends order to seats via `SEATS_WEBHOOK_URL` or writes to `outbox/orders/`.
+
+13. **Report**: Send summary to Telegram (optional) and wait 15 minutes for next cycle.
+
+### Always-on sidecars
+
+These processes must run continuously:
+
+- **uvicorn server:app** on port 8080 — serves `/judge`, `/book/held`, `/book/release`
+- **Chrome with remote debugging** on port 9222 — if using CDP for FOMO bearer refresh (not needed if `FOMO_BEARER` is set). Launch with `scripts/launch-fomo-chrome.sh` if present.
+- **cloudflared tunnel** (optional) — only if seats run remotely and need to reach local judge
+- **run.py** — the desk itself. Writes PID to `outbox/run.pid` when daemonized.
