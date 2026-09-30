@@ -118,8 +118,9 @@ class Fomo:
         return out
 
     def _filter_tokens(self, chunk: list[str]) -> dict[str, dict]:
-        # Retry logic for transient network errors
-        max_retries = 1
+        # Retry logic for transient network errors with exponential backoff
+        max_retries = 4
+        base_delay = 0.5
         for attempt in range(max_retries + 1):
             try:
                 r = self.s.post(f"{FOMO_API}/proxy/filterTokens", json=chunk, timeout=30,
@@ -130,21 +131,24 @@ class Fomo:
                                     headers={"Authorization": f"Bearer {self.token(force=True)}"})
                     if r.status_code in (401, 403):
                         raise FomoAuthError(f"FOMO {r.status_code}: log into fomo.family again")
-                # Retry on 502 Bad Gateway
-                if r.status_code == 502 and attempt < max_retries:
-                    log.warning("FOMO 502 Bad Gateway, retrying (attempt %d/%d)", attempt + 1, max_retries + 1)
-                    time.sleep(1)
+                # Retry on 502 Bad Gateway and similar transient failures
+                if r.status_code in (502, 503, 504) and attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    log.warning("FOMO %d gateway error, retrying in %.1fs (attempt %d/%d)", 
+                               r.status_code, delay, attempt + 1, max_retries + 1)
+                    time.sleep(delay)
                     continue
                 r.raise_for_status()
                 break
             except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
                 if attempt < max_retries:
-                    log.warning("Connection error on filterTokens: %s, retrying (attempt %d/%d)", 
-                               e, attempt + 1, max_retries + 1)
+                    delay = base_delay * (2 ** attempt)
+                    log.warning("Connection error on filterTokens: %s, retrying in %.1fs (attempt %d/%d)", 
+                               e, delay, attempt + 1, max_retries + 1)
                     # Close adapters to reset connection pool; session will reconnect on next request
                     for adapter in self.s.adapters.values():
                         adapter.close()
-                    time.sleep(1)
+                    time.sleep(delay)
                     continue
                 else:
                     raise

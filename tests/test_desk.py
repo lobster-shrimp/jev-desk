@@ -219,7 +219,7 @@ def test_nested_token_yields_parsed_tokens():
 
 
 def test_filter_tokens_retries_on_connection_error():
-    """_filter_tokens should retry once on ConnectionError."""
+    """_filter_tokens should retry up to 4 times on ConnectionError."""
     fomo = Fomo(bearer="fake-token")
     mock_resp = Mock()
     mock_resp.status_code = 200
@@ -237,13 +237,13 @@ def test_filter_tokens_retries_on_connection_error():
     fomo.s.adapters = {}  # Mock empty adapters dict so close() doesn't fail
     result = fomo._filter_tokens(["addr1:56"])
     
-    assert call_count[0] == 2  # Should have retried once
+    assert call_count[0] == 2  # Should have retried once (1 failure + 1 success)
     assert len(result) == 1
     assert "addr1:56" in result
 
 
 def test_filter_tokens_retries_on_502():
-    """_filter_tokens should retry once on HTTP 502 Bad Gateway."""
+    """_filter_tokens should retry on HTTP 502 Bad Gateway with exponential backoff."""
     fomo = Fomo(bearer="fake-token")
     mock_502 = Mock()
     mock_502.status_code = 502
@@ -255,8 +255,94 @@ def test_filter_tokens_retries_on_502():
     fomo.s.post = Mock(side_effect=[mock_502, mock_200])
     result = fomo._filter_tokens(["addr1:56"])
     
-    assert fomo.s.post.call_count == 2  # Should have retried once
+    assert fomo.s.post.call_count == 2  # Should have retried once (1 failure + 1 success)
     assert len(result) == 1
+
+
+def test_filter_tokens_retries_multiple_502s():
+    """_filter_tokens should retry up to 4 times on persistent 502s."""
+    fomo = Fomo(bearer="fake-token")
+    mock_502 = Mock()
+    mock_502.status_code = 502
+    mock_200 = Mock()
+    mock_200.status_code = 200
+    mock_200.json.return_value = {"responseObject": [{"id": "addr1:56", "symbol": "TKN"}]}
+    
+    # Three 502s, then success on 4th attempt
+    fomo.s.post = Mock(side_effect=[mock_502, mock_502, mock_502, mock_200])
+    result = fomo._filter_tokens(["addr1:56"])
+    
+    assert fomo.s.post.call_count == 4  # 3 failures + 1 success
+    assert len(result) == 1
+    assert "addr1:56" in result
+
+
+def test_filter_tokens_exhausts_retries_on_persistent_502():
+    """_filter_tokens should raise HTTPError after 5 failed attempts."""
+    fomo = Fomo(bearer="fake-token")
+    mock_502 = Mock()
+    mock_502.status_code = 502
+    mock_502.raise_for_status = Mock(side_effect=requests.exceptions.HTTPError("502 Server Error"))
+    
+    fomo.s.post = Mock(return_value=mock_502)
+    
+    try:
+        fomo._filter_tokens(["addr1:56"])
+        assert False, "should have raised HTTPError"
+    except requests.exceptions.HTTPError:
+        pass
+    
+    # Should have tried 5 times (initial + 4 retries)
+    assert fomo.s.post.call_count == 5
+
+
+def test_filter_tokens_retries_on_503_and_504():
+    """_filter_tokens should retry on 503 and 504 gateway errors."""
+    fomo = Fomo(bearer="fake-token")
+    mock_503 = Mock()
+    mock_503.status_code = 503
+    mock_504 = Mock()
+    mock_504.status_code = 504
+    mock_200 = Mock()
+    mock_200.status_code = 200
+    mock_200.json.return_value = {"responseObject": [{"id": "addr1:56", "symbol": "TKN"}]}
+    
+    # 503, then 504, then success
+    fomo.s.post = Mock(side_effect=[mock_503, mock_504, mock_200])
+    result = fomo._filter_tokens(["addr1:56"])
+    
+    assert fomo.s.post.call_count == 3
+    assert len(result) == 1
+    assert "addr1:56" in result
+
+
+def test_filter_tokens_exponential_backoff():
+    """_filter_tokens should use exponential backoff (0.5s, 1s, 2s, 4s)."""
+    import time as time_module
+    
+    fomo = Fomo(bearer="fake-token")
+    mock_502 = Mock()
+    mock_502.status_code = 502
+    mock_200 = Mock()
+    mock_200.status_code = 200
+    mock_200.json.return_value = {"responseObject": [{"id": "addr1:56", "symbol": "TKN"}]}
+    
+    sleep_calls = []
+    original_sleep = time_module.sleep
+    time_module.sleep = lambda x: sleep_calls.append(x)
+    
+    try:
+        # Three 502s, then success
+        fomo.s.post = Mock(side_effect=[mock_502, mock_502, mock_502, mock_200])
+        result = fomo._filter_tokens(["addr1:56"])
+        
+        assert len(sleep_calls) == 3
+        assert sleep_calls[0] == 0.5   # 0.5 * 2^0
+        assert sleep_calls[1] == 1.0   # 0.5 * 2^1
+        assert sleep_calls[2] == 2.0   # 0.5 * 2^2
+        assert len(result) == 1
+    finally:
+        time_module.sleep = original_sleep
 
 
 def test_flat_and_nested_shapes_both_work():
