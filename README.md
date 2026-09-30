@@ -330,6 +330,209 @@ The desk connects to these external services:
 
 Environment variable reference: `BANK_USD`, `DESK_SECRET`, `JUDGE_URL`, `TYPESAFE_API_KEY`, `FOMO_BEARER`, `CDP_URL`, `SOCIAL_URL`, `SEATS_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DESK_DB`, `JUDGE_MOCK`, `CONFIRM_LIVE`
 
+## Trade Decision Logic
+
+### When the desk trades vs when it doesn't
+
+The desk produces **one of two outcomes every cycle**: a trade (shadow or live) or `NO TRADE`. Understanding the path to both is the point.
+
+**TRADE happens when:**
+1. Book is **not** held (no open position)
+2. At least one token survives all four kill stages (free → trade → chain → soft)
+3. For multiple survivors: `pick()` returns an order (passes `worth_trading_at_all >= 0.60` and `confidence >= 0.55`)
+4. For a single survivor: order is created immediately (no pick needed)
+5. **Shadow mode**: order logged to `outbox/shadow.jsonl` (NO actual trade, just recorded)
+6. **Live mode** (`--live` + `CONFIRM_LIVE=yes`): `book.take()` called, order sent to seats
+
+**NO TRADE happens when any of these is true:**
+- **Book held**: RISK owns the desk, entire scan skipped until `/book/release` called
+- **Rate limit exhausted**: DexScreener or GeckoTerminal budget depleted mid-cycle
+- **All tokens benched**: every token in universe already judged recently and still sitting out
+- **All killed at free stage**: age/liquidity/volume/mcap filters eliminate everything (no network cost)
+- **All killed at trade stage**: trade count thresholds eliminate all survivors from free stage
+- **All dossiers failed**: GeckoTerminal/RPC calls throw for all survivors
+- **All killed at chain stage**: honeypot/authority/concentration facts bench remaining tokens
+- **All killed at soft stage**: judge answers fail thresholds (momentum spent, concentration risk, etc.)
+- **No survivors**: zero tokens make it through all four kills
+- **Pick returns None**: multiple survivors exist but either:
+  - `worth_trading_at_all` < 0.60 (today is not a day)
+  - `confidence` < 0.55 (pick is too flat across options)
+- **Judge unreachable** (`JudgeDown` exception): cycle stands down entirely, no guessing
+
+The log line `NO TRADE. seen X, benched Y, judged Z, killed {...}` tells you exactly which gate stopped the flow.
+
+### Decision tree: TRADE or NO TRADE
+
+```mermaid
+graph TB
+    START[Cycle begins<br/>every 15 min] --> HELD{Book held?}
+    HELD -->|Yes| NO_SCAN[NO TRADE<br/>RISK owns desk]
+    HELD -->|No| UNIVERSE[universe scan<br/>GeckoTerminal new_pools]
+    
+    UNIVERSE --> SHORTLIST[shortlist<br/>FOMO filterTokens]
+    SHORTLIST --> BENCHED{All tokens<br/>already benched?}
+    BENCHED -->|Yes| NO_BENCHED[NO TRADE<br/>all tokens benched]
+    BENCHED -->|No| FREE[free_kill loop]
+    
+    FREE --> FREE_CHECK{Any pass<br/>free_kill?}
+    FREE_CHECK -->|No| NO_FREE[NO TRADE<br/>all free-killed]
+    FREE_CHECK -->|Yes| BUDGET{Rate limit<br/>budget left?}
+    BUDGET -->|No| NO_BUDGET[NO TRADE<br/>budget exhausted]
+    BUDGET -->|Yes| TRADE_STAGE[trade_kill loop]
+    
+    TRADE_STAGE --> TRADE_CHECK{Any pass<br/>trade_kill?}
+    TRADE_CHECK -->|No| NO_TRADE_KILL[NO TRADE<br/>all trade-killed]
+    TRADE_CHECK -->|Yes| DOSSIER[dossier loop]
+    
+    DOSSIER --> DOSSIER_CHECK{Any dossier<br/>succeed?}
+    DOSSIER_CHECK -->|No| NO_DOSSIER[NO TRADE<br/>all dossiers failed]
+    DOSSIER_CHECK -->|Yes| CHAIN[chain_kill loop]
+    
+    CHAIN --> CHAIN_CHECK{Any pass<br/>chain_kill?}
+    CHAIN_CHECK -->|No| NO_CHAIN[NO TRADE<br/>all chain-killed]
+    CHAIN_CHECK -->|Yes| JUDGE_STAGE[judge loop]
+    
+    JUDGE_STAGE --> JUDGE_OK{Judge<br/>reachable?}
+    JUDGE_OK -->|No| NO_JUDGE[NO TRADE<br/>judge unreachable]
+    JUDGE_OK -->|Yes| SOFT[soft_kill loop]
+    
+    SOFT --> SOFT_CHECK{Any pass<br/>soft_kill?}
+    SOFT_CHECK -->|No| NO_SOFT[NO TRADE<br/>all soft-killed]
+    SOFT_CHECK -->|Yes| SURVIVORS{Survivor<br/>count?}
+    
+    SURVIVORS -->|0| NO_SURVIVORS[NO TRADE<br/>no survivors]
+    SURVIVORS -->|1| SINGLE[Single survivor<br/>skip pick]
+    SURVIVORS -->|2+| PICK[pick call]
+    
+    PICK --> PICK_RESULT{Pick result?}
+    PICK_RESULT -->|worth < 0.60| NO_WORTH[NO TRADE<br/>not worth trading]
+    PICK_RESULT -->|conf < 0.55| NO_CONF[NO TRADE<br/>pick too flat]
+    PICK_RESULT -->|Order| ORDER[Order created]
+    
+    SINGLE --> ORDER
+    ORDER --> MODE{Shadow or<br/>live mode?}
+    
+    MODE -->|Shadow| SHADOW[Log to shadow.jsonl<br/>NO actual trade]
+    MODE -->|Live| LIVE[book.take<br/>send_to_seats]
+    
+    SHADOW --> DONE[Cycle complete<br/>report sent]
+    LIVE --> DONE
+    NO_SCAN --> DONE
+    NO_BENCHED --> DONE
+    NO_FREE --> DONE
+    NO_BUDGET --> DONE
+    NO_TRADE_KILL --> DONE
+    NO_DOSSIER --> DONE
+    NO_CHAIN --> DONE
+    NO_JUDGE --> DONE
+    NO_SOFT --> DONE
+    NO_SURVIVORS --> DONE
+    NO_WORTH --> DONE
+    NO_CONF --> DONE
+    
+    style ORDER fill:#90EE90
+    style SHADOW fill:#FFE4B5
+    style LIVE fill:#FFB6C1
+    style NO_SCAN fill:#FFA07A
+    style NO_BENCHED fill:#FFA07A
+    style NO_FREE fill:#FFA07A
+    style NO_BUDGET fill:#FFA07A
+    style NO_TRADE_KILL fill:#FFA07A
+    style NO_DOSSIER fill:#FFA07A
+    style NO_CHAIN fill:#FFA07A
+    style NO_JUDGE fill:#FFA07A
+    style NO_SOFT fill:#FFA07A
+    style NO_SURVIVORS fill:#FFA07A
+    style NO_WORTH fill:#FFA07A
+    style NO_CONF fill:#FFA07A
+```
+
+### Kill stages reference
+
+The desk applies **four kill stages in strict cost order**: free → trade → chain → soft. Each stage benches tokens for different durations (see `book.py` `BENCH_MINUTES`).
+
+#### 1. free_kill (no network cost, runs on hundreds)
+
+Source: `filter.py:free_kill()`, data from FOMO `filterTokens` batch.
+
+| Check | Threshold | Bench duration | Meaning |
+|---|---|---|---|
+| `age` | 15 min ≤ age ≤ 72 hours | 20 min | Too young = noisy data; too old = not a launch |
+| `liquidity` | ≥ $12,000 | 25 min | Insufficient liquidity to support entry/exit |
+| `volume` | ≥ $40,000 (24h) | 25 min | Low volume = illiquid, hard to fill |
+| `mcap` | $60k ≤ mcap ≤ $8M | 25 min | Too small = rug risk; too large = limited upside |
+
+**Purpose**: Eliminate obvious mismatches before spending DexScreener slots. Arithmetic only, no network calls.
+
+#### 2. trade_kill (one DexScreener call per token, runs on tens)
+
+Source: `filter.py:trade_kill()`, data from DexScreener `/tokens/<addr>`.
+
+| Check | Threshold | Bench duration | Meaning |
+|---|---|---|---|
+| `no_pair` | pair must exist | (default 45 min) | DexScreener has no data for this token |
+| `trades` | ≥ 150 trades (24h) | 25 min | Inactive token, no market interest |
+| `no_sells` | Must have sells if >20 buys (1h) | (default 45 min) | One-way market, potential honeypot |
+
+**Purpose**: Validate trade activity. Costs one DexScreener slot per token that passed `free_kill`.
+
+**Rate limit**: `DEX_BUDGET = 25` calls per cycle. Once exhausted, remaining tokens are skipped (not benched).
+
+#### 3. chain_kill (after dossier, still free — facts not judgements)
+
+Source: `filter.py:chain_kill()`, data from GeckoTerminal dossier + Solana RPC.
+
+| Check | Threshold | Chain | Bench duration | Meaning |
+|---|---|---|---|---|
+| `top_wallet` | ≤ 5% | Solana only | 100,000 min (~69 days) | Single wallet owns too much, exit risk |
+| `top_10` | ≤ 60% | where data exists | 100,000 min | Top 10 wallets too concentrated |
+| `holders` | ≥ 80 | where data exists | 90 min | Too few holders, centralized float |
+| `authority_open` | must be closed | Solana only | 100,000 min | Mint/freeze authority still enabled = rug vector |
+| `honeypot` | must be false | BSC, Base | 100,000 min | Honeypot fact from GeckoTerminal |
+
+**Purpose**: Apply chain-specific facts. These are not judgements — they're facts from on-chain data or GT metadata. Facts bench longest (100k min = permanent rejection for this token's lifetime).
+
+**Rate limit**: `GT_DOSSIER = 3` slots per cycle. GeckoTerminal allows 10 calls/min; 6 are spent on universe scan, leaving 3 for dossiers.
+
+#### 4. soft_kill (judge answers against thresholds, runs on a handful)
+
+Source: `filter.py:soft_kill()`, data from TypeSafe judge responses (market + chain + social question sets).
+
+| Check | Direction | Threshold | Bench duration | Meaning |
+|---|---|---|---|---|
+| `concentration_is_exit_risk` | max | 0.55 | 90 min | Holder concentration creates exit risk |
+| `momentum_already_spent` | max | 0.60 | 25 min | Price momentum exhausted, late entry |
+| `liquidity_fits_ticket` | min | 0.60 | 25 min | Liquidity too thin for intended ticket size |
+| `account_is_the_project` | min | 0.70 | 360 min (6 hr) | X account not legitimate/official |
+| `recycled_account` | max | 0.50 | 360 min | X account is recycled/bought |
+| `audience_is_real` | min | 0.45 | (default 45 min) | Followers are bots/fake |
+| `effort` | min | 1.0 | (default 45 min) | Low-effort social presence |
+| `dev_still_loaded` | max | 0.55 | 90 min | Developer wallet still heavily loaded |
+| `sellable_by_evidence` | min | 0.60 | (default 45 min) | Robinhood only: evidence of sellability |
+| `shape` (choice) | — | Must not be "fading" or "one_buyer" | 25 min | Chart shape shows fading interest or single buyer |
+| `shape` (probability) | — | `crowd` probability ≥ 0.55 | 25 min | Even if choice is "crowd", confidence too low |
+| `sell_side_risk` (choice) | — | Must not be "flagged" or "suspicious" | 100,000 min | Chain-level sell-side risk detected |
+
+**Purpose**: Filter on AI judgement calls. These are probabilistic assessments from the TypeSafe model, not facts. Bench durations vary: social checks bench longest (360 min), momentum checks shortest (25 min).
+
+**Rate limit**: ~10 judge calls per cycle at $0.042/Mtok = ~$0.06/day.
+
+### The pick gate
+
+If multiple tokens survive all four kills, `pick()` decides which one to trade. **Pick can still return `None`** (NO TRADE) even with survivors:
+
+**Two pick gates (both must pass):**
+1. `worth_trading_at_all` ≥ 0.60 — "Is today a day to trade at all?" A blanket noul across all candidates.
+2. `confidence` ≥ 0.55 — "Is the pick confident enough?" A flat distribution means no clear favorite.
+
+**Pick bypass**: If exactly **one survivor** exists, pick is skipped. The order is created immediately with `model: "single-survivor"` and no confidence score.
+
+**Size factors** (applied to both pick and single-survivor orders):
+- `DARK_TICKET_CUT = 0.40` when `data_coverage == "dark"` (Robinhood low-visibility tokens)
+- `NO_SOCIAL_CUT = 0.60` when no usable X account exists
+
+These multiply: a Robinhood dark token with no social = 0.40 × 0.60 = 0.24× final ticket size.
+
 ## Activity workflow
 
 ### Cycle flowchart
@@ -379,33 +582,315 @@ graph TB
     G --> AE
 ```
 
-### Cycle steps
+### Component interaction sequence
 
-1. **Check book status**: If RISK is holding a position, skip the entire scan. The desk does not trade while a position is open.
+```mermaid
+sequenceDiagram
+    participant R as run.py
+    participant M as main.py
+    participant B as book.py
+    participant C as collect.py
+    participant F as filter.py
+    participant J as judge (TypeSafe)
+    participant P as pick.py
+    participant D as desk.py
+    
+    R->>M: main(fomo, judge, desk, shadow=True)
+    loop Every 15 minutes
+        M->>B: held()?
+        alt Book held
+            B-->>M: {ticker, minutes}
+            M->>D: report(None, stats)
+            Note over M: NO TRADE - RISK owns desk
+        else Book free
+            M->>C: universe() [3 chains × 2 pages]
+            C-->>M: ['<addr>:<netId>', ...]
+            M->>C: shortlist(fomo, ids) [FOMO filterTokens, 20/call]
+            C-->>M: [{tid, ticker, mcap, liquidity, ...}, ...]
+            
+            loop Each token in shortlist
+                M->>B: benched(tid)?
+                alt Already benched
+                    B-->>M: True
+                    Note over M: Skip (still serving time)
+                else Not benched
+                    M->>F: free_kill(token)
+                    alt Killed
+                        F-->>M: reason (age|liquidity|volume|mcap)
+                        M->>B: sit(tid, reason)
+                    else Pass free_kill
+                        M->>C: trade_counts(token) [DexScreener]
+                        C-->>M: {buys_h1, sells_h1, trades_h24, ...}
+                        M->>F: trade_kill(token)
+                        alt Killed
+                            F-->>M: reason (no_pair|trades|no_sells)
+                            M->>B: sit(tid, reason)
+                        else Pass trade_kill
+                            M->>C: dossier(token) [GT info + Solana RPC]
+                            alt Dossier fails
+                                C-->>M: Exception
+                                M->>B: sit(tid, "dossier_failed")
+                            else Dossier OK
+                                C-->>M: {holder_count, top_10_percent, x_handle, ...}
+                                M->>F: chain_kill(dossier)
+                                alt Killed
+                                    F-->>M: reason (honeypot|authority_open|concentration)
+                                    M->>B: sit(tid, reason)
+                                else Pass chain_kill
+                                    alt X handle exists & SOCIAL_URL set
+                                        M->>D: read_x(handle)
+                                        D-->>M: {followers, verified, ...} or None
+                                    end
+                                    M->>J: judge("market", dossier)
+                                    J-->>M: {answers: {shape, momentum, ...}, model}
+                                    M->>J: judge("solana"|"bsc"|"robinhood", dossier)
+                                    J-->>M: {answers: {concentration, authority, ...}}
+                                    alt Social data exists
+                                        M->>J: judge("social", social_state)
+                                        J-->>M: {answers: {account_is_project, effort, ...}}
+                                    end
+                                    M->>F: soft_kill(answers)
+                                    alt Killed
+                                        F-->>M: reason (momentum_spent|concentration|social)
+                                        M->>B: sit(tid, reason)
+                                    else Pass soft_kill
+                                        Note over M: Token survives → survivors list
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            
+            alt No survivors
+                M->>D: report(None, stats)
+                Note over M: NO TRADE - all killed
+            else One survivor
+                Note over M: Create order (single-survivor, no pick)
+                alt Shadow mode
+                    M->>D: log_shadow(order, stats)
+                else Live mode
+                    M->>B: take(order)
+                    M->>D: send_to_seats(order)
+                end
+                M->>D: report(order, stats)
+            else Multiple survivors
+                M->>P: pick(judge, survivors)
+                P->>J: judge("pick", state)
+                J-->>P: {answers: {best, worth_trading_at_all}}
+                alt Pick returns None
+                    P-->>M: None
+                    M->>D: report(None, stats)
+                    Note over M: NO TRADE - not worth/conf too low
+                else Pick returns order
+                    P-->>M: order
+                    alt Shadow mode
+                        M->>D: log_shadow(order, stats)
+                    else Live mode
+                        M->>B: take(order)
+                        M->>D: send_to_seats(order)
+                    end
+                    M->>D: report(order, stats)
+                end
+            end
+        end
+    end
+```
 
-2. **Universe scan**: Query GeckoTerminal `new_pools` for fresh launches across Solana, BSC, and Robinhood chains. Two pages per chain = 6 GeckoTerminal slots.
+### Cycle steps (detailed)
 
-3. **Shortlist fetch**: Call FOMO `filterTokens` (20 tokens per call) for metadata: mcap, liquidity, volume, holders, price changes (5m/1h/24h), created timestamp.
+1. **Check book status** (`book.held()`)
+   - Query: `SELECT ticker, opened_at FROM position WHERE id=1`
+   - If row exists: RISK owns the desk, return `{ticker, minutes}`
+   - If no row: desk is free, proceed with scan
+   - **NO TRADE path**: Book held → skip entire cycle until RISK calls `/book/release`
 
-4. **Free kill stage**: Filter by age, liquidity, volume, mcap. No network calls. Surviving tokens cost one DexScreener slot each.
+2. **Universe scan** (`collect.universe()`)
+   - Endpoint: `GET api.geckoterminal.com/api/v2/networks/{net}/new_pools?page={p}`
+   - Chains: Solana (1399811149), BSC (56), Robinhood (4663) — Base (8453) shares BSC question set
+   - Pages: 2 per chain = **6 GeckoTerminal slots** (60% of free tier's 10/min budget)
+   - Output: `['<addr>:<netId>', ...]` list of fresh pool tokens
+   - **Rate limit**: 429 stops pagination for that network, preserves IDs from other nets/pages
 
-5. **Trade kill stage**: Fetch buy/sell counts from DexScreener. Check trade activity thresholds. Budget: `DEX_BUDGET` calls per cycle (default 25).
+3. **Shortlist fetch** (`collect.shortlist()`)
+   - Endpoint: `POST prod-api.fomo.family/filterTokens` (20 token IDs per call)
+   - Data: mcap, liquidity, volume (24h), holders, price, change (5m/1h/4h/24h), created timestamp
+   - Sorting: By turnover (`volume_h24 / mcap_usd`) descending → prioritizes active tokens for limited budget
+   - **Rate limit**: FOMO bearer expires ~hourly, refreshed automatically from Chrome CDP or `FOMO_BEARER` env var
 
-6. **Dossier stage**: Pull full token info from GeckoTerminal plus on-chain concentration from Solana RPC (if Solana). Budget: 3 GeckoTerminal slots. Failed dossiers bench the token as `dossier_failed`.
+4. **Bench check** (`book.benched()`)
+   - Query: `SELECT until FROM bench WHERE tid=?`
+   - If `until > now()`: token still serving time, skip to next
+   - **Stats**: `benched` counter increments (included in NO TRADE report)
 
-7. **Chain kill stage**: Apply chain-specific filters (honeypot facts, concentration limits, graduated status).
+5. **Free kill stage** (`filter.free_kill()`)
+   - Source: Data from FOMO batch (no additional network calls)
+   - Checks: age (15 min – 72 hr), liquidity (≥$12k), volume (≥$40k/24h), mcap ($60k – $8M)
+   - **NO TRADE path**: All tokens killed → bench each with reason, cycle ends with `free {age: X, liquidity: Y, ...}` in stats
+   - **Bench**: `sit(tid, reason)` with duration from `BENCH_MINUTES` (20–25 min for free kills)
 
-8. **Social lookup** (optional): If token has X handle and `SOCIAL_URL` is set, fetch X profile data. Missing social data applies `NO_SOCIAL_CUT` (0.60 size factor).
+6. **Budget check**
+   - Counters: `dex_slots` (default 25), `gt_slots` (default 3)
+   - **NO TRADE path**: Budget exhausted → remaining tokens skipped (not benched), cycle ends
 
-9. **Judge stage**: POST question sets (market + chain, optionally social) to `JUDGE_URL`. TypeSafe backend scores each token. Budget: ~10 calls/cycle at $0.042/Mtok.
+7. **Trade kill stage** (`filter.trade_kill()`)
+   - Endpoint: `GET api.dexscreener.com/latest/dex/tokens/{addr}` **(one call per token)**
+   - Data: buys/sells per window (1h, 6h, 24h), trades_h24
+   - Checks: pair exists, ≥150 trades/24h, has sells if >20 buys/1h
+   - **NO TRADE path**: All survivors killed → cycle ends with `trade {no_pair: X, trades: Y, ...}` in stats
+   - **Rate limit**: 429 → lower `DEX_BUDGET` in `main.py` (current default 25)
+   - **Budget**: Decrements `dex_slots` per call
 
-10. **Soft kill stage**: Filter on judge answers (momentum, risk flags, social health).
+8. **Dossier stage** (`collect.dossier()`)
+   - Endpoint: `GET api.geckoterminal.com/api/v2/networks/{net}/tokens/{addr}/info` **(one call per token)**
+   - Data: holder count/distribution, top 10%, developer holding %, GT score details, honeypot flag, mint/freeze authority (Solana), description, X handle
+   - Solana only: `POST api.mainnet-beta.solana.com` → `getTokenSupply` + `getTokenLargestAccounts` for exact top wallet %
+   - **NO TRADE path**: All dossiers throw → tokens benched as `dossier_failed`, cycle ends
+   - **Rate limit**: GT 429 → back off 1 min, persistent 429 → set `pages=1` in universe call
+   - **Budget**: Decrements `gt_slots` per call (success or failure)
 
-11. **Pick stage**: If multiple survivors, call judge with `pick` question set to choose best option. Single survivor skips pick. No survivors ends cycle.
+9. **Chain kill stage** (`filter.chain_kill()`)
+   - Source: Facts from dossier (no additional network calls)
+   - Checks: top wallet ≤5% (Solana), top 10 ≤60%, holders ≥80, authority closed (Solana), not honeypot (BSC/Base)
+   - **NO TRADE path**: All survivors killed → bench each for 90–100k min (facts bench longest), cycle ends with `chain {honeypot: X, authority_open: Y, ...}` in stats
 
-12. **Shadow or live**: Shadow mode logs order to `outbox/shadow.jsonl`. Live mode calls `book.take()` (desk now held) and sends order to seats via `SEATS_WEBHOOK_URL` or writes to `outbox/orders/`.
+10. **Social lookup** (optional, `desk.read_x()`)
+    - Condition: `x_handle` exists in dossier AND `SOCIAL_URL` env var set
+    - Endpoint: `POST $SOCIAL_URL` with `{"x_handle": "..."}`
+    - Data: followers, verified, account age, bio (collected by SOCIAL bot's X plugin)
+    - **Failure handling**: HTTP error or timeout → returns `None`, no bench (token not at fault)
+    - **Missing social**: Applies `NO_SOCIAL_CUT = 0.60` size factor in pick/single-survivor order
 
-13. **Report**: Send summary to Telegram (optional) and wait 15 minutes for next cycle.
+11. **Judge stage** (`judge_client.judge()`)
+    - Endpoint: `POST $JUDGE_URL/judge` with `Authorization: Bearer $DESK_SECRET`
+    - Question sets (per token):
+      - `market`: shape, momentum_already_spent, liquidity_fits_ticket (always)
+      - `solana` / `bsc` / `robinhood`: chain-specific concentration, authority, honeypot, data coverage (always)
+      - `social`: account_is_the_project, effort, recycled_account, audience_is_real (only if `x_account` exists)
+    - Backend: TypeSafe API (`TYPESAFE_API_KEY`) with model `jev-latest`
+    - Response: `{answers: {question_name: {noul|score|choice, probabilities, confidence}}, model: "jev-X.Y.Z"}`
+    - **NO TRADE path**: Judge unreachable → `JudgeDown` exception, entire cycle stands down (no guessing)
+    - **Malformed question**: 422 response → `JudgeDown` exception, cycle stops permanently (question is wrong and stays wrong)
+    - **Rate limit**: SDK retries 429/529 with backoff automatically
+    - **Budget**: ~10 calls/cycle × ~1,400 tokens × $0.042/Mtok = ~$0.06/day
+
+12. **Soft kill stage** (`filter.soft_kill()`)
+    - Source: Judge answers against `SOFT` thresholds in `thresholds.py`
+    - Checks: concentration ≤0.55, momentum ≤0.60, liquidity fit ≥0.60, social health (if present), shape not "fading"/"one_buyer", shape crowd probability ≥0.55, sell_side_risk not "flagged"/"suspicious"
+    - **NO TRADE path**: All survivors killed → cycle ends with `soft {momentum_already_spent: X, concentration_is_exit_risk: Y, ...}` in stats
+    - **Bench**: 25 min (momentum/shape) to 360 min (social) depending on reason
+
+13. **Survivors check**
+    - Count survivors after all four kills
+    - **NO TRADE path**: Zero survivors → cycle ends with `NO TRADE. seen X, judged Y, killed {...}`
+
+14. **Pick stage** (`pick.pick()`)
+    - **Bypass**: If exactly 1 survivor → create order immediately with `model: "single-survivor"`, no pick call
+    - **Multiple survivors**: Call `judge("pick", state)` with candidate summaries
+    - Question: `best` (choice over tickers) + `worth_trading_at_all` (noul, blanket assessment)
+    - **NO TRADE paths**:
+      - `worth_trading_at_all` < 0.60 → None (today is not a day)
+      - `best` confidence < 0.55 → None (pick too flat)
+      - `best` choice not in survivors list → None (schema violation, log and stand down)
+    - **Size factors applied**:
+      - `DARK_TICKET_CUT = 0.40` if `data_coverage == "dark"` (Robinhood)
+      - `NO_SOCIAL_CUT = 0.60` if no usable X account
+      - These multiply: dark + no social = 0.40 × 0.60 = 0.24× ticket
+
+15. **Shadow or live mode**
+    - **Shadow** (default): `desk.log_shadow(order, stats)` → append to `outbox/shadow.jsonl` with `your_call: None` field for manual review. **NO actual trade**, no `book.take()`, no seat handoff.
+    - **Live** (`--live` + `CONFIRM_LIVE=yes`):
+      1. `book.take(order)` → `INSERT OR REPLACE INTO position VALUES (1, ticker, addr, net, time.time())` — desk now held
+      2. `desk.send_to_seats(order)` → POST to `SEATS_WEBHOOK_URL` or write to `outbox/orders/<order_id>.json`
+      3. Seats: SIZE → FILLS → RISK (in that order, CHIEF coordinates)
+      4. RISK calls `/book/release` when close is filled → `DELETE FROM position`, desk free again
+
+16. **Report and sleep** (`desk.report()`)
+    - Log line: `ORDER <id> <ticker> on <chain> size xN conf N model <model>` OR `NO TRADE. seen X, benched Y, judged Z, killed {...}`
+    - Telegram: One line per cycle (optional, requires `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`)
+    - Sleep: 15 minutes (`CYCLE_SECONDS = 900`) before next cycle
+
+### Interpreting log output
+
+Every cycle produces a summary line that tells you exactly what happened. Learn to read these at a glance.
+
+#### TRADE logs (shadow or live)
+
+```
+SHADOW would trade TICKER (solana) size x0.60 conf 0.78
+ORDER 2026-09-30T13:42:00Z TICKER on solana size x1.0 conf 0.82 model jev-3.1.4
+```
+
+**Fields:**
+- `size xN`: Size factor applied to `BANK_USD * 0.06` (max SIZE can allow). Factors: `DARK_TICKET_CUT` (0.40), `NO_SOCIAL_CUT` (0.60), or 1.0 baseline
+- `conf N`: Pick confidence (0.55 minimum). Only present for multi-survivor picks, not single-survivor orders
+- `model`: Judge model version (`jev-X.Y.Z`) or `single-survivor` (no pick needed)
+
+#### NO TRADE logs
+
+```
+NO TRADE. seen 247, benched 18, judged 12, killed {'free': {'age': 34, 'liquidity': 89, 'volume': 23}, 'trade': {'trades': 8, 'no_sells': 2}, 'chain': {'authority_open': 3}, 'soft': {'momentum_already_spent': 4, 'shape': 1}}
+```
+
+**Parse it:**
+1. `seen 247`: Total tokens in FOMO shortlist this cycle
+2. `benched 18`: Tokens skipped because still serving bench time from prior cycles
+3. `judged 12`: Tokens that made it to the judge stage (passed free/trade/chain kills)
+4. `killed {...}`: Breakdown by stage and reason
+   - `free`: age/liquidity/volume/mcap (no network cost)
+   - `trade`: no_pair/trades/no_sells (DexScreener cost)
+   - `chain`: honeypot/authority_open/concentration (fact cost)
+   - `soft`: momentum/concentration/social/shape (judge cost)
+
+**Common patterns:**
+- **Heavy free kills** (`free: {age: 200, ...}`): Universe is full of too-young or too-old launches. Normal; free filter doing its job.
+- **No judged tokens** (`judged 0`): All tokens killed at free/trade/chain stages. Budget saved, but may indicate thresholds too tight.
+- **Many judged, all soft-killed** (`judged 25, soft: {...}`): Tokens passed facts but failed judge thresholds. Review `SOFT` in `thresholds.py`.
+- **Zero killed** (`killed {}`): All tokens were benched. Normal in slow markets; bench clears over time.
+
+#### HOLDING logs
+
+```
+HOLDING TICKER for 23 min, no scan
+```
+
+**Meaning:** RISK seat has not yet called `/book/release` for the open position. Desk remains idle until release. If this persists >60 min, check:
+1. RISK seat is running and received the order
+2. Position was closed and RISK called `/book/release`
+3. Release call succeeded (200 response from `$JUDGE_URL/../book/release`)
+
+**Stuck desk recovery:**
+```bash
+# Manually release the book (only if you know the position is closed)
+curl -X POST $JUDGE_URL/../book/release -H "Authorization: Bearer $DESK_SECRET"
+
+# Or query what's held and why
+python run.py --bench
+```
+
+#### Rate limit logs
+
+```
+WARNING:collect:GeckoTerminal 429 on solana page 2, stopping pagination for this network
+WARNING:main.py:dossier failed TICKER: GeckoTerminal 429: over 10/min
+```
+
+**Actions:**
+- **Universe 429**: Set `pages=1` in `main.py` `universe()` call → frees 3 GT slots for dossiers
+- **Dossier 429**: Reduce dossier budget (currently `GT_DOSSIER = 3`) or wait for rate limit reset
+- **DexScreener 429**: Lower `DEX_BUDGET` in `main.py` (default 25)
+
+#### Judge failure logs
+
+```
+WARNING:main.py:judge failed TICKER: timeout
+ERROR:main.py:malformed question set, stopping cycle: 422 Client Error
+```
+
+**Meanings:**
+- **Timeout/unreachable**: Network issue, judge server down. Cycle stands down (`JudgeDown`), no guessing. Token not benched (not its fault).
+- **422 malformed**: Question schema is wrong. Cycle stops permanently until code is fixed. Never retried.
 
 ### Always-on sidecars
 
