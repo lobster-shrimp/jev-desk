@@ -7,6 +7,7 @@ import sys
 import time
 import pathlib
 from unittest.mock import Mock
+import requests
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -116,6 +117,170 @@ def test_filter_tokens_handles_empty_response_object():
     fomo.s.post = Mock(return_value=mock_resp)
     result = fomo._filter_tokens(["addr1:56"])
     assert result == {}
+
+
+def test_filter_tokens_parses_nested_token_structure():
+    """_filter_tokens should handle nested {token: {address, networkId, ...}} structure from live API."""
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "success": True,
+        "statusCode": 200,
+        "message": "Tokens filtered successfully",
+        "responseObject": [
+            {
+                "token": {
+                    "address": "So11111111111111111111111111111111111111112",
+                    "networkId": 1399811149,
+                    "symbol": "SOL",
+                    "marketCap": 85000000000,
+                    "liquidity": 45000000,
+                    "volume24": 125000000,
+                    "priceUSD": 150.45,
+                    "holders": 2500000,
+                    "createdAt": 1609459200000,
+                    "change5m": 0.02,
+                    "change1": 0.05,
+                    "change4": 0.12,
+                    "change24": 0.08
+                },
+                "someOtherField": "ignored"
+            },
+            {
+                "token": {
+                    "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                    "networkId": 1399811149,
+                    "symbol": "USDC",
+                    "marketCap": 45000000000,
+                    "liquidity": 120000000,
+                    "volume24": 850000000,
+                    "priceUSD": 1.00,
+                    "holders": 1800000,
+                    "createdAt": 1625097600000
+                }
+            }
+        ]
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    result = fomo._filter_tokens(["So11111111111111111111111111111111111111112:1399811149",
+                                   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v:1399811149"])
+    assert len(result) == 2
+    assert "So11111111111111111111111111111111111111112:1399811149" in result
+    assert "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v:1399811149" in result
+    # Verify flattened structure has expected fields
+    sol_row = result["So11111111111111111111111111111111111111112:1399811149"]
+    assert sol_row["symbol"] == "SOL"
+    assert sol_row["marketCap"] == 85000000000
+    assert sol_row["networkId"] == 1399811149
+
+
+def test_nested_token_yields_parsed_tokens():
+    """Nested token structure should successfully parse through _row and produce valid token data."""
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "responseObject": [
+            {
+                "token": {
+                    "address": "TestAddr1",
+                    "networkId": 56,
+                    "symbol": "TEST",
+                    "marketCap": 500000,
+                    "liquidity": 80000,
+                    "volume24": 250000,
+                    "priceUSD": 0.05,
+                    "holders": 1500,
+                    "createdAt": int(time.time() * 1000 - 3600000),  # 1 hour ago
+                    "change5m": 0.03,
+                    "change1": 0.08,
+                    "change4": 0.15,
+                    "change24": 0.25
+                }
+            }
+        ]
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    
+    # Full flow: _filter_tokens -> tokens() -> _row()
+    tokens = fomo.tokens(["TestAddr1:56"])
+    assert len(tokens) == 1
+    assert "TestAddr1:56" in tokens
+    
+    token = tokens["TestAddr1:56"]
+    assert token["symbol"] == "TEST"
+    assert token["mcap"] == 500000.0
+    assert token["liq"] == 80000.0
+    assert token["vol24"] == 250000.0
+    assert token["price"] == 0.05
+    assert token["holders"] == 1500
+    assert token["change"][300] == 0.03  # 5m
+    assert token["change"][3600] == 0.08  # 1h
+    assert token["created"] is not None
+
+
+def test_filter_tokens_retries_on_connection_error():
+    """_filter_tokens should retry once on ConnectionError."""
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"responseObject": [{"id": "addr1:56", "symbol": "TKN"}]}
+    
+    # First call raises ConnectionError, second succeeds
+    call_count = [0]
+    def side_effect(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            raise requests.exceptions.ConnectionError("Connection reset by peer")
+        return mock_resp
+    
+    fomo.s.post = Mock(side_effect=side_effect)
+    fomo.s.adapters = {}  # Mock empty adapters dict so close() doesn't fail
+    result = fomo._filter_tokens(["addr1:56"])
+    
+    assert call_count[0] == 2  # Should have retried once
+    assert len(result) == 1
+    assert "addr1:56" in result
+
+
+def test_filter_tokens_retries_on_502():
+    """_filter_tokens should retry once on HTTP 502 Bad Gateway."""
+    fomo = Fomo(bearer="fake-token")
+    mock_502 = Mock()
+    mock_502.status_code = 502
+    mock_200 = Mock()
+    mock_200.status_code = 200
+    mock_200.json.return_value = {"responseObject": [{"id": "addr1:56", "symbol": "TKN"}]}
+    
+    # First call returns 502, second succeeds
+    fomo.s.post = Mock(side_effect=[mock_502, mock_200])
+    result = fomo._filter_tokens(["addr1:56"])
+    
+    assert fomo.s.post.call_count == 2  # Should have retried once
+    assert len(result) == 1
+
+
+def test_flat_and_nested_shapes_both_work():
+    """Verify backward compatibility: both flat and nested structures parse correctly."""
+    fomo = Fomo(bearer="fake-token")
+    
+    # Test with mixed response
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "responseObject": [
+            # Flat structure (old format)
+            {"id": "addr1:56", "symbol": "FLAT", "marketCap": 100000},
+            # Nested structure (new format)
+            {"token": {"address": "addr2", "networkId": 56, "symbol": "NESTED", "marketCap": 200000}}
+        ]
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    result = fomo._filter_tokens(["addr1:56", "addr2:56"])
+    
+    assert len(result) == 2
+    assert "addr1:56" in result
+    assert "addr2:56" in result
+    assert result["addr1:56"]["symbol"] == "FLAT"
+    assert result["addr2:56"]["symbol"] == "NESTED"
 
 
 # ---- filter -------------------------------------------------------------------
@@ -355,3 +520,51 @@ def test_normalise_and_clean_handle():
     assert collect.clean_handle("@good_handle?x=1") == "good_handle"
     assert collect.clean_handle("https://x.com/foo") is None
     assert collect.clean_handle("") is None
+
+
+def test_universe_429_stops_network_not_all():
+    """GeckoTerminal 429 should stop pagination for that network only, not wipe entire universe."""
+    import requests
+    
+    # Mock responses: solana page 1 succeeds, page 2 gets 429, bsc succeeds
+    mock_responses = [
+        # Solana page 1 - success
+        Mock(status_code=200, json=lambda: {
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "solana_addr1"}}}}
+            ]
+        }),
+        # Solana page 2 - 429
+        Mock(status_code=429),
+        # BSC page 1 - success (should still run)
+        Mock(status_code=200, json=lambda: {
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "bsc_addr2"}}}}
+            ]
+        }),
+        # BSC page 2 - success
+        Mock(status_code=200, json=lambda: {
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "bsc_addr3"}}}}
+            ]
+        })
+    ]
+    
+    original_get = requests.get
+    mock_get = Mock(side_effect=mock_responses)
+    requests.get = mock_get
+    
+    try:
+        ids = collect.universe(nets=("solana", "bsc"), pages=2)
+        
+        # Should have IDs from solana page 1 and both bsc pages
+        # (solana stopped at page 2 due to 429, but BSC continued)
+        assert len(ids) >= 2
+        assert any("1399811149" in tid for tid in ids)  # Solana network
+        assert any("56" in tid for tid in ids)  # BSC network
+        
+        # Verify we collected from multiple networks despite 429 on one
+        networks = {tid.split(":")[1] for tid in ids}
+        assert len(networks) >= 2 or len(ids) >= 1  # Got IDs from at least one network
+    finally:
+        requests.get = original_get
