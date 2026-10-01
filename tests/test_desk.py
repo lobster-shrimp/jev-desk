@@ -598,6 +598,218 @@ def test_held_position_means_no_scan(monkeypatch):
     book.release()
 
 
+# ---- ops panel state.json -----------------------------------------------------
+def test_write_state_produces_expected_keys():
+    """write_state should create state.json with all required keys."""
+    import desk as desk_mod
+    desk = desk_mod.Desk()
+    order = {
+        "order_id": "2026-01-01T00:00:00Z",
+        "token": {"ticker": "TEST", "address": "addr1", "network_id": 56, "chain": "bsc"},
+        "size_factor": 0.6,
+        "confidence": 0.82,
+        "model": "jev-3.1.4"
+    }
+    stats = {
+        "seen": 50,
+        "benched": 10,
+        "judged": 5,
+        "free": {"age": 20, "liquidity": 5},
+        "trade": {"no_sells": 2},
+        "chain": {"honeypot": 1},
+        "soft": {"momentum_already_spent": 3},
+        "tokens": [
+            {"tid": "addr1:56", "ticker": "T1", "chain": "bsc", "stage": "free",
+             "reason": "age", "verdict": "DROP", "mcap_usd": 100000,
+             "liquidity_usd": 5000, "age_minutes": 5},
+            {"tid": "addr2:56", "ticker": "T2", "chain": "bsc", "stage": "judged",
+             "reason": None, "verdict": "PASS", "mcap_usd": 500000,
+             "liquidity_usd": 50000, "age_minutes": 42}
+        ]
+    }
+    
+    desk.write_state(order, stats)
+    
+    state_path = desk_mod.OUTBOX / "state.json"
+    assert state_path.exists()
+    
+    import json
+    state = json.loads(state_path.read_text())
+    
+    assert state["demo"] is False
+    assert state["mode"] in ("shadow", "live")
+    assert "updated_at" in state
+    assert "cycle" in state
+    assert state["cycle"]["seen"] == 50
+    assert state["cycle"]["benched"] == 10
+    assert state["cycle"]["judged"] == 5
+    assert state["cycle"]["outcome"] in ("SHADOW", "ORDER", "NO TRADE")
+    assert "killed" in state["cycle"]
+    assert state["cycle"]["killed"]["free"] == {"age": 20, "liquidity": 5}
+    assert state["cycle"]["killed"]["trade"] == {"no_sells": 2}
+    assert state["cycle"]["killed"]["chain"] == {"honeypot": 1}
+    assert state["cycle"]["killed"]["soft"] == {"momentum_already_spent": 3}
+    assert "tokens" in state
+    assert len(state["tokens"]) == 2
+    assert state["tokens"][0]["ticker"] == "T1"
+    assert state["tokens"][0]["stage"] == "free"
+    assert state["tokens"][0]["reason"] == "age"
+    assert state["tokens"][0]["verdict"] == "DROP"
+    assert state["tokens"][1]["verdict"] == "PASS"
+    assert "held" in state
+    assert "bench" in state
+    assert state["pick"] == order
+
+
+def test_write_state_no_trade_cycle():
+    """write_state should handle NO TRADE cycles correctly."""
+    import desk as desk_mod
+    desk = desk_mod.Desk()
+    stats = {
+        "seen": 100,
+        "benched": 50,
+        "judged": 0,
+        "free": {"age": 30, "liquidity": 10, "volume": 5},
+        "trade": {},
+        "chain": {},
+        "soft": {},
+        "tokens": [
+            {"tid": "addr1:56", "ticker": "T1", "chain": "bsc", "stage": "free",
+             "reason": "age", "verdict": "DROP", "mcap_usd": 50000,
+             "liquidity_usd": 2000, "age_minutes": 8}
+        ]
+    }
+    
+    desk.write_state(None, stats)
+    
+    import json
+    state = json.loads((desk_mod.OUTBOX / "state.json").read_text())
+    
+    assert state["demo"] is False
+    assert state["cycle"]["outcome"] == "NO TRADE"
+    assert state["cycle"]["error"] is None
+    assert state["pick"] is None
+
+
+def test_write_state_held_position():
+    """write_state should handle HOLDING cycles correctly."""
+    import desk as desk_mod
+    desk = desk_mod.Desk()
+    stats = {"held": "TICKER", "minutes": 25}
+    
+    desk.write_state(None, stats)
+    
+    import json
+    state = json.loads((desk_mod.OUTBOX / "state.json").read_text())
+    
+    assert state["demo"] is False
+    assert state["cycle"]["outcome"] == "HOLDING"
+    assert state["cycle"]["error"] is None
+
+
+def test_api_state_returns_file():
+    """GET /api/state should return the state.json file."""
+    import os
+    os.environ.setdefault("DESK_SECRET", "test-secret-for-ops-panel-test")
+    os.environ.setdefault("JUDGE_MOCK", "1")
+    
+    import desk as desk_mod
+    desk = desk_mod.Desk()
+    stats = {
+        "seen": 10,
+        "benched": 2,
+        "judged": 1,
+        "free": {"age": 5},
+        "trade": {},
+        "chain": {},
+        "soft": {},
+        "tokens": []
+    }
+    desk.write_state(None, stats)
+    
+    from fastapi.testclient import TestClient
+    import server
+    client = TestClient(server.app)
+    
+    response = client.get("/api/state")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["demo"] is False
+    assert data["cycle"]["seen"] == 10
+
+
+def test_api_state_404_when_missing():
+    """GET /api/state should return 404 with demo:false when state.json doesn't exist."""
+    import os
+    os.environ.setdefault("DESK_SECRET", "test-secret-for-ops-panel-test")
+    os.environ.setdefault("JUDGE_MOCK", "1")
+    
+    import pathlib
+    state_path = pathlib.Path(os.environ.get("DESK_OUTBOX", "outbox")) / "state.json"
+    if state_path.exists():
+        state_path.unlink()
+    
+    from fastapi.testclient import TestClient
+    import server
+    client = TestClient(server.app)
+    
+    response = client.get("/api/state")
+    assert response.status_code == 404
+    data = response.json()
+    assert data["demo"] is False
+    assert data["tokens"] == []
+    assert data["cycle"] is None
+
+
+def test_ops_endpoint_returns_html():
+    """GET /ops should return 200 and HTML."""
+    import os
+    os.environ.setdefault("DESK_SECRET", "test-secret-for-ops-panel-test")
+    os.environ.setdefault("JUDGE_MOCK", "1")
+    
+    from fastapi.testclient import TestClient
+    import server
+    client = TestClient(server.app)
+    
+    response = client.get("/ops")
+    assert response.status_code == 200
+    assert "jev-desk ops" in response.text
+    assert "ops-console" in response.text or "Kill Histograms" in response.text
+
+
+def test_run_once_records_tokens(monkeypatch):
+    """run_once should populate stats['tokens'] with stage/reason for each token."""
+    book.release()
+    ids = [f"Addr{i}:1399811149" for i in range(5)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(collect, "shortlist", lambda fomo, ids: [
+        tok(i) for i in range(5)
+    ])
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {
+        "buys_h1": 540, "sells_h1": 120,
+        "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", lambda t: {
+        **t, "chain": "solana", "top_10_percent": 30,
+        "top_wallet_percent": 0.02, "developer_holding_percentage": 2,
+        "gt_score_details": None, "is_honeypot": None,
+        "mint_authority": None, "freeze_authority": None,
+        "description": "a token", "x_handle": None})
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    assert "tokens" in stats
+    assert len(stats["tokens"]) >= 1
+    
+    for t in stats["tokens"]:
+        assert "tid" in t or "ticker" in t
+        assert "stage" in t
+        assert "verdict" in t
+        if t["verdict"] == "DROP":
+            assert t["reason"] is not None
+
+
 def test_normalise_and_clean_handle():
     m = FakeFomo().tokens(["Addr1:56"])["Addr1:56"]
     t = collect.normalise("Addr1:56", m)

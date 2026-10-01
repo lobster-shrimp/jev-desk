@@ -330,6 +330,29 @@ The desk connects to these external services:
 
 Environment variable reference: `BANK_USD`, `DESK_SECRET`, `JUDGE_URL`, `TYPESAFE_API_KEY`, `FOMO_BEARER`, `CDP_URL`, `SOCIAL_URL`, `SEATS_WEBHOOK_URL`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `DESK_DB`, `JUDGE_MOCK`, `CONFIRM_LIVE`
 
+## Ops panel
+
+A minimal ops panel provides visibility into the running desk with real cycle data only.
+
+**Start the judge and open the panel:**
+
+```bash
+python run.py              # start the shift (or leave it running)
+```
+
+Then visit `http://localhost:8080/ops` in your browser.
+
+**What it shows:**
+- Last cycle outcome (NO TRADE / SHADOW / ORDER / HOLDING)
+- Seen / benched / judged counts
+- Kill histograms by stage (free/trade/chain/soft) with reason counts
+- Held positions from the book
+- Per-token stage/reason rows (real data only, no demo tokens)
+
+**Data source:** The desk writes `outbox/state.json` at the end of each cycle. The panel fetches `/api/state` every 20 seconds.
+
+**Empty states:** If you see "No state.json yet", wait for a cycle to complete. The panel never invents demo tokens.
+
 ## Trade Decision Logic
 
 ### When the desk trades vs when it doesn't
