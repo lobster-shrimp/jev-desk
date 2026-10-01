@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>jev-desk ops</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0a0a0a;
+  color: #e0e0e0;
+  font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 20px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+h1 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 20px;
+  color: #fff;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  margin-left: 8px;
+}
+.badge.shadow { background: #4a5568; color: #fff; }
+.badge.live { background: #e91e63; color: #fff; }
+.meta {
+  margin-bottom: 30px;
+  padding: 15px;
+  background: #111;
+  border-left: 3px solid #333;
+}
+.meta-row {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.meta-row:last-child { margin-bottom: 0; }
+.meta-item {
+  display: flex;
+  gap: 8px;
+}
+.meta-label {
+  color: #888;
+  min-width: 80px;
+}
+.meta-value {
+  color: #e0e0e0;
+  font-weight: 500;
+}
+.outcome-NO_TRADE { color: #64748b; }
+.outcome-SHADOW { color: #fb8c00; }
+.outcome-ORDER { color: #e91e63; }
+.outcome-ERROR { color: #ef5350; }
+.outcome-HOLDING { color: #42a5f5; }
+.section {
+  margin-bottom: 25px;
+}
+.section-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 10px;
+  color: #fff;
+  border-bottom: 1px solid #222;
+  padding-bottom: 5px;
+}
+.histogram {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+.hist-group {
+  background: #111;
+  padding: 10px;
+  border-left: 2px solid #333;
+}
+.hist-group.free { border-left-color: #64748b; }
+.hist-group.trade { border-left-color: #fb8c00; }
+.hist-group.chain { border-left-color: #e91e63; }
+.hist-group.soft { border-left-color: #ab47bc; }
+.hist-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: #888;
+  margin-bottom: 5px;
+  font-weight: 600;
+}
+.hist-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  font-size: 12px;
+}
+.hist-reason { color: #bbb; }
+.hist-count {
+  color: #fff;
+  font-weight: 600;
+  min-width: 30px;
+  text-align: right;
+}
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 10px;
+}
+.stat-box {
+  background: #111;
+  padding: 12px;
+  border-left: 2px solid #333;
+}
+.stat-label {
+  font-size: 11px;
+  color: #888;
+  text-transform: uppercase;
+  margin-bottom: 3px;
+}
+.stat-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: #fff;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #111;
+}
+th {
+  text-align: left;
+  padding: 8px;
+  background: #0a0a0a;
+  color: #888;
+  font-size: 11px;
+  text-transform: uppercase;
+  font-weight: 600;
+  border-bottom: 1px solid #222;
+}
+td {
+  padding: 6px 8px;
+  border-bottom: 1px solid #1a1a1a;
+  font-size: 12px;
+}
+tr:hover td { background: #151515; }
+.stage-free { color: #64748b; }
+.stage-trade { color: #fb8c00; }
+.stage-chain { color: #e91e63; }
+.stage-soft { color: #ab47bc; }
+.stage-judged { color: #66bb6a; }
+.verdict-PASS { color: #66bb6a; }
+.verdict-DROP { color: #ef5350; }
+.empty {
+  padding: 30px;
+  text-align: center;
+  color: #555;
+  background: #111;
+  font-style: italic;
+}
+.footer {
+  margin-top: 40px;
+  padding-top: 20px;
+  border-top: 1px solid #222;
+  color: #555;
+  font-size: 11px;
+  text-align: center;
+}
+.error {
+  padding: 15px;
+  background: #2c1515;
+  border-left: 3px solid #ef5350;
+  color: #ffcdd2;
+  margin-bottom: 20px;
+}
+@media (max-width: 768px) {
+  body { padding: 10px; font-size: 12px; }
+  .histogram { grid-template-columns: 1fr; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  table { font-size: 11px; }
+}
+</style>
+</head>
+<body>
+<h1>jev-desk ops<span id="mode-badge" class="badge shadow">shadow</span></h1>
+
+<div id="error-box" class="error" style="display:none;"></div>
+
+<div class="meta">
+  <div class="meta-row">
+    <div class="meta-item">
+      <span class="meta-label">Updated</span>
+      <span class="meta-value" id="updated-at">—</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Outcome</span>
+      <span class="meta-value" id="outcome">—</span>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">Cycle Stats</div>
+  <div class="stats-grid">
+    <div class="stat-box">
+      <div class="stat-label">Seen</div>
+      <div class="stat-value" id="stat-seen">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Benched</div>
+      <div class="stat-value" id="stat-benched">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Judged</div>
+      <div class="stat-value" id="stat-judged">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Bench Count</div>
+      <div class="stat-value" id="stat-bench">—</div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">Kill Histograms</div>
+  <div id="histograms" class="histogram"></div>
+</div>
+
+<div class="section">
+  <div class="section-title">Held Positions</div>
+  <div id="held-section"></div>
+</div>
+
+<div class="section">
+  <div class="section-title">Tokens (stage/reason)</div>
+  <div id="tokens-section"></div>
+</div>
+
+<div class="footer">
+  Refreshes every 20s · Real data only, no demo tokens
+</div>
+
+<script>
+let lastUpdated = null;
+
+function formatTimestamp(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const now = new Date();
+  const diff = Math.floor((now - d) / 1000);
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return d.toLocaleString();
+}
+
+function renderHistograms(killed) {
+  const stages = ['free', 'trade', 'chain', 'soft'];
+  const histDiv = document.getElementById('histograms');
+  histDiv.innerHTML = '';
+  
+  let hasAny = false;
+  stages.forEach(stage => {
+    const kills = killed[stage] || {};
+    const entries = Object.entries(kills);
+    if (entries.length === 0) return;
+    
+    hasAny = true;
+    const group = document.createElement('div');
+    group.className = `hist-group ${stage}`;
+    
+    const title = document.createElement('div');
+    title.className = 'hist-title';
+    title.textContent = stage;
+    group.appendChild(title);
+    
+    entries.sort((a, b) => b[1] - a[1]).forEach(([reason, count]) => {
+      const item = document.createElement('div');
+      item.className = 'hist-item';
+      item.innerHTML = `<span class="hist-reason">${reason}</span><span class="hist-count">${count}</span>`;
+      group.appendChild(item);
+    });
+    
+    histDiv.appendChild(group);
+  });
+  
+  if (!hasAny) {
+    histDiv.innerHTML = '<div class="empty">No kills this cycle</div>';
+  }
+}
+
+function renderHeld(held) {
+  const section = document.getElementById('held-section');
+  if (!held || held.length === 0) {
+    section.innerHTML = '<div class="empty">No held positions</div>';
+    return;
+  }
+  
+  const table = document.createElement('table');
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>Chain</th>
+        <th>Held For</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${held.map(h => `
+        <tr>
+          <td>${h.ticker || '—'}</td>
+          <td>${h.chain || h.net || '—'}</td>
+          <td>${h.minutes ? Math.round(h.minutes) + 'm' : '—'}</td>
+        </tr>
+      `).join('')}
+    </tbody>
+  `;
+  section.innerHTML = '';
+  section.appendChild(table);
+}
+
+function renderTokens(tokens) {
+  const section = document.getElementById('tokens-section');
+  if (!tokens || tokens.length === 0) {
+    section.innerHTML = '<div class="empty">No token data this cycle</div>';
+    return;
+  }
+  
+  const table = document.createElement('table');
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>Chain</th>
+        <th>Stage</th>
+        <th>Reason</th>
+        <th>Verdict</th>
+        <th>MCap USD</th>
+        <th>Liq USD</th>
+        <th>Age min</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${tokens.map(t => `
+        <tr>
+          <td>${t.ticker || '—'}</td>
+          <td>${t.chain || '—'}</td>
+          <td class="stage-${t.stage}">${t.stage || '—'}</td>
+          <td>${t.reason || '—'}</td>
+          <td class="verdict-${t.verdict}">${t.verdict || '—'}</td>
+          <td>${t.mcap_usd ? Math.round(t.mcap_usd).toLocaleString() : '—'}</td>
+          <td>${t.liquidity_usd ? Math.round(t.liquidity_usd).toLocaleString() : '—'}</td>
+          <td>${t.age_minutes ? Math.round(t.age_minutes) : '—'}</td>
+        </tr>
+      `).join('')}
+    </tbody>
+  `;
+  section.innerHTML = '';
+  section.appendChild(table);
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch('/api/state');
+    if (!resp.ok && resp.status === 404) {
+      const data = await resp.json();
+      if (data.demo === false) {
+        document.getElementById('error-box').textContent = 'No state.json yet — wait for a cycle';
+        document.getElementById('error-box').style.display = 'block';
+        return;
+      }
+    }
+    
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    
+    const state = await resp.json();
+    document.getElementById('error-box').style.display = 'none';
+    
+    if (state.demo === true) {
+      document.getElementById('error-box').textContent = 'Demo mode not supported — ops panel shows real data only';
+      document.getElementById('error-box').style.display = 'block';
+      return;
+    }
+    
+    const badge = document.getElementById('mode-badge');
+    badge.textContent = state.mode;
+    badge.className = `badge ${state.mode}`;
+    
+    document.getElementById('updated-at').textContent = formatTimestamp(state.updated_at);
+    
+    if (state.cycle) {
+      const outcome = state.cycle.outcome || '—';
+      const outcomeEl = document.getElementById('outcome');
+      outcomeEl.textContent = outcome;
+      outcomeEl.className = `meta-value outcome-${outcome.replace(' ', '_')}`;
+      
+      document.getElementById('stat-seen').textContent = state.cycle.seen || 0;
+      document.getElementById('stat-benched').textContent = state.cycle.benched || 0;
+      document.getElementById('stat-judged').textContent = state.cycle.judged || 0;
+      
+      if (state.cycle.killed) {
+        renderHistograms(state.cycle.killed);
+      }
+    }
+    
+    document.getElementById('stat-bench').textContent = state.bench || 0;
+    
+    renderHeld(state.held);
+    renderTokens(state.tokens);
+    
+    lastUpdated = state.updated_at;
+  } catch (err) {
+    document.getElementById('error-box').textContent = `Error: ${err.message}`;
+    document.getElementById('error-box').style.display = 'block';
+  }
+}
+
+refresh();
+setInterval(refresh, 20000);
+</script>
+</body>
+</html>

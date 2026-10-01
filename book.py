@@ -74,3 +74,9 @@ def bench_report(limit: int = 50) -> list[tuple]:
     """For the evening read: what is sitting out and why."""
     return DB.execute("SELECT tid, reason, ROUND((until-?)/60) FROM bench WHERE until>? "
                       "ORDER BY until DESC LIMIT ?", (time.time(), time.time(), limit)).fetchall()
+
+
+def bench_count() -> int:
+    """How many tokens are currently benched."""
+    r = DB.execute("SELECT COUNT(*) FROM bench WHERE until>?", (time.time(),)).fetchone()
+    return r[0] if r else 0

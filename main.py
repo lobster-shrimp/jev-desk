@@ -44,19 +44,31 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
         return None, {"held": h["ticker"], "minutes": round(h["minutes"])}
 
     stats = {"seen": 0, "benched": 0, "free": {}, "trade": {},
-             "chain": {}, "soft": {}, "judged": 0}
+             "chain": {}, "soft": {}, "judged": 0, "tokens": []}
     survivors = []
     gt_slots, dex_slots = gt_dossier, DEX_BUDGET
+
+    def record(t, stage, reason=None):
+        """One row per token for the log and the ops panel: where it stopped and why."""
+        stats["tokens"].append({
+            "tid": t.get("tid"), "ticker": t.get("ticker"), "chain": t.get("chain"),
+            "mcap_usd": t.get("mcap_usd"), "liquidity_usd": t.get("liquidity_usd"),
+            "age_minutes": t.get("age_minutes"),
+            "stage": stage, "reason": reason,
+            "verdict": "PASS" if reason is None else "DROP"
+        })
 
     ids = universe()                             # fresh pools, 3 chains, GT_UNIVERSE slots
     for t in shortlist(fomo, ids):               # pass one: free, no per-token requests
         stats["seen"] += 1
+        t.setdefault("chain", CHAIN_SET.get(t["net"]))
         if book.benched(t["tid"]):               # already judged, still serving its time
             stats["benched"] += 1
             continue
         if (k := free_kill(t)):
             book.sit(t["tid"], k)
             stats["free"][k] = stats["free"].get(k, 0) + 1
+            record(t, "free", k)
             continue
 
         if dex_slots <= 0 or gt_slots <= 0:
@@ -67,6 +79,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
         if (k := trade_kill(t)):
             book.sit(t["tid"], k)
             stats["trade"][k] = stats["trade"].get(k, 0) + 1
+            record(t, "trade", k)
             continue
 
         try:
@@ -76,11 +89,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
             log.warning("dossier failed %s: %s", t["ticker"], e)
             gt_slots -= 1                        # a failed call still cost you the slot
             book.sit(t["tid"], "dossier_failed")
+            record(t, "chain", "dossier_failed")
             continue                             # missing is missing, not a pass
 
         if (k := chain_kill(d)):
             book.sit(t["tid"], k)                # facts bench longest
             stats["chain"][k] = stats["chain"].get(k, 0) + 1
+            record(d, "chain", k)
             continue
 
         d["intended_ticket_usd"] = bank * 0.06   # the most SIZE could ever allow
@@ -103,8 +118,10 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
         if (k := soft_kill(ans)):
             book.sit(t["tid"], k)
             stats["soft"][k] = stats["soft"].get(k, 0) + 1
+            record(d, "soft", k)
             continue
 
+        record(d, "judged", None)
         survivors.append((d, ans))
 
     log.info("cycle: %(seen)s seen, %(benched)s benched, free %(free)s, "
@@ -150,8 +167,21 @@ def main(fomo, judge, desk, shadow=True, once=False):
                 desk.send_to_seats(order)
         except JudgeDown as e:
             log.error("judge down, standing down this cycle: %s", e)
+            # JudgeDown: stand down without writing error state (not inventing tokens)
         except Exception as e:
             log.exception("cycle blew up: %s", e)
+            # Write error state so ops panel shows ERROR instead of stale last-good
+            desk.write_state(None, {
+                "error": str(e),
+                "seen": 0,
+                "benched": 0,
+                "judged": 0,
+                "free": {},
+                "trade": {},
+                "chain": {},
+                "soft": {},
+                "tokens": []
+            })
         if once:
             return
         time.sleep(CYCLE_SECONDS)

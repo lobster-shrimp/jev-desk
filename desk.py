@@ -70,6 +70,7 @@ class Desk:
                  order["size_factor"], order.get("confidence"))
 
     def report(self, order, stats):
+        self.write_state(order, stats)
         if order:
             t = order["token"]
             line = (f"ORDER {order.get('order_id')} {t['ticker']} on {t['chain']} "
@@ -97,6 +98,56 @@ class Desk:
                 self._telegram(f"HANDOFF FAILED for {order['token']['ticker']}: {e}")
         else:
             log.info("no SEATS_WEBHOOK_URL, order written to %s", path)
+
+    def write_state(self, order, stats):
+        """Write outbox/state.json for the ops panel. Real data only, no demo tokens."""
+        import book
+        state_path = OUTBOX / "state.json"
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        
+        tokens = stats.get("tokens", [])
+        if len(tokens) > 100:
+            tokens = tokens[:100]
+        
+        kill_histograms = {
+            "free": stats.get("free", {}),
+            "trade": stats.get("trade", {}),
+            "chain": stats.get("chain", {}),
+            "soft": stats.get("soft", {})
+        }
+        
+        if "held" in stats:
+            outcome = "HOLDING"
+            error = None
+        elif order:
+            outcome = "SHADOW" if not os.environ.get("CONFIRM_LIVE") else "ORDER"
+            error = None
+        elif stats.get("error"):
+            outcome = "ERROR"
+            error = stats.get("error")
+        else:
+            outcome = "NO TRADE"
+            error = None
+        
+        state = {
+            "updated_at": now,
+            "demo": False,
+            "mode": "live" if os.environ.get("CONFIRM_LIVE") == "yes" else "shadow",
+            "cycle": {
+                "seen": stats.get("seen", 0),
+                "benched": stats.get("benched", 0),
+                "judged": stats.get("judged", 0),
+                "killed": kill_histograms,
+                "outcome": outcome,
+                "error": error
+            },
+            "tokens": tokens,
+            "held": [book.held()] if book.held() else [],
+            "bench": book.bench_count(),
+            "pick": order
+        }
+        
+        state_path.write_text(json.dumps(state, default=str))
 
     def _telegram(self, text: str):
         if not (self.tg_token and self.tg_chat):
