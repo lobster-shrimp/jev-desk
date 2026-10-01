@@ -780,12 +780,30 @@ def test_ops_endpoint_returns_html():
 def test_run_once_records_tokens(monkeypatch):
     """run_once should populate stats['tokens'] with stage/reason for each token."""
     book.release()
-    ids = [f"Addr{i}:1399811149" for i in range(5)]
+    
+    # Use unique addresses to avoid collisions with bench entries from earlier tests
+    import time
+    unique_suffix = int(time.time() * 1000000) % 1000000
+    
+    # Create tokens with unique addresses and ensure at least one passes free_kill
+    def fake_shortlist(fomo, id_list):
+        tokens = []
+        for i in range(5):
+            addr = f"UniqueAddr{i}_{unique_suffix}"
+            tid = f"{addr}:1399811149"
+            # Make token 0-1 fail free kill (young), token 2+ pass
+            t = tok(i, tid=tid, addr=addr, age_minutes=10 if i < 2 else 42)
+            tokens.append(t)
+        return tokens
+    
+    ids = [f"UniqueAddr{i}_{unique_suffix}:1399811149" for i in range(5)]
     
     monkeypatch.setattr(shift, "universe", lambda: ids)
-    monkeypatch.setattr(collect, "shortlist", lambda fomo, ids: [
-        tok(i) for i in range(5)
-    ])
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist)
+    
+    # Monkeypatch book.benched to ensure tokens aren't skipped
+    monkeypatch.setattr(book, "benched", lambda tid: False)
+    
     monkeypatch.setattr(shift, "trade_counts", lambda t: {
         "buys_h1": 540, "sells_h1": 120,
         "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000})
@@ -800,7 +818,7 @@ def test_run_once_records_tokens(monkeypatch):
     order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
     
     assert "tokens" in stats
-    assert len(stats["tokens"]) >= 1
+    assert len(stats["tokens"]) >= 1, f"Expected at least 1 token record, got {len(stats['tokens'])}"
     
     for t in stats["tokens"]:
         assert "tid" in t or "ticker" in t

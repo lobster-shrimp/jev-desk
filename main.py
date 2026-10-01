@@ -167,8 +167,21 @@ def main(fomo, judge, desk, shadow=True, once=False):
                 desk.send_to_seats(order)
         except JudgeDown as e:
             log.error("judge down, standing down this cycle: %s", e)
+            # JudgeDown: stand down without writing error state (not inventing tokens)
         except Exception as e:
             log.exception("cycle blew up: %s", e)
+            # Write error state so ops panel shows ERROR instead of stale last-good
+            desk.write_state(None, {
+                "error": str(e),
+                "seen": 0,
+                "benched": 0,
+                "judged": 0,
+                "free": {},
+                "trade": {},
+                "chain": {},
+                "soft": {},
+                "tokens": []
+            })
         if once:
             return
         time.sleep(CYCLE_SECONDS)

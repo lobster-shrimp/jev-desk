@@ -58,7 +58,7 @@ h1 {
   color: #e0e0e0;
   font-weight: 500;
 }
-.outcome-NO.TRADE { color: #64748b; }
+.outcome-NO_TRADE { color: #64748b; }
 .outcome-SHADOW { color: #fb8c00; }
 .outcome-ORDER { color: #e91e63; }
 .outcome-ERROR { color: #ef5350; }
@@ -398,7 +398,7 @@ async function refresh() {
       const outcome = state.cycle.outcome || '—';
       const outcomeEl = document.getElementById('outcome');
       outcomeEl.textContent = outcome;
-      outcomeEl.className = `meta-value outcome-${outcome.replace(' ', '.')}`;
+      outcomeEl.className = `meta-value outcome-${outcome.replace(' ', '_')}`;
       
       document.getElementById('stat-seen').textContent = state.cycle.seen || 0;
       document.getElementById('stat-benched').textContent = state.cycle.benched || 0;
