@@ -1,115 +1,73 @@
 # Bugbot Review Rules for jev-desk
 
-This memecoin launch desk fetches, judges with TypeSafe Jev, and trades. Bugbot reviews should enforce desk-specific conventions and operational safety.
+Memecoin launch desk: fetches, Jev judges, code decides. Enforce desk conventions and trading safety.
 
-## Core Principles
+## Core Safety
 
-### 1. Shadow-First, No Demo Data
-- Never invent or commit fake cycle data in `outbox/state.json` or ops panel state
-- The `demo: false` constraint must hold for all real runs
-- Test fixtures in `tests/` may fake data, but never production state files
+**1. Shadow-First, No Demo Data**
+- Never invent fake cycle data in `outbox/state.json` or ops state (`demo: false` for real runs)
+- Test fixtures may fake data; production state files never
 
-### 2. Secrets Never Touch the Repo
-Flag any PR that adds, logs, or commits:
-- `.env` files (already gitignored, but catch attempts to track them)
-- `DESK_SECRET` values in code, logs, or test output
-- FOMO/Privy bearer tokens (`FOMO_BEARER`, CDP extraction results)
-- Telegram bot tokens (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`)
-- TypeSafe API keys (`TYPESAFE_API_KEY`)
-- Any credential in plaintext comments or docstrings
+**2. Secrets Never Committed**
+Flag PRs adding/logging: `.env`, `DESK_SECRET`, `FOMO_BEARER`, `TYPESAFE_API_KEY`, `TELEGRAM_BOT_TOKEN`, any credential in code/logs/comments
 
-### 3. State Sources: Real Over Marketing
-- Prefer `/api/state`, `outbox/state.json`, and `/ops` panel for observability
-- The ops panel (`ops.html` + `server.py /api/state`) shows real cycle data only
-- Flag PRs that bypass structured state endpoints in favor of ad-hoc logging
+**3. Real State Over Dashboards**
+Prefer `/api/state`, `outbox/state.json`, `/ops` panel. Flag ad-hoc logging bypassing structured endpoints.
 
-## Kill Stage Integrity
+## Kill Stages (Free → Trade → Chain → Soft)
 
-### 4. Four-Stage Filter Order (Free → Trade → Chain → Soft)
-The desk applies kills in strict cost order. Respect existing gates:
-- **Free kills**: age (15 min – 72 hr), liquidity ≥$12k, volume ≥$40k, mcap $60k–$8M
-- **Trade kills**: ≥150 trades/24h, sells must exist if >20 buys/1h
-- **Chain kills**: top wallet ≤5% (Solana), top 10 ≤60%, holders ≥80, authority closed, not honeypot
-- **Soft kills**: judge answer thresholds in `thresholds.py`
+**4. Filter Order Is Sacred**
+Respect cost-ordered gates:
+- **Free**: age 15min–72hr, liquidity ≥$12k, volume ≥$40k, mcap $60k–$8M
+- **Trade**: ≥150 trades/24h, sells exist if >20 buys/1h (DexScreener)
+- **Chain**: top wallet ≤5% (Solana), top10 ≤60%, holders ≥80, authority closed, not honeypot
+- **Soft**: judge thresholds in `thresholds.py`
 
-Flag PRs that:
-- Reorder kill stages (breaks cost discipline)
-- Change numeric thresholds without corresponding test updates in `tests/test_filter.py`
-- Skip gates conditionally without clear justification
+Flag: reordering stages, threshold changes without test updates, conditional gate skips
 
-### 5. Bench Durations Are Intentional
-`book.py` defines `BENCH_MINUTES` per kill reason:
-- Facts (honeypot, authority_open, concentration) bench for ~69 days (100,000 min)
-- Social checks bench for 6 hours (360 min)
-- Momentum checks bench for 25 minutes
+**5. Bench Durations Match Kill Severity**
+Facts bench ~69 days, social 6hr, momentum 25min. Flag accidental duration changes.
 
-Flag accidental changes to these durations without explanation.
+## Network Hardening
 
-## Network Resilience
+**6. FOMO/Gecko 429 Handling Is Intentional**
+- `collect.py`: stop-paging per network on 429, preserve other chains
+- `fomo_api.py`: hourly token refresh via CDP
+- Budgets: GT 6 universe + 3 dossiers, DexScreener 25/cycle
 
-### 6. FOMO/GeckoTerminal Retry and 429 Handling
-Existing backoff and per-network stop-paging behavior is hardening, not cruft:
-- `collect.py` stops pagination on 429 per network, preserves other chains' data
-- `fomo_api.py` refreshes Privy tokens hourly via CDP or fails gracefully
-- GeckoTerminal budget: 6 slots for universe (3 chains × 2 pages), 3 for dossiers
-- DexScreener budget: `DEX_BUDGET = 25` per cycle
+Flag: removing backoff, retrying 422 (malformed questions fail permanently), increasing pagination without budget accounting
 
-Flag PRs that:
-- Remove 429 handling or backoff logic
-- Retry 422 responses (malformed questions are permanent failures)
-- Increase pagination without accounting for rate limits
+**7. RISK Book Release Stays HTTP**
+`POST /book/release` with `DESK_SECRET` is the only release path. Never reintroduce direct `book.release()` from bot prompts (xAI bots cannot import Python). Shared `desk.db` between judge and shift.
 
-### 7. RISK Book Release Must Stay HTTP
-`server.py` `/book/release` endpoint is the only correct way to free the desk:
-- RISK seat calls `POST $JUDGE_URL/../book/release` with `Authorization: Bearer $DESK_SECRET`
-- Never reintroduce direct `book.release()` calls from bot prompts (bots run in xAI cloud, cannot import Python)
-- The book SQLite file (`desk.db`) must be shared by judge and shift processes
+## Python Discipline
 
-## Python Environment
+**8. Lockfile Integrity**
+- `requirements.txt` = compiled lock from `requirements.in` (never hand-edit)
+- Recompile: `uv pip compile requirements.in -o requirements.txt --universal --python-version 3.10`
+- CI: pytest on 3.10–3.14, checks lockfile freshness
 
-### 8. Python 3.10+ Floor and Lockfile Discipline
-- `requirements.txt` is a compiled lock: never hand-edit, always recompile from `requirements.in`
-- CI runs `python -m pytest` on 3.10–3.14 and checks lockfile freshness
-- Recompilation command: `uv pip compile requirements.in -o requirements.txt --universal --python-version 3.10`
+Flag: direct `requirements.txt` edits, lowering Python floor below 3.10
 
-Flag PRs that:
-- Edit `requirements.txt` directly instead of `requirements.in` + recompile
-- Lower the Python floor below 3.10
+## Trading Paths
 
-## Trading Safety
+**9. Shadow/Mock Guards Required**
+Flag PRs adding/modifying live trading without:
+- `shadow=True` default, `CONFIRM_LIVE=yes` guard for `--live`
+- Tests with mocked collectors/judge
+- Docs update (README/GROK_HANDOFF.md)
 
-### 9. Shadow/Mock Guards for Live Execution Paths
-Flag PRs that introduce or modify executable trading/live-order paths without:
-- Clear `shadow=True` default in `main.py` or flags in `run.py`
-- `CONFIRM_LIVE=yes` environment guard for `--live` mode
-- Corresponding tests in `tests/` that exercise the new path with mocked collectors/judge
-- Documentation update in README or GROK_HANDOFF.md explaining the change
+Examples: seat handoff, `book.take()`, FILLS execution
 
-Examples: adding new seat handoff logic, modifying `book.take()`, changing FILLS order execution.
+**10. Size Factors Applied Once**
+`DARK_TICKET_CUT` (0.40), `NO_SOCIAL_CUT` (0.60) applied in `pick.py` for both single-survivor and multi-survivor orders. Flag SIZE seat reapplication (double-cuts).
 
-### 10. Single-Survivor vs Pick Paths
-Both produce orders, both apply size factors:
-- **Single survivor**: no `pick()` call, `model: "single-survivor"`, `confidence: null`
-- **Multiple survivors**: `pick()` returns order after passing `worth_trading_at_all ≥ 0.60` and `confidence ≥ 0.55`
+## Schema Stability
 
-Size factors (`DARK_TICKET_CUT`, `NO_SOCIAL_CUT`) are applied in `pick.py` for both paths. Flag PRs that reapply them in SIZE seat logic (double-cuts the ticket).
+**11. Question Sets Require Tests**
+Three sets: `market`, chain (`solana`/`bsc`/`robinhood`), optional `social`. `questions.py` + `tests/test_questions.py`.
 
-## Questions and Thresholds
+Flag: adding/changing questions without test updates, changing question `type` without updating `filter.soft_kill()`
 
-### 11. Question Sets Are Immutable Without Schema Tests
-The desk asks three question sets per token: `market`, `solana`/`bsc`/`robinhood`, and optionally `social`.
-- `questions.py` defines every question structure
-- `tests/test_questions.py` asserts wire shape
-
-Flag PRs that:
-- Add or change questions without updating `tests/test_questions.py`
-- Change question `type` (noul/score/choice) without updating `filter.soft_kill()` thresholds
-
-### 12. Thresholds Live in One Place
-All numeric gates live in `thresholds.py`:
-- Filter limits (age, liquidity, volume, mcap, trades)
-- Soft kill thresholds (concentration, momentum, social)
-- Pick gates (`PICK_MIN_WORTH`, `PICK_MIN_CONF`)
-- Size factors (`DARK_TICKET_CUT`, `NO_SOCIAL_CUT`)
-
-Flag PRs that hardcode thresholds elsewhere.
+**12. Thresholds Centralized**
+All numeric gates in `thresholds.py`: filter limits, soft kill thresholds, pick gates, size factors. Flag hardcoded thresholds elsewhere.
