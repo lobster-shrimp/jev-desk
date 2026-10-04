@@ -775,6 +775,39 @@ def test_ops_endpoint_returns_html():
     assert response.status_code == 200
     assert "jev-desk ops" in response.text
     assert "ops-console" in response.text or "Kill Histograms" in response.text
+    # Verify new summary section exists
+    assert "summary-box" in response.text
+    assert "What Happened" in response.text
+    assert "Judge Health" in response.text
+
+
+def test_ops_panel_has_summary_and_judge_health():
+    """Ops panel should include summary box and judge health display."""
+    import os
+    os.environ.setdefault("DESK_SECRET", "test-secret-for-ops-panel-test")
+    os.environ.setdefault("JUDGE_MOCK", "1")
+    
+    from fastapi.testclient import TestClient
+    import server
+    client = TestClient(server.app)
+    
+    response = client.get("/ops")
+    assert response.status_code == 200
+    html = response.text
+    
+    # Verify summary section
+    assert 'id="summary-box"' in html
+    assert 'id="summary-content"' in html
+    assert "What Happened" in html
+    
+    # Verify judge health field
+    assert 'id="judge-health"' in html
+    
+    # Verify JavaScript functions for rendering
+    assert "renderSummary" in html
+    assert "renderJudgeHealth" in html
+    assert "summary-highlight" in html  # CSS class for emphasis
+    assert "summary-warning" in html    # CSS class for warnings
 
 
 def test_run_once_records_tokens(monkeypatch):

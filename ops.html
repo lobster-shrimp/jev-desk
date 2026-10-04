@@ -33,6 +33,37 @@ h1 {
 }
 .badge.shadow { background: #4a5568; color: #fff; }
 .badge.live { background: #e91e63; color: #fff; }
+.summary {
+  margin-bottom: 25px;
+  padding: 20px;
+  background: #111;
+  border-left: 4px solid #fb8c00;
+}
+.summary-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 12px;
+}
+.summary-text {
+  font-size: 14px;
+  line-height: 1.6;
+  color: #bbb;
+  margin-bottom: 8px;
+}
+.summary-text:last-child { margin-bottom: 0; }
+.summary-highlight {
+  color: #fb8c00;
+  font-weight: 600;
+}
+.summary-warning {
+  color: #ef5350;
+  font-weight: 600;
+}
+.summary-ok {
+  color: #66bb6a;
+  font-weight: 600;
+}
 .meta {
   margin-bottom: 30px;
   padding: 15px;
@@ -192,6 +223,11 @@ tr:hover td { background: #151515; }
 
 <div id="error-box" class="error" style="display:none;"></div>
 
+<div id="summary-box" class="summary" style="display:none;">
+  <div class="summary-title">What Happened</div>
+  <div id="summary-content"></div>
+</div>
+
 <div class="meta">
   <div class="meta-row">
     <div class="meta-item">
@@ -201,6 +237,10 @@ tr:hover td { background: #151515; }
     <div class="meta-item">
       <span class="meta-label">Outcome</span>
       <span class="meta-value" id="outcome">—</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Judge Health</span>
+      <span class="meta-value" id="judge-health">—</span>
     </div>
   </div>
 </div>
@@ -258,6 +298,122 @@ function formatTimestamp(iso) {
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
   return d.toLocaleString();
+}
+
+function renderSummary(state) {
+  const box = document.getElementById('summary-box');
+  const content = document.getElementById('summary-content');
+  
+  if (!state.cycle) {
+    box.style.display = 'none';
+    return;
+  }
+  
+  const cycle = state.cycle;
+  const seen = cycle.seen || 0;
+  const benched = cycle.benched || 0;
+  const judged = cycle.judged || 0;
+  const killed = cycle.killed || {};
+  
+  const lines = [];
+  
+  // Outcome summary
+  if (cycle.outcome === 'HOLDING') {
+    const held = state.held && state.held.length > 0 ? state.held[0] : null;
+    if (held) {
+      lines.push(`<span class="summary-ok">HOLDING ${held.ticker || '?'} for ${Math.round(held.minutes || 0)} minutes.</span> Desk is owned by RISK, no scan running.`);
+    } else {
+      lines.push(`<span class="summary-ok">HOLDING</span> a position, no scan running.`);
+    }
+  } else if (cycle.outcome === 'ERROR') {
+    lines.push(`<span class="summary-warning">ERROR:</span> ${cycle.error || 'unknown error'}`);
+  } else if (cycle.outcome === 'NO TRADE') {
+    lines.push(`<span class="summary-highlight">NO TRADE</span> this cycle.`);
+  } else if (cycle.outcome === 'SHADOW' || cycle.outcome === 'ORDER') {
+    const order = state.pick;
+    if (order && order.token) {
+      const conf = order.confidence !== null ? ` conf ${order.confidence.toFixed(2)}` : '';
+      lines.push(`<span class="summary-ok">${cycle.outcome}:</span> ${order.token.ticker} on ${order.token.chain}, size x${order.size_factor}${conf}, model ${order.model}`);
+    } else {
+      lines.push(`<span class="summary-ok">${cycle.outcome}</span> this cycle.`);
+    }
+  }
+  
+  // Flow summary
+  if (seen > 0) {
+    const examined = seen - benched;
+    lines.push(`Saw <span class="summary-highlight">${seen}</span> tokens, <span class="summary-highlight">${benched}</span> already benched, examined <span class="summary-highlight">${examined}</span>.`);
+  }
+  
+  // Kill analysis - emphasize age kills
+  const freeKills = killed.free || {};
+  const tradeKills = killed.trade || {};
+  const chainKills = killed.chain || {};
+  const softKills = killed.soft || {};
+  
+  const totalFree = Object.values(freeKills).reduce((a,b) => a+b, 0);
+  const totalTrade = Object.values(tradeKills).reduce((a,b) => a+b, 0);
+  const totalChain = Object.values(chainKills).reduce((a,b) => a+b, 0);
+  const totalSoft = Object.values(softKills).reduce((a,b) => a+b, 0);
+  const totalKilled = totalFree + totalTrade + totalChain + totalSoft;
+  
+  if (totalKilled > 0) {
+    const killParts = [];
+    if (totalFree > 0) killParts.push(`<span class="summary-highlight">${totalFree}</span> free`);
+    if (totalTrade > 0) killParts.push(`<span class="summary-highlight">${totalTrade}</span> trade`);
+    if (totalChain > 0) killParts.push(`<span class="summary-highlight">${totalChain}</span> chain`);
+    if (totalSoft > 0) killParts.push(`<span class="summary-highlight">${totalSoft}</span> soft`);
+    lines.push(`Killed ${killParts.join(', ')}.`);
+    
+    // Emphasize age kills
+    if (freeKills.age > 0) {
+      const ageTokens = (state.tokens || []).filter(t => t.reason === 'age' && t.stage === 'free');
+      if (ageTokens.length > 0) {
+        const ages = ageTokens.map(t => t.age_minutes).filter(a => a != null);
+        if (ages.length > 0) {
+          const avgAge = (ages.reduce((a,b) => a+b, 0) / ages.length).toFixed(1);
+          const minAge = Math.min(...ages).toFixed(1);
+          const maxAge = Math.max(...ages).toFixed(1);
+          lines.push(`<span class="summary-warning">Age kills dominate:</span> ${freeKills.age} tokens dropped at free stage. Ages: ${minAge}–${maxAge} min (avg ${avgAge} min). All killed before judge.`);
+        } else {
+          lines.push(`<span class="summary-warning">Age kills dominate:</span> ${freeKills.age} tokens dropped at free stage, all before judge.`);
+        }
+      }
+    }
+  }
+  
+  // Judge activity
+  if (judged > 0) {
+    lines.push(`Judge saw <span class="summary-ok">${judged}</span> tokens (passed free/trade/chain gates).`);
+  } else if (totalKilled > 0) {
+    lines.push(`<span class="summary-warning">Judge idle:</span> zero tokens made it past free/trade/chain gates.`);
+  }
+  
+  content.innerHTML = lines.map(l => `<div class="summary-text">${l}</div>`).join('');
+  box.style.display = 'block';
+}
+
+function renderJudgeHealth(state) {
+  const el = document.getElementById('judge-health');
+  
+  if (!state.cycle) {
+    el.textContent = '—';
+    return;
+  }
+  
+  const judged = state.cycle.judged || 0;
+  const error = state.cycle.error;
+  
+  if (error) {
+    el.textContent = 'ERROR';
+    el.style.color = '#ef5350';
+  } else if (judged > 0) {
+    el.textContent = `OK (${judged} judged)`;
+    el.style.color = '#66bb6a';
+  } else {
+    el.textContent = 'waiting (0 judged)';
+    el.style.color = '#888';
+  }
 }
 
 function renderHistograms(killed) {
@@ -373,6 +529,7 @@ async function refresh() {
       if (data.demo === false) {
         document.getElementById('error-box').textContent = 'No state.json yet — wait for a cycle';
         document.getElementById('error-box').style.display = 'block';
+        document.getElementById('summary-box').style.display = 'none';
         return;
       }
     }
@@ -385,6 +542,7 @@ async function refresh() {
     if (state.demo === true) {
       document.getElementById('error-box').textContent = 'Demo mode not supported — ops panel shows real data only';
       document.getElementById('error-box').style.display = 'block';
+      document.getElementById('summary-box').style.display = 'none';
       return;
     }
     
@@ -407,6 +565,11 @@ async function refresh() {
       if (state.cycle.killed) {
         renderHistograms(state.cycle.killed);
       }
+      
+      renderSummary(state);
+      renderJudgeHealth(state);
+    } else {
+      document.getElementById('summary-box').style.display = 'none';
     }
     
     document.getElementById('stat-bench').textContent = state.bench || 0;
@@ -418,6 +581,7 @@ async function refresh() {
   } catch (err) {
     document.getElementById('error-box').textContent = `Error: ${err.message}`;
     document.getElementById('error-box').style.display = 'block';
+    document.getElementById('summary-box').style.display = 'none';
   }
 }
 
