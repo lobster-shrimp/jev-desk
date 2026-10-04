@@ -23,6 +23,7 @@ import book
 from collect import universe, shortlist, trade_counts, dossier, social_state
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from pick import pick, size_factor_for
+from thresholds import HARD
 
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
 CYCLE_SECONDS = 900
@@ -59,17 +60,44 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
         })
 
     ids = universe()                             # fresh pools, 3 chains, GT_UNIVERSE slots
-    for t in shortlist(fomo, ids):               # pass one: free, no per-token requests
+    book.expire_defer()                          # drop rows past max age
+    due = book.defer_due()                       # ids ready for rescoring
+    seen_ids = set()
+    combined_ids = []
+    for tid in due + ids:                        # due first, then universe, first occurrence wins
+        if tid not in seen_ids:
+            seen_ids.add(tid)
+            combined_ids.append(tid)
+    
+    shortlist_result = list(shortlist(fomo, combined_ids))
+    shortlist_tids = {t["tid"] for t in shortlist_result}
+    for tid in due:
+        if tid not in shortlist_tids:
+            log.info("defer miss %s", tid)
+            book.forget_defer(tid)
+    
+    for t in shortlist_result:                   # pass one: free, no per-token requests
         stats["seen"] += 1
         t.setdefault("chain", CHAIN_SET.get(t["net"]))
         if book.benched(t["tid"]):               # already judged, still serving its time
             stats["benched"] += 1
             continue
         if (k := free_kill(t)):
+            if k == "age" and t["age_minutes"] < HARD["min_age_minutes"]:
+                now = time.time()
+                ready = now + max(0, (HARD["min_age_minutes"] - t["age_minutes"]) * 60)
+                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                book.defer(t["tid"], ready, drop_at)
+                stats["free"][k] = stats["free"].get(k, 0) + 1
+                record(t, "free", k)
+                continue
             book.sit(t["tid"], k)
+            book.forget_defer(t["tid"])
             stats["free"][k] = stats["free"].get(k, 0) + 1
             record(t, "free", k)
             continue
+
+        book.forget_defer(t["tid"])
 
         if dex_slots <= 0 or gt_slots <= 0:
             break                                # out of budget, not out of ideas
@@ -78,6 +106,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
         dex_slots -= 1
         if (k := trade_kill(t)):
             book.sit(t["tid"], k)
+            book.forget_defer(t["tid"])
             stats["trade"][k] = stats["trade"].get(k, 0) + 1
             record(t, "trade", k)
             continue
@@ -89,11 +118,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
             log.warning("dossier failed %s: %s", t["ticker"], e)
             gt_slots -= 1                        # a failed call still cost you the slot
             book.sit(t["tid"], "dossier_failed")
+            book.forget_defer(t["tid"])
             record(t, "chain", "dossier_failed")
             continue                             # missing is missing, not a pass
 
         if (k := chain_kill(d)):
             book.sit(t["tid"], k)                # facts bench longest
+            book.forget_defer(t["tid"])
             stats["chain"][k] = stats["chain"].get(k, 0) + 1
             record(d, "chain", k)
             continue
@@ -117,6 +148,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
 
         if (k := soft_kill(ans)):
             book.sit(t["tid"], k)
+            book.forget_defer(t["tid"])
             stats["soft"][k] = stats["soft"].get(k, 0) + 1
             record(d, "soft", k)
             continue

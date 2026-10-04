@@ -20,6 +20,11 @@ CREATE TABLE IF NOT EXISTS position(
   ticker TEXT, addr TEXT, net INT, opened_at REAL);
 CREATE TABLE IF NOT EXISTS bench(
   tid TEXT PRIMARY KEY, reason TEXT, until REAL);
+CREATE TABLE IF NOT EXISTS defer(
+  tid TEXT PRIMARY KEY,
+  ready REAL NOT NULL,
+  drop_at REAL NOT NULL
+);
 """)
 
 # how long a rejection stands, by what fired it (minutes)
@@ -38,6 +43,7 @@ BENCH_MINUTES = {
     "trades": 25, "mcap": 25, "age": 20,
 }
 DEFAULT_BENCH = 45
+DEFER_CAP = 200
 
 
 def held():
@@ -80,3 +86,37 @@ def bench_count() -> int:
     """How many tokens are currently benched."""
     r = DB.execute("SELECT COUNT(*) FROM bench WHERE until>?", (time.time(),)).fetchone()
     return r[0] if r else 0
+
+
+def defer(tid: str, ready: float, drop_at: float):
+    """Store a too-young token for later rescoring."""
+    now = time.time()
+    existing = DB.execute("SELECT 1 FROM defer WHERE tid=?", (tid,)).fetchone()
+    if existing:
+        DB.execute("UPDATE defer SET ready=?, drop_at=? WHERE tid=?", (ready, drop_at, tid))
+        DB.commit()
+        return
+    active_count = DB.execute("SELECT COUNT(*) FROM defer WHERE drop_at>?", (now,)).fetchone()[0]
+    if active_count >= DEFER_CAP:
+        return
+    DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, ready, drop_at))
+    DB.commit()
+
+
+def defer_due() -> list[str]:
+    """Tids where ready <= now and drop_at > now."""
+    now = time.time()
+    rows = DB.execute("SELECT tid FROM defer WHERE ready<=? AND drop_at>?", (now, now)).fetchall()
+    return [r[0] for r in rows]
+
+
+def forget_defer(tid: str):
+    """Delete that defer row."""
+    DB.execute("DELETE FROM defer WHERE tid=?", (tid,))
+    DB.commit()
+
+
+def expire_defer():
+    """Delete rows with drop_at <= now."""
+    DB.execute("DELETE FROM defer WHERE drop_at<=?", (time.time(),))
+    DB.commit()
