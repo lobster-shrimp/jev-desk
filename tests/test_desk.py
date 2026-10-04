@@ -2,6 +2,7 @@
 Funnel tests. No network, no key: collectors are faked, the judge is the mock.
     pytest -q
 """
+import logging
 import os
 import sys
 import time
@@ -917,3 +918,175 @@ def test_universe_429_stops_network_not_all():
         assert len(networks) >= 2 or len(ids) >= 1  # Got IDs from at least one network
     finally:
         requests.get = original_get
+
+
+# ---- defer --------------------------------------------------------------------
+def test_defer_young_token_not_benched(monkeypatch):
+    """A token at 2 minutes calls defer and does not call sit. benched is false."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"DeferAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_young(fomo, id_list):
+        t = tok(0, tid=tid, addr="DeferAddr1", age_minutes=2, liquidity_usd=50000)
+        return [t]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    assert not book.benched(tid), f"Token {tid} should not be benched"
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 1, f"Expected 1 defer row, got {len(defer_rows)}"
+    assert stats["free"].get("age", 0) == 1, f"Expected 1 age kill, got {stats['free'].get('age', 0)}"
+
+
+def test_defer_due_token_passed_to_fomo(monkeypatch):
+    """Next run_once: universe returns [], a due row exists, FakeFomo.tokens is called with that tid."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.commit()
+    
+    tid = f"DueAddr1:{1399811149}"
+    now = time.time()
+    book.DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, now - 1, now + 3600))
+    book.DB.commit()
+    
+    monkeypatch.setattr(shift, "universe", lambda: [])
+    
+    fomo_calls = []
+    original_shortlist = collect.shortlist
+    def spy_shortlist(fomo, ids):
+        fomo_calls.append(ids)
+        return original_shortlist(fomo, ids)
+    monkeypatch.setattr(shift, "shortlist", spy_shortlist)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    assert len(fomo_calls) > 0
+    assert tid in fomo_calls[0]
+
+
+def test_free_kill_age_boundaries():
+    """free_kill at 16 minutes is not age, at 5 minutes is age, at 80 hours is age."""
+    assert free_kill(tok(1, age_minutes=16)) is None
+    assert free_kill(tok(1, age_minutes=5)) == "age"
+    assert free_kill(tok(1, age_minutes=80 * 60)) == "age"
+
+
+def test_old_token_benched_not_deferred(monkeypatch):
+    """A token at 80 hours is benched with reason age and has no defer row."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"OldAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_old(fomo, id_list):
+        return [tok(0, tid=tid, addr="OldAddr1", age_minutes=80 * 60)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_old)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    assert book.benched(tid)
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 0
+    bench_rows = book.DB.execute("SELECT reason FROM bench WHERE tid=?", (tid,)).fetchall()
+    assert len(bench_rows) == 1
+    assert bench_rows[0][0] == "age"
+
+
+def test_judge_not_called_for_young_token(monkeypatch):
+    """The judge stand-in is not called for a token under 15 minutes."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.commit()
+    
+    tid = f"YoungAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_young(fomo, id_list):
+        return [tok(0, tid=tid, addr="YoungAddr1", age_minutes=5)]
+    
+    judge_calls = []
+    def spy_judge(question_set, state):
+        judge_calls.append((question_set, state))
+        return JUDGE(question_set, state)
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), spy_judge, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    assert len(judge_calls) == 0
+
+
+def test_defer_miss_forgotten_and_logged(monkeypatch, caplog):
+    """A due id missing from FOMO response is deleted and logged as defer miss."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.commit()
+    
+    tid = f"MissAddr1:{1399811149}"
+    now = time.time()
+    book.DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, now - 1, now + 3600))
+    book.DB.commit()
+    
+    monkeypatch.setattr(shift, "universe", lambda: [])
+    
+    def fake_tokens_miss(self, ids):
+        return {}
+    monkeypatch.setattr(FakeFomo, "tokens", fake_tokens_miss)
+    
+    desk = FakeDesk()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    assert any("defer miss" in rec.message and tid in rec.message for rec in caplog.records)
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 0
+
+
+def test_defer_cap_200(monkeypatch, caplog):
+    """The 201st new id is not inserted, and the log contains defer full."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.commit()
+    
+    now = time.time()
+    for i in range(book.DEFER_CAP):
+        tid = f"CapAddr{i}:1399811149"
+        book.DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, now + 3600, now + 7200))
+    book.DB.commit()
+    
+    new_tid = f"CapAddr{book.DEFER_CAP}:1399811149"
+    ids = [new_tid]
+    
+    def fake_shortlist_cap(fomo, id_list):
+        return [tok(0, tid=new_tid, addr=f"CapAddr{book.DEFER_CAP}", age_minutes=5)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_cap)
+    
+    desk = FakeDesk()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    defer_count = book.DB.execute("SELECT COUNT(*) FROM defer").fetchone()[0]
+    assert defer_count == book.DEFER_CAP
+    
+    new_tid_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (new_tid,)).fetchall()
+    assert len(new_tid_rows) == 0
