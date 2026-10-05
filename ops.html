@@ -345,7 +345,7 @@ function renderSummary(state) {
     lines.push(`Saw <span class="summary-highlight">${seen}</span> tokens, <span class="summary-highlight">${benched}</span> already benched, examined <span class="summary-highlight">${examined}</span>.`);
   }
   
-  // Kill analysis - emphasize age kills
+  // Kill analysis - emphasize age kills and data quality
   const freeKills = killed.free || {};
   const tradeKills = killed.trade || {};
   const chainKills = killed.chain || {};
@@ -380,13 +380,30 @@ function renderSummary(state) {
         }
       }
     }
+    
+    // Data quality breakdown - distinguish missing data from threshold failures
+    const missingDataKills = (freeKills.no_liq || 0) + (freeKills.no_vol || 0) + (freeKills.no_mcap || 0);
+    const thresholdKills = (freeKills.liquidity || 0) + (freeKills.volume || 0) + (freeKills.mcap || 0);
+    
+    if (missingDataKills > 0 || thresholdKills > 0) {
+      const dataParts = [];
+      if (missingDataKills > 0) {
+        dataParts.push(`<span class="summary-warning">${missingDataKills} missing data</span> (no_liq: ${freeKills.no_liq || 0}, no_vol: ${freeKills.no_vol || 0}, no_mcap: ${freeKills.no_mcap || 0})`);
+      }
+      if (thresholdKills > 0) {
+        dataParts.push(`<span class="summary-highlight">${thresholdKills} below thresholds</span> (liq: ${freeKills.liquidity || 0}, vol: ${freeKills.volume || 0}, mcap: ${freeKills.mcap || 0})`);
+      }
+      lines.push(`Data quality: ${dataParts.join(', ')}.`);
+    }
   }
   
-  // Judge activity
+  // Judge activity - never imply health when judged=0
   if (judged > 0) {
     lines.push(`Judge saw <span class="summary-ok">${judged}</span> tokens (passed free/trade/chain gates).`);
   } else if (totalKilled > 0) {
-    lines.push(`<span class="summary-warning">Judge idle:</span> zero tokens made it past free/trade/chain gates.`);
+    lines.push(`<span class="summary-warning">Judge idle:</span> zero tokens made it past free/trade/chain gates. Not healthy even if process is up.`);
+  } else {
+    lines.push(`<span class="summary-warning">No activity:</span> zero tokens examined, judge idle.`);
   }
   
   content.innerHTML = lines.map(l => `<div class="summary-text">${l}</div>`).join('');
@@ -488,6 +505,16 @@ function renderTokens(tokens) {
     return;
   }
   
+  function formatMetric(value, missingLabel = 'missing') {
+    if (value === null || value === undefined) {
+      return `<span style="color: #ef5350;">${missingLabel}</span>`;
+    }
+    if (value === 0) {
+      return `<span style="color: #fb8c00;">$0</span>`;
+    }
+    return '$' + Math.round(value).toLocaleString();
+  }
+  
   const table = document.createElement('table');
   table.innerHTML = `
     <thead>
@@ -510,9 +537,9 @@ function renderTokens(tokens) {
           <td class="stage-${t.stage}">${t.stage || '—'}</td>
           <td>${t.reason || '—'}</td>
           <td class="verdict-${t.verdict}">${t.verdict || '—'}</td>
-          <td>${t.mcap_usd ? Math.round(t.mcap_usd).toLocaleString() : '—'}</td>
-          <td>${t.liquidity_usd ? Math.round(t.liquidity_usd).toLocaleString() : '—'}</td>
-          <td>${t.age_minutes ? Math.round(t.age_minutes) : '—'}</td>
+          <td>${formatMetric(t.mcap_usd)}</td>
+          <td>${formatMetric(t.liquidity_usd)}</td>
+          <td>${t.age_minutes != null ? Math.round(t.age_minutes) : '—'}</td>
         </tr>
       `).join('')}
     </tbody>
