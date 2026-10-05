@@ -90,14 +90,18 @@ def bench_count() -> int:
 
 def defer(tid: str, ready: float, drop_at: float):
     """Store a too-young token for later rescoring."""
+    import logging
+    log = logging.getLogger("desk")
     now = time.time()
     existing = DB.execute("SELECT 1 FROM defer WHERE tid=?", (tid,)).fetchone()
     if existing:
         DB.execute("UPDATE defer SET ready=?, drop_at=? WHERE tid=?", (ready, drop_at, tid))
         DB.commit()
+        log.info("defer update tid=%s ready=%.0f drop_at=%.0f", tid, ready, drop_at)
         return
     active_count = DB.execute("SELECT COUNT(*) FROM defer WHERE drop_at>?", (now,)).fetchone()[0]
     if active_count >= DEFER_CAP:
+        log.warning("defer full, cannot insert tid=%s", tid)
         return
     DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, ready, drop_at))
     DB.commit()
