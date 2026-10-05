@@ -370,6 +370,117 @@ def test_flat_and_nested_shapes_both_work():
     assert result["addr2:56"]["symbol"] == "NESTED"
 
 
+def test_top_level_metrics_with_nested_token_structure():
+    """BUG REPRODUCTION: Market metrics at top level + nested token object should preserve top-level values.
+    
+    This is the exact shape that causes the all-zero liquidity/mcap bug from issue evidence.
+    FOMO returns: {marketCap: X, liquidity: Y, token: {address, networkId}} 
+    The bug: _flatten_nested_token overwrites X and Y with None from token_data.
+    """
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "responseObject": [
+            {
+                # Market metrics at TOP level (the real values)
+                "marketCap": 500000,
+                "liquidity": 80000,
+                "volume24": 250000,
+                "priceUSD": 0.05,
+                "holders": 1500,
+                "createdAt": int(time.time() * 1000 - 3600000),  # 1 hour ago
+                "change5m": 0.03,
+                "change1": 0.08,
+                # Nested token object with ONLY address/network (NOT metrics)
+                "token": {
+                    "address": "TopLevelAddr1",
+                    "networkId": 56
+                }
+            }
+        ]
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    
+    # Full flow: _filter_tokens -> tokens() -> _row()
+    tokens = fomo.tokens(["TopLevelAddr1:56"])
+    assert len(tokens) == 1
+    assert "TopLevelAddr1:56" in tokens
+    
+    token = tokens["TopLevelAddr1:56"]
+    assert token["symbol"] is not None
+    # BUG: These should be 500000/80000 but were being overwritten to None -> 0.0
+    assert token["mcap"] == 500000.0, f"Expected mcap=500000, got {token['mcap']}"
+    assert token["liq"] == 80000.0, f"Expected liq=80000, got {token['liq']}"
+    assert token["vol24"] == 250000.0
+    assert token["price"] == 0.05
+    assert token["holders"] == 1500
+
+
+def test_normalise_preserves_none_for_missing_metrics():
+    """normalise should preserve None for truly missing data, not invent 0.0.
+    
+    Per collect.py contract: 'NEVER invent a number. A field that came back null stays null.'
+    """
+    # Case 1: FOMO returned None for mcap/liq (truly missing data)
+    m = {"symbol": "TEST", "mcap": None, "liq": None, "vol24": None, "price": None,
+         "holders": None, "change": {300: None, 3600: None, 14400: None, 86400: None},
+         "created": int(time.time() * 1000)}
+    
+    t = collect.normalise("addr1:56", m)
+    
+    # Should preserve None, not invent 0.0
+    assert t["mcap_usd"] is None, f"Expected None for missing mcap, got {t['mcap_usd']}"
+    assert t["liquidity_usd"] is None, f"Expected None for missing liq, got {t['liquidity_usd']}"
+    assert t["volume_h24"] is None, f"Expected None for missing vol24, got {t['volume_h24']}"
+
+
+def test_shortlist_ranking_survives_none_metrics():
+    """shortlist should sort without crashing when mcap/vol are None.
+    
+    BUG: After removing 'or 0.0' coercion, the ranking `vol / max(mcap, 1)` would
+    TypeError on None values. Missing data should sort to lowest priority (turnover=0).
+    """
+    from fomo_api import Fomo
+    
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "responseObject": [
+            # Token 1: All real values, high turnover
+            {"token": {"address": "addr1", "networkId": 56},
+             "marketCap": 100000, "liquidity": 50000, "volume24": 80000,
+             "priceUSD": 0.01, "holders": 500, "createdAt": int(time.time() * 1000 - 3600000)},
+            # Token 2: None mcap (should rank lowest)
+            {"token": {"address": "addr2", "networkId": 56},
+             "marketCap": None, "liquidity": 50000, "volume24": 60000,
+             "priceUSD": 0.01, "holders": 500, "createdAt": int(time.time() * 1000 - 3600000)},
+            # Token 3: None volume (should rank lowest)
+            {"token": {"address": "addr3", "networkId": 56},
+             "marketCap": 100000, "liquidity": 50000, "volume24": None,
+             "priceUSD": 0.01, "holders": 500, "createdAt": int(time.time() * 1000 - 3600000)},
+            # Token 4: Real values, low turnover
+            {"token": {"address": "addr4", "networkId": 56},
+             "marketCap": 500000, "liquidity": 50000, "volume24": 10000,
+             "priceUSD": 0.01, "holders": 500, "createdAt": int(time.time() * 1000 - 3600000)},
+        ]
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    
+    # Should not crash
+    tokens = collect.shortlist(fomo, ["addr1:56", "addr2:56", "addr3:56", "addr4:56"])
+    
+    # Should return all 4 tokens
+    assert len(tokens) == 4
+    
+    # High turnover (token 1) should rank first
+    assert tokens[0]["addr"] == "addr1"
+    
+    # None values (tokens 2, 3) should rank lowest (after token 4 with low but real turnover)
+    # Exact order of None values doesn't matter, but they should be at the end
+    none_addrs = {tokens[2]["addr"], tokens[3]["addr"]}
+    assert none_addrs == {"addr2", "addr3"}, f"Expected None tokens at end, got order: {[t['addr'] for t in tokens]}"
+
+
 # ---- filter -------------------------------------------------------------------
 def test_free_kill_order_and_reasons():
     assert free_kill(tok(1)) is None
@@ -378,6 +489,23 @@ def test_free_kill_order_and_reasons():
     assert free_kill(tok(1, liquidity_usd=1000)) == "liquidity"
     assert free_kill(tok(1, volume_h24=10)) == "volume"
     assert free_kill(tok(1, mcap_usd=10)) == "mcap"
+
+
+def test_free_kill_distinguishes_none_from_threshold():
+    """None metrics get distinct kill reasons (no_liq, no_vol, no_mcap) vs threshold failures."""
+    # Real values below threshold
+    assert free_kill(tok(1, liquidity_usd=1000)) == "liquidity"
+    assert free_kill(tok(1, volume_h24=100)) == "volume"
+    assert free_kill(tok(1, mcap_usd=1000)) == "mcap"
+    
+    # None values (missing data)
+    assert free_kill(tok(1, liquidity_usd=None)) == "no_liq"
+    assert free_kill(tok(1, volume_h24=None)) == "no_vol"
+    assert free_kill(tok(1, mcap_usd=None)) == "no_mcap"
+    
+    # Mix: Some real, some None - first failure wins
+    assert free_kill(tok(1, liquidity_usd=None, volume_h24=100)) == "no_liq"
+    assert free_kill(tok(1, liquidity_usd=50000, volume_h24=None)) == "no_vol"
 
 
 def test_trade_kill():
