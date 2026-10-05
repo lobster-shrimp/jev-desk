@@ -184,24 +184,63 @@ class Fomo:
 
     @staticmethod
     def _flatten_nested_token(m: dict, token_data: dict) -> dict:
-        """Flatten nested {token: {...}} structure to flat dict for _row processing."""
-        flattened = dict(m)  # Copy top-level fields
-        # Map nested token fields to flat structure
-        flattened.update({
-            "address": token_data.get("address"),
-            "networkId": token_data.get("networkId") or token_data.get("netId"),
-            "symbol": token_data.get("symbol") or token_data.get("ticker"),
-            "marketCap": token_data.get("marketCap") or token_data.get("mcap"),
-            "liquidity": token_data.get("liquidity") or token_data.get("liq"),
-            "volume24": token_data.get("volume24") or token_data.get("volume24h"),
-            "priceUSD": token_data.get("priceUSD") or token_data.get("price"),
-            "holders": token_data.get("holders") or token_data.get("holderCount"),
-            "createdAt": token_data.get("createdAt") or token_data.get("created"),
-        })
-        # Copy change fields if present
+        """Flatten nested {token: {...}} structure to flat dict for _row processing.
+        
+        Preserve top-level market metrics (marketCap, liquidity, etc.) when they exist,
+        only overwriting with nested values if the nested value is not None.
+        This handles the case where FOMO returns metrics at top level with a nested
+        token object containing only address/networkId.
+        """
+        flattened = dict(m)  # Copy top-level fields (may include market metrics)
+        
+        # Map nested token fields to flat structure, but ONLY if non-None
+        # This preserves top-level values when nested object lacks them
+        updates = {}
+        
+        # Always update address/networkId from token (these define the token identity)
+        if token_data.get("address") is not None:
+            updates["address"] = token_data["address"]
+        netid = token_data.get("networkId") or token_data.get("netId")
+        if netid is not None:
+            updates["networkId"] = netid
+        
+        # For market metrics, only update if present in nested token
+        # (preserves top-level values when nested lacks them)
+        sym = token_data.get("symbol") or token_data.get("ticker")
+        if sym is not None:
+            updates["symbol"] = sym
+        
+        mcap = token_data.get("marketCap") or token_data.get("mcap")
+        if mcap is not None:
+            updates["marketCap"] = mcap
+        
+        liq = token_data.get("liquidity") or token_data.get("liq")
+        if liq is not None:
+            updates["liquidity"] = liq
+        
+        vol = token_data.get("volume24") or token_data.get("volume24h")
+        if vol is not None:
+            updates["volume24"] = vol
+        
+        price = token_data.get("priceUSD") or token_data.get("price")
+        if price is not None:
+            updates["priceUSD"] = price
+        
+        holders = token_data.get("holders") or token_data.get("holderCount")
+        if holders is not None:
+            updates["holders"] = holders
+        
+        created = token_data.get("createdAt") or token_data.get("created")
+        if created is not None:
+            updates["createdAt"] = created
+        
+        flattened.update(updates)
+        
+        # Copy change fields if present in nested token
         for change_key in CHANGE_WINDOWS.keys():
-            if change_key in token_data:
+            if change_key in token_data and token_data[change_key] is not None:
                 flattened[change_key] = token_data[change_key]
+        
         return flattened
 
     @staticmethod

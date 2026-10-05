@@ -370,6 +370,70 @@ def test_flat_and_nested_shapes_both_work():
     assert result["addr2:56"]["symbol"] == "NESTED"
 
 
+def test_top_level_metrics_with_nested_token_structure():
+    """BUG REPRODUCTION: Market metrics at top level + nested token object should preserve top-level values.
+    
+    This is the exact shape that causes the all-zero liquidity/mcap bug from issue evidence.
+    FOMO returns: {marketCap: X, liquidity: Y, token: {address, networkId}} 
+    The bug: _flatten_nested_token overwrites X and Y with None from token_data.
+    """
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "responseObject": [
+            {
+                # Market metrics at TOP level (the real values)
+                "marketCap": 500000,
+                "liquidity": 80000,
+                "volume24": 250000,
+                "priceUSD": 0.05,
+                "holders": 1500,
+                "createdAt": int(time.time() * 1000 - 3600000),  # 1 hour ago
+                "change5m": 0.03,
+                "change1": 0.08,
+                # Nested token object with ONLY address/network (NOT metrics)
+                "token": {
+                    "address": "TopLevelAddr1",
+                    "networkId": 56
+                }
+            }
+        ]
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    
+    # Full flow: _filter_tokens -> tokens() -> _row()
+    tokens = fomo.tokens(["TopLevelAddr1:56"])
+    assert len(tokens) == 1
+    assert "TopLevelAddr1:56" in tokens
+    
+    token = tokens["TopLevelAddr1:56"]
+    assert token["symbol"] is not None
+    # BUG: These should be 500000/80000 but were being overwritten to None -> 0.0
+    assert token["mcap"] == 500000.0, f"Expected mcap=500000, got {token['mcap']}"
+    assert token["liq"] == 80000.0, f"Expected liq=80000, got {token['liq']}"
+    assert token["vol24"] == 250000.0
+    assert token["price"] == 0.05
+    assert token["holders"] == 1500
+
+
+def test_normalise_preserves_none_for_missing_metrics():
+    """normalise should preserve None for truly missing data, not invent 0.0.
+    
+    Per collect.py contract: 'NEVER invent a number. A field that came back null stays null.'
+    """
+    # Case 1: FOMO returned None for mcap/liq (truly missing data)
+    m = {"symbol": "TEST", "mcap": None, "liq": None, "vol24": None, "price": None,
+         "holders": None, "change": {300: None, 3600: None, 14400: None, 86400: None},
+         "created": int(time.time() * 1000)}
+    
+    t = collect.normalise("addr1:56", m)
+    
+    # Should preserve None, not invent 0.0
+    assert t["mcap_usd"] is None, f"Expected None for missing mcap, got {t['mcap_usd']}"
+    assert t["liquidity_usd"] is None, f"Expected None for missing liq, got {t['liquidity_usd']}"
+    assert t["volume_h24"] is None, f"Expected None for missing vol24, got {t['volume_h24']}"
+
+
 # ---- filter -------------------------------------------------------------------
 def test_free_kill_order_and_reasons():
     assert free_kill(tok(1)) is None

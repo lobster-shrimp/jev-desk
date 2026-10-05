@@ -70,12 +70,17 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2) -> list[str]:
 
 def normalise(tid: str, m: dict) -> dict:
     """FOMO's field names become the desk's field names, once, here.
-       Every file downstream reads these names and only these."""
+       Every file downstream reads these names and only these.
+       
+       NEVER invent a number. Preserve None for truly missing data.
+       The `or 0.0` pattern is REMOVED: missing market metrics stay None
+       so downstream filters can distinguish 'no data' from 'zero liquidity'.
+       """
     addr, net = tid.split(":")
     return {"addr": addr, "net": int(net), "tid": tid, "ticker": m["symbol"],
-            "mcap_usd": m["mcap"] or 0.0, "liquidity_usd": m["liq"] or 0.0,
-            "volume_h24": m["vol24"] or 0.0, "price_usd": m["price"],
-            "holder_count": m["holders"] or None,
+            "mcap_usd": m["mcap"], "liquidity_usd": m["liq"],
+            "volume_h24": m["vol24"], "price_usd": m["price"],
+            "holder_count": m["holders"],
             "change": {"5m": m["change"].get(300), "1h": m["change"].get(3600),
                        "4h": m["change"].get(14400), "24h": m["change"].get(86400)},
             "age_minutes": age_minutes(m["created"])}

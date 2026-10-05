@@ -17,12 +17,19 @@ from thresholds import HARD, SOFT, SHAPE_MIN_CROWD
 
 def free_kill(t) -> str | None:
     """Pass one. Runs on the whole universe, costs nothing, touches no network.
-       Everything it reads came back with the FOMO batch."""
+       Everything it reads came back with the FOMO batch.
+       
+       None means missing data (FOMO has no value). Treat it as failing the check:
+       a token with no liquidity data is not tradeable."""
     if not HARD["min_age_minutes"] <= t["age_minutes"] <= HARD["max_age_hours"] * 60:
         return "age"
-    if t["liquidity_usd"] < HARD["min_liquidity_usd"]:      return "liquidity"
-    if t["volume_h24"]    < HARD["min_volume_h24"]:         return "volume"
-    if not HARD["min_mcap_usd"] <= t["mcap_usd"] <= HARD["max_mcap_usd"]:
+    # None or below threshold both fail
+    if t["liquidity_usd"] is None or t["liquidity_usd"] < HARD["min_liquidity_usd"]:
+        return "liquidity"
+    if t["volume_h24"] is None or t["volume_h24"] < HARD["min_volume_h24"]:
+        return "volume"
+    # mcap can be None or outside bounds
+    if t["mcap_usd"] is None or not (HARD["min_mcap_usd"] <= t["mcap_usd"] <= HARD["max_mcap_usd"]):
         return "mcap"
     return None
 
