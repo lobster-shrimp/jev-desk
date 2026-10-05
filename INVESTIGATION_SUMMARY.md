@@ -62,15 +62,28 @@ if t["liquidity_usd"] < HARD["min_liquidity_usd"]:  # 0.0 < 12_000 → True for 
    "liquidity_usd": m["liq"],  # Preserves None for missing data
    ```
 
-3. **Explicit None handling** in `free_kill`:
+3. **Distinct kill reasons** in `free_kill`:
    ```python
-   if t["liquidity_usd"] is None or t["liquidity_usd"] < HARD["min_liquidity_usd"]:
-       return "liquidity"  # Missing data = not tradeable
+   # Missing data gets distinct reasons (no_liq, no_vol, no_mcap)
+   if t["liquidity_usd"] is None:
+       return "no_liq"  # Ops can distinguish from real thin books
+   if t["liquidity_usd"] < HARD["min_liquidity_usd"]:
+       return "liquidity"
+   ```
+
+4. **Safe ranking** in `shortlist`:
+   ```python
+   # Handle None metrics without crashing (treat as turnover=0)
+   def turnover(t):
+       vol, mcap = t["volume_h24"], t["mcap_usd"]
+       if vol is None or mcap is None:
+           return 0.0  # lowest priority for missing data
+       return vol / max(mcap, 1)
    ```
 
 ### New Tests
 
-**Both reproduce the exact bug from your evidence**:
+**Four regression tests covering the bug and follow-up fixes**:
 
 1. `test_top_level_metrics_with_nested_token_structure`  
    FOMO response: `{marketCap: 500000, token: {address, networkId}}`  
@@ -79,7 +92,13 @@ if t["liquidity_usd"] < HARD["min_liquidity_usd"]:  # 0.0 < 12_000 → True for 
 2. `test_normalise_preserves_none_for_missing_metrics`  
    Verifies: `None` stays `None`, not coerced to `0.0`
 
-**Result**: All 48 tests pass ✅
+3. `test_shortlist_ranking_survives_none_metrics`  
+   Verifies: Ranking doesn't crash with None vol/mcap, sorts to lowest priority
+
+4. `test_free_kill_distinguishes_none_from_threshold`  
+   Verifies: `no_liq` vs `liquidity`, `no_vol` vs `volume`, `no_mcap` vs `mcap`
+
+**Result**: All 50 tests pass ✅
 
 ---
 
@@ -98,7 +117,7 @@ if t["liquidity_usd"] < HARD["min_liquidity_usd"]:  # 0.0 < 12_000 → True for 
 ### After (Fixed)
 ```json
 {
-  "cycle": {"seen": 73, "judged": 5, "killed": {"free": {"age": 30, "liquidity": 15, "volume": 10, "mcap": 8}, "trade": {"no_sells": 2}, "soft": {"momentum": 3}}},
+  "cycle": {"seen": 73, "judged": 5, "killed": {"free": {"age": 30, "liquidity": 15, "no_liq": 3, "volume": 8, "no_vol": 2, "mcap": 5}, "trade": {"no_sells": 2}, "soft": {"momentum": 3}}},
   "tokens": [
     {"ticker": "DOOYET", "liquidity_usd": 48000, "mcap_usd": 320000, "age_minutes": 16.96, "verdict": "PASS"}
   ]
@@ -109,6 +128,7 @@ if t["liquidity_usd"] < HARD["min_liquidity_usd"]:  # 0.0 < 12_000 → True for 
 - ✅ `judged > 0` (tokens reach judgement stage)
 - ✅ Real liquidity/mcap values (not zeros)
 - ✅ Diverse kills (age, liquidity, volume, mcap, trades, soft)
+- ✅ **Distinct kill reasons**: `no_liq`/`no_vol`/`no_mcap` for missing data vs `liquidity`/`volume`/`mcap` for real thin books
 - ✅ Funnel flows through all stages
 
 ---
@@ -156,6 +176,8 @@ jq '.cycle.judged' outbox/state.json
 ## Commits on Branch
 
 ```
+3b670db Fix shortlist ranking crash and add distinct None kill reasons
+bf5caf1 Add executive investigation summary
 b5db34a Add next steps guide for fix verification
 42cde4e Add comprehensive root cause analysis document
 cd575a6 Fix zero liquidity/mcap bug from nested FOMO responses
@@ -163,9 +185,9 @@ cd575a6 Fix zero liquidity/mcap bug from nested FOMO responses
 
 **Branch**: `cursor/fix-zero-liquidity-bug-dd7a`  
 **Base**: `main` at f1cb354  
-**Files Changed**: 4 (fomo_api.py, collect.py, filter.py, tests/test_desk.py)  
-**Lines**: +139 / -24  
-**Tests**: 48 passing (46 existing + 2 new)
+**Files Changed**: 7 (code: 3 files, tests: 1 file, docs: 3 files)  
+**Lines**: +1065 / -26  
+**Tests**: 50 passing (46 existing + 4 new regression tests)
 
 ---
 
