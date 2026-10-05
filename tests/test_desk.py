@@ -1048,6 +1048,79 @@ def test_universe_429_stops_network_not_all():
         requests.get = original_get
 
 
+def test_universe_robinhood_one_page():
+    """robinhood fetches only page 1 to avoid 429 rate limits, other networks fetch 2 pages."""
+    import requests
+    
+    # Mock responses: 2 pages for solana, 2 for bsc, 1 for robinhood
+    mock_responses = [
+        # Solana page 1
+        Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "solana_addr1"}}}}]
+        }),
+        # Solana page 2
+        Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "solana_addr2"}}}}]
+        }),
+        # BSC page 1
+        Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_addr3"}}}}]
+        }),
+        # BSC page 2
+        Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_addr4"}}}}]
+        }),
+        # Robinhood page 1 (only page requested)
+        Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "robinhood_addr5"}}}}]
+        })
+    ]
+    
+    original_get = requests.get
+    call_info = []  # Track (url, params) tuples
+    
+    def tracked_get(url, **kwargs):
+        call_info.append((url, kwargs.get("params", {})))
+        return mock_responses.pop(0)
+    
+    requests.get = tracked_get
+    
+    try:
+        ids = collect.universe(nets=("solana", "bsc", "robinhood"), pages=2)
+        
+        # Should have collected 5 IDs total (2 solana + 2 bsc + 1 robinhood)
+        assert len(ids) == 5
+        
+        # Verify all three networks represented
+        assert any("1399811149" in tid for tid in ids)  # Solana
+        assert any("56" in tid for tid in ids)          # BSC
+        assert any("4663" in tid for tid in ids)        # Robinhood
+        
+        # Verify call pattern: 2 solana pages, 2 bsc pages, 1 robinhood page
+        assert len(call_info) == 5
+        
+        # Count calls per network
+        solana_calls = [c for c in call_info if "solana" in c[0]]
+        bsc_calls = [c for c in call_info if "bsc" in c[0]]
+        robinhood_calls = [c for c in call_info if "robinhood" in c[0]]
+        
+        assert len(solana_calls) == 2
+        assert len(bsc_calls) == 2
+        assert len(robinhood_calls) == 1
+        
+        # Verify robinhood only requested page 1
+        assert robinhood_calls[0][1]["page"] == 1
+        
+        # Verify other networks requested both pages
+        assert solana_calls[0][1]["page"] == 1
+        assert solana_calls[1][1]["page"] == 2
+        assert bsc_calls[0][1]["page"] == 1
+        assert bsc_calls[1][1]["page"] == 2
+    finally:
+        requests.get = original_get
+
+
+
 # ---- defer --------------------------------------------------------------------
 def test_defer_young_token_not_benched(monkeypatch):
     """A token at 2 minutes calls defer and does not call sit. benched is false."""

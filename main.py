@@ -28,7 +28,7 @@ from thresholds import HARD
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
 CYCLE_SECONDS = 900
 GT_PER_MINUTE = 10          # free tier
-GT_UNIVERSE   = 6           # 3 chains x 2 pages, spent before the funnel starts
+GT_UNIVERSE   = 5           # 2+2+1 pages (solana+bsc+robinhood; robinhood capped at 1 to avoid 429)
 GT_DOSSIER    = 3           # what is left for dossiers in the same minute
 DEX_BUDGET    = 25          # DexScreener calls per cycle, pass two only
 log = logging.getLogger("desk")
