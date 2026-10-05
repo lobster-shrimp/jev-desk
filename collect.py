@@ -40,10 +40,14 @@ def age_minutes(created) -> float:
 
 def universe(nets=("solana", "bsc", "robinhood"), pages=2) -> list[str]:
     """Where the whole thing starts. Fresh pools per chain -> ['<addr>:<netId>', ...].
-       Costs one GeckoTerminal slot per chain per page, so keep pages small."""
+       Costs one GeckoTerminal slot per chain per page, so keep pages small.
+       
+       robinhood is capped at 1 page to avoid 429 rate limits every cycle.
+       Other networks fetch 2 pages. This gives 5 GT slots total (2+2+1)."""
     ids, seen = [], set()
     for net in nets:
-        for page in range(1, pages + 1):
+        net_pages = 1 if net == "robinhood" else pages
+        for page in range(1, net_pages + 1):
             try:
                 resp = requests.get(f"{GT}/networks/{net}/new_pools",
                                     params={"page": page}, headers=UA, timeout=20)
