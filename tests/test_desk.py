@@ -1183,7 +1183,8 @@ def test_defer_miss_forgotten_and_logged(monkeypatch, caplog):
     with caplog.at_level(logging.INFO):
         order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
     
-    assert any("defer miss" in rec.message and tid in rec.message for rec in caplog.records)
+    assert any("defer outcome" in rec.message and tid in rec.message and "miss" in rec.message 
+               for rec in caplog.records)
     defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
     assert len(defer_rows) == 0
 
@@ -1218,3 +1219,146 @@ def test_defer_cap_200(monkeypatch, caplog):
     
     new_tid_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (new_tid,)).fetchall()
     assert len(new_tid_rows) == 0
+
+
+def test_defer_gate_below_threshold(monkeypatch, caplog):
+    """Young token with liquidity below $12k is not deferred, stays benched as age."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"BelowGateAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_below_gate(fomo, id_list):
+        # $8k liquidity, below the $12k threshold
+        return [tok(0, tid=tid, addr="BelowGateAddr1", age_minutes=5, liquidity_usd=8000)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_below_gate)
+    
+    desk = FakeDesk()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    # Should be benched, not deferred
+    assert book.benched(tid), f"Token {tid} should be benched"
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 0, f"Expected 0 defer rows, got {len(defer_rows)}"
+    
+    # Check for gate rejection log
+    assert any("defer gate_reject" in rec.message and tid in rec.message 
+               for rec in caplog.records), "Expected defer gate_reject log"
+
+
+def test_defer_gate_at_threshold(monkeypatch, caplog):
+    """Young token with liquidity at exactly $12k is deferred."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"AtGateAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_at_gate(fomo, id_list):
+        # Exactly $12k liquidity, at the threshold
+        return [tok(0, tid=tid, addr="AtGateAddr1", age_minutes=5, liquidity_usd=12000)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_at_gate)
+    
+    desk = FakeDesk()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    # Should be deferred, not benched
+    assert not book.benched(tid), f"Token {tid} should not be benched"
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 1, f"Expected 1 defer row, got {len(defer_rows)}"
+    
+    # Check for defer insert log
+    assert any("defer insert" in rec.message and tid in rec.message 
+               for rec in caplog.records), "Expected defer insert log"
+
+
+def test_defer_gate_null_liquidity(monkeypatch, caplog):
+    """Young token with null liquidity is not deferred, stays benched as age."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"NullLiqAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_null_liq(fomo, id_list):
+        # liquidity_usd is None
+        return [tok(0, tid=tid, addr="NullLiqAddr1", age_minutes=5, liquidity_usd=None)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_null_liq)
+    
+    desk = FakeDesk()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    # Should be benched, not deferred
+    assert book.benched(tid), f"Token {tid} should be benched"
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 0, f"Expected 0 defer rows, got {len(defer_rows)}"
+    
+    # Check for gate rejection log with "missing" reason
+    assert any("defer gate_reject" in rec.message and tid in rec.message and "missing" in rec.message
+               for rec in caplog.records), "Expected defer gate_reject log with missing reason"
+
+
+def test_defer_outcome_logging(monkeypatch, caplog):
+    """Defer outcome is logged when a deferred token is rescored and killed by liquidity."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"OutcomeAddr1:{1399811149}"
+    now = time.time()
+    
+    # First cycle: insert a deferred token
+    ids1 = [tid]
+    def fake_shortlist_defer(fomo, id_list):
+        return [tok(0, tid=tid, addr="OutcomeAddr1", age_minutes=5, liquidity_usd=20000)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids1)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_defer)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    # Verify it was deferred
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 1, f"Expected 1 defer row, got {len(defer_rows)}"
+    
+    # Second cycle: token is due but now fails liquidity check
+    book.DB.execute("UPDATE defer SET ready=? WHERE tid=?", (now - 1, tid))
+    book.DB.commit()
+    
+    def fake_shortlist_fail_liq(fomo, id_list):
+        # Now has low liquidity
+        return [tok(0, tid=tid, addr="OutcomeAddr1", age_minutes=16, liquidity_usd=5000)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: [])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_fail_liq)
+    
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    # Should be forgotten with liquidity reason
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 0, f"Expected 0 defer rows after liquidity kill, got {len(defer_rows)}"
+    
+    # Check for defer outcome log
+    assert any("defer outcome" in rec.message and tid in rec.message and "liquidity" in rec.message
+               for rec in caplog.records), "Expected defer outcome log with liquidity reason"
+

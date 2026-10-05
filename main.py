@@ -73,7 +73,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
     shortlist_tids = {t["tid"] for t in shortlist_result}
     for tid in due:
         if tid not in shortlist_tids:
-            log.info("defer miss %s", tid)
+            log.info("defer outcome tid=%s reason=miss", tid)
             book.forget_defer(tid)
     
     for t in shortlist_result:                   # pass one: free, no per-token requests
@@ -84,20 +84,30 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
             continue
         if (k := free_kill(t)):
             if k == "age" and t["age_minutes"] < HARD["min_age_minutes"]:
-                now = time.time()
-                ready = now + max(0, (HARD["min_age_minutes"] - t["age_minutes"]) * 60)
-                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
-                book.defer(t["tid"], ready, drop_at)
-                stats["free"][k] = stats["free"].get(k, 0) + 1
-                record(t, "free", k)
-                continue
+                # Gate defer on liquidity: only defer if liquidity is known and >= threshold
+                liq_usd = t.get("liquidity_usd")
+                if liq_usd is not None and liq_usd >= HARD["min_liquidity_usd"]:
+                    now = time.time()
+                    ready = now + max(0, (HARD["min_age_minutes"] - t["age_minutes"]) * 60)
+                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                    book.defer(t["tid"], ready, drop_at)
+                    log.info("defer insert tid=%s age_minutes=%.1f liquidity_usd=%.0f",
+                             t["tid"], t["age_minutes"], liq_usd)
+                    stats["free"][k] = stats["free"].get(k, 0) + 1
+                    record(t, "free", k)
+                    continue
+                # Below gate: stay age-killed without defer
+                log.info("defer gate_reject tid=%s age_minutes=%.1f liquidity_usd=%s reason=%s",
+                         t["tid"], t["age_minutes"], liq_usd, "missing" if liq_usd is None else "below_threshold")
             book.sit(t["tid"], k)
+            log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])
             stats["free"][k] = stats["free"].get(k, 0) + 1
             record(t, "free", k)
             continue
 
         book.forget_defer(t["tid"])
+        log.info("defer outcome tid=%s reason=pass", t["tid"])
 
         if dex_slots <= 0 or gt_slots <= 0:
             break                                # out of budget, not out of ideas
@@ -106,6 +116,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
         dex_slots -= 1
         if (k := trade_kill(t)):
             book.sit(t["tid"], k)
+            log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])
             stats["trade"][k] = stats["trade"].get(k, 0) + 1
             record(t, "trade", k)
@@ -118,12 +129,14 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
             log.warning("dossier failed %s: %s", t["ticker"], e)
             gt_slots -= 1                        # a failed call still cost you the slot
             book.sit(t["tid"], "dossier_failed")
+            log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
             book.forget_defer(t["tid"])
             record(t, "chain", "dossier_failed")
             continue                             # missing is missing, not a pass
 
         if (k := chain_kill(d)):
             book.sit(t["tid"], k)                # facts bench longest
+            log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])
             stats["chain"][k] = stats["chain"].get(k, 0) + 1
             record(d, "chain", k)
@@ -148,6 +161,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
 
         if (k := soft_kill(ans)):
             book.sit(t["tid"], k)
+            log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])
             stats["soft"][k] = stats["soft"].get(k, 0) + 1
             record(d, "soft", k)
