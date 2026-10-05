@@ -98,8 +98,14 @@ def shortlist(fomo: Fomo, ids: list[str]) -> list[dict]:
             continue
         if t["net"] in GT_NET:
             out.append(t)
-    # turnover ranks the queue. It orders work, it does not decide anything
-    out.sort(key=lambda t: t["volume_h24"] / max(t["mcap_usd"], 1), reverse=True)
+    # turnover ranks the queue. It orders work, it does not decide anything.
+    # Missing data (None) gets lowest priority (treat as turnover = 0).
+    def turnover(t):
+        vol, mcap = t["volume_h24"], t["mcap_usd"]
+        if vol is None or mcap is None:
+            return 0.0  # lowest priority for missing data
+        return vol / max(mcap, 1)
+    out.sort(key=turnover, reverse=True)
     return out
 
 

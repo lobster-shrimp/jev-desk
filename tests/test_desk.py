@@ -434,6 +434,53 @@ def test_normalise_preserves_none_for_missing_metrics():
     assert t["volume_h24"] is None, f"Expected None for missing vol24, got {t['volume_h24']}"
 
 
+def test_shortlist_ranking_survives_none_metrics():
+    """shortlist should sort without crashing when mcap/vol are None.
+    
+    BUG: After removing 'or 0.0' coercion, the ranking `vol / max(mcap, 1)` would
+    TypeError on None values. Missing data should sort to lowest priority (turnover=0).
+    """
+    from fomo_api import Fomo
+    
+    fomo = Fomo(bearer="fake-token")
+    mock_resp = Mock()
+    mock_resp.json.return_value = {
+        "responseObject": [
+            # Token 1: All real values, high turnover
+            {"token": {"address": "addr1", "networkId": 56},
+             "marketCap": 100000, "liquidity": 50000, "volume24": 80000,
+             "priceUSD": 0.01, "holders": 500, "createdAt": int(time.time() * 1000 - 3600000)},
+            # Token 2: None mcap (should rank lowest)
+            {"token": {"address": "addr2", "networkId": 56},
+             "marketCap": None, "liquidity": 50000, "volume24": 60000,
+             "priceUSD": 0.01, "holders": 500, "createdAt": int(time.time() * 1000 - 3600000)},
+            # Token 3: None volume (should rank lowest)
+            {"token": {"address": "addr3", "networkId": 56},
+             "marketCap": 100000, "liquidity": 50000, "volume24": None,
+             "priceUSD": 0.01, "holders": 500, "createdAt": int(time.time() * 1000 - 3600000)},
+            # Token 4: Real values, low turnover
+            {"token": {"address": "addr4", "networkId": 56},
+             "marketCap": 500000, "liquidity": 50000, "volume24": 10000,
+             "priceUSD": 0.01, "holders": 500, "createdAt": int(time.time() * 1000 - 3600000)},
+        ]
+    }
+    fomo.s.post = Mock(return_value=mock_resp)
+    
+    # Should not crash
+    tokens = collect.shortlist(fomo, ["addr1:56", "addr2:56", "addr3:56", "addr4:56"])
+    
+    # Should return all 4 tokens
+    assert len(tokens) == 4
+    
+    # High turnover (token 1) should rank first
+    assert tokens[0]["addr"] == "addr1"
+    
+    # None values (tokens 2, 3) should rank lowest (after token 4 with low but real turnover)
+    # Exact order of None values doesn't matter, but they should be at the end
+    none_addrs = {tokens[2]["addr"], tokens[3]["addr"]}
+    assert none_addrs == {"addr2", "addr3"}, f"Expected None tokens at end, got order: {[t['addr'] for t in tokens]}"
+
+
 # ---- filter -------------------------------------------------------------------
 def test_free_kill_order_and_reasons():
     assert free_kill(tok(1)) is None
@@ -442,6 +489,23 @@ def test_free_kill_order_and_reasons():
     assert free_kill(tok(1, liquidity_usd=1000)) == "liquidity"
     assert free_kill(tok(1, volume_h24=10)) == "volume"
     assert free_kill(tok(1, mcap_usd=10)) == "mcap"
+
+
+def test_free_kill_distinguishes_none_from_threshold():
+    """None metrics get distinct kill reasons (no_liq, no_vol, no_mcap) vs threshold failures."""
+    # Real values below threshold
+    assert free_kill(tok(1, liquidity_usd=1000)) == "liquidity"
+    assert free_kill(tok(1, volume_h24=100)) == "volume"
+    assert free_kill(tok(1, mcap_usd=1000)) == "mcap"
+    
+    # None values (missing data)
+    assert free_kill(tok(1, liquidity_usd=None)) == "no_liq"
+    assert free_kill(tok(1, volume_h24=None)) == "no_vol"
+    assert free_kill(tok(1, mcap_usd=None)) == "no_mcap"
+    
+    # Mix: Some real, some None - first failure wins
+    assert free_kill(tok(1, liquidity_usd=None, volume_h24=100)) == "no_liq"
+    assert free_kill(tok(1, liquidity_usd=50000, volume_h24=None)) == "no_vol"
 
 
 def test_trade_kill():

@@ -19,17 +19,22 @@ def free_kill(t) -> str | None:
     """Pass one. Runs on the whole universe, costs nothing, touches no network.
        Everything it reads came back with the FOMO batch.
        
-       None means missing data (FOMO has no value). Treat it as failing the check:
-       a token with no liquidity data is not tradeable."""
+       None means missing data (FOMO has no value). Distinct kill reasons for None
+       let ops tell missing data from real thin books."""
     if not HARD["min_age_minutes"] <= t["age_minutes"] <= HARD["max_age_hours"] * 60:
         return "age"
-    # None or below threshold both fail
-    if t["liquidity_usd"] is None or t["liquidity_usd"] < HARD["min_liquidity_usd"]:
+    # Missing data gets distinct reason (no_liq vs liquidity, etc.)
+    if t["liquidity_usd"] is None:
+        return "no_liq"
+    if t["liquidity_usd"] < HARD["min_liquidity_usd"]:
         return "liquidity"
-    if t["volume_h24"] is None or t["volume_h24"] < HARD["min_volume_h24"]:
+    if t["volume_h24"] is None:
+        return "no_vol"
+    if t["volume_h24"] < HARD["min_volume_h24"]:
         return "volume"
-    # mcap can be None or outside bounds
-    if t["mcap_usd"] is None or not (HARD["min_mcap_usd"] <= t["mcap_usd"] <= HARD["max_mcap_usd"]):
+    if t["mcap_usd"] is None:
+        return "no_mcap"
+    if not (HARD["min_mcap_usd"] <= t["mcap_usd"] <= HARD["max_mcap_usd"]):
         return "mcap"
     return None
 
