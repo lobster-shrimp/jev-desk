@@ -19,6 +19,7 @@ Failure handling (runs unattended):
   FOMO token expired -> refresh the Privy bearer out of Chrome and continue.
 """
 import logging
+import os
 import time
 
 import book
@@ -29,17 +30,21 @@ from thresholds import HARD
 
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
 CYCLE_SECONDS = 900
-GT_PER_MINUTE = 10          # free tier
+GT_CALLS_PER_MIN = int(os.environ.get("GT_CALLS_PER_MIN", "8"))  # conservative default, configurable
 GT_DOSSIER_RESERVE = 3      # reserve this many slots for dossiers before calling universe
 DEX_BUDGET    = 25          # DexScreener calls per cycle, pass two only
 log = logging.getLogger("desk")
+
+# Shared GT rate limiter for the entire process (not per-cycle)
+_gt_limiter = GTRateLimiter(calls_per_min=GT_CALLS_PER_MIN)
 
 
 class JudgeDown(Exception):
     """The judge is unreachable or a question set is malformed. The cycle stands down."""
 
 
-def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER_RESERVE):
+def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER_RESERVE, 
+             gt_limiter=None):
     if (h := book.held()):                       # RISK owns the desk right now
         log.info("holding %s for %.0f min, no scan this cycle",
                  h["ticker"], h["minutes"])
@@ -50,8 +55,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     survivors = []
     dex_slots = DEX_BUDGET
     
-    # Shared GT rate limiter: prioritize dossiers over universe pagination
-    gt_limiter = GTRateLimiter(capacity=GT_PER_MINUTE)
+    # Use shared GT rate limiter (default to global singleton)
+    if gt_limiter is None:
+        gt_limiter = _gt_limiter
     gt_limiter.reserve(gt_dossier_reserve)  # Log how much reserved
 
     def record(t, stage, reason=None):

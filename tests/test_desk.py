@@ -1004,24 +1004,34 @@ def test_universe_429_stops_network_not_all():
     """GeckoTerminal 429 should stop pagination for that network only, not wipe entire universe."""
     import requests
     
-    # Mock responses: solana page 1 succeeds, page 2 gets 429, bsc succeeds
+    # Mock responses: trending first, then new_pools
+    # solana trending succeeds, bsc trending 429, then new_pools
     mock_responses = [
-        # Solana page 1 - success
-        Mock(status_code=200, json=lambda: {
+        # Solana trending - success
+        Mock(status_code=200, headers={}, json=lambda: {
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "solana_addr_t1"}}}}
+            ]
+        }),
+        # BSC trending - 429 (with retry, so 2 attempts)
+        Mock(status_code=429, headers={"Retry-After": "0.01"}),
+        Mock(status_code=429, headers={}),  # Still 429 after retry
+        # Solana new_pools page 1 - success
+        Mock(status_code=200, headers={}, json=lambda: {
             "data": [
                 {"relationships": {"base_token": {"data": {"id": "solana_addr1"}}}}
             ]
         }),
-        # Solana page 2 - 429
-        Mock(status_code=429),
-        # BSC page 1 - success (should still run)
-        Mock(status_code=200, json=lambda: {
+        # Solana new_pools page 2 - 429
+        Mock(status_code=429, headers={}),
+        # BSC new_pools page 1 - success (should still run despite trending 429)
+        Mock(status_code=200, headers={}, json=lambda: {
             "data": [
                 {"relationships": {"base_token": {"data": {"id": "bsc_addr2"}}}}
             ]
         }),
-        # BSC page 2 - success
-        Mock(status_code=200, json=lambda: {
+        # BSC new_pools page 2 - success
+        Mock(status_code=200, headers={}, json=lambda: {
             "data": [
                 {"relationships": {"base_token": {"data": {"id": "bsc_addr3"}}}}
             ]
@@ -1033,10 +1043,10 @@ def test_universe_429_stops_network_not_all():
     requests.get = mock_get
     
     try:
-        ids = collect.universe(nets=("solana", "bsc"), pages=2)
+        ids = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
         
-        # Should have IDs from solana page 1 and both bsc pages
-        # (solana stopped at page 2 due to 429, but BSC continued)
+        # Should have IDs from solana trending, solana page 1, and both bsc new_pools pages
+        # (bsc trending 429'd, solana new_pools stopped at page 2 due to 429, but BSC new_pools continued)
         assert len(ids) >= 2
         assert any("1399811149" in tid for tid in ids)  # Solana network
         assert any("56" in tid for tid in ids)  # BSC network
@@ -1124,37 +1134,37 @@ def test_universe_includes_trending_pools():
     """universe should fetch trending_pools in addition to new_pools and dedupe."""
     import requests
     
-    # Mock responses: new_pools for 2 networks + trending_pools for 2 networks
+    # Mock responses: trending_pools FIRST (new order), then new_pools
     mock_responses = [
-        # Solana new_pools page 1
-        Mock(status_code=200, json=lambda: {
+        # Solana trending_pools page 1 (called first now)
+        Mock(status_code=200, headers={}, json=lambda: {
             "data": [
-                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}},
+                {"relationships": {"base_token": {"data": {"id": "solana_trend1"}}}},
+                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}}  # will be duplicate later
+            ]
+        }),
+        # BSC trending_pools page 1
+        Mock(status_code=200, headers={}, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_trend1"}}}}]
+        }),
+        # Solana new_pools page 1
+        Mock(status_code=200, headers={}, json=lambda: {
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}},  # duplicate from trending
                 {"relationships": {"base_token": {"data": {"id": "solana_new2"}}}}
             ]
         }),
         # Solana new_pools page 2
-        Mock(status_code=200, json=lambda: {
+        Mock(status_code=200, headers={}, json=lambda: {
             "data": [{"relationships": {"base_token": {"data": {"id": "solana_new3"}}}}]
         }),
         # BSC new_pools page 1
-        Mock(status_code=200, json=lambda: {
+        Mock(status_code=200, headers={}, json=lambda: {
             "data": [{"relationships": {"base_token": {"data": {"id": "bsc_new1"}}}}]
         }),
         # BSC new_pools page 2
-        Mock(status_code=200, json=lambda: {
+        Mock(status_code=200, headers={}, json=lambda: {
             "data": [{"relationships": {"base_token": {"data": {"id": "bsc_new2"}}}}]
-        }),
-        # Solana trending_pools page 1
-        Mock(status_code=200, json=lambda: {
-            "data": [
-                {"relationships": {"base_token": {"data": {"id": "solana_trend1"}}}},
-                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}}  # duplicate
-            ]
-        }),
-        # BSC trending_pools page 1
-        Mock(status_code=200, json=lambda: {
-            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_trend1"}}}}]
         })
     ]
     
@@ -1170,7 +1180,7 @@ def test_universe_includes_trending_pools():
     try:
         ids = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
         
-        # Should have 7 unique IDs (3 solana new + 2 bsc new + 1 solana trend + 1 bsc trend - 1 duplicate)
+        # Should have 7 unique IDs (2 solana trend + 3 solana new + 1 bsc trend + 2 bsc new - 1 duplicate)
         assert len(ids) == 7
         
         # Verify no duplicates
@@ -1362,8 +1372,9 @@ def test_free_kill_logs_none_values(monkeypatch, caplog):
 
 # ---- rate limiter -------------------------------------------------------------
 def test_rate_limiter_spends_budget():
-    """GTRateLimiter should track and spend tokens."""
-    limiter = collect.GTRateLimiter(capacity=10)
+    """GTRateLimiter should track and spend tokens using rolling window."""
+    fake_time = [0.0]
+    limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
     assert limiter.available() == 10
     
     assert limiter.spend(3) is True
@@ -1375,15 +1386,138 @@ def test_rate_limiter_spends_budget():
     # Budget exhausted
     assert limiter.spend(1) is False
     assert limiter.available() == 0
+    
+    # After 60.1s, oldest calls expire and budget refills
+    fake_time[0] += 60.1
+    assert limiter.available() == 10
 
 
 def test_rate_limiter_reserve():
     """GTRateLimiter.reserve() should reserve budget for priority use."""
-    limiter = collect.GTRateLimiter(capacity=10)
+    fake_time = [0.0]
+    limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
     reserved = limiter.reserve(3)
     assert reserved == 3
-    # Tokens still available (reserve just logs, doesn't spend)
-    assert limiter.available() == 10
+    
+    # Non-priority calls can't use reserved slots
+    for _ in range(7):
+        assert limiter.spend(1, priority=False) is True
+    assert limiter.spend(1, priority=False) is False  # 7 spent, 3 reserved
+    
+    # Priority calls can use reserved slots
+    assert limiter.spend(1, priority=True) is True
+    assert limiter.available() == 2
+
+
+def test_rolling_window_no_more_than_n_calls_per_minute():
+    """GTRateLimiter enforces no more than N calls in any 60s window."""
+    fake_time = [0.0]
+    limiter = collect.GTRateLimiter(calls_per_min=5, time_fn=lambda: fake_time[0])
+    
+    # Make 5 calls at different times
+    for i in range(5):
+        fake_time[0] = float(i)
+        assert limiter.spend(1) is True
+    assert limiter.available() == 0
+    
+    # Can't make more calls until window expires
+    assert limiter.spend(1) is False
+    
+    # Advance to t=30 - oldest call at t=0 still in window (30-60=-30, so cutoff=0-60=-60)
+    fake_time[0] = 30.0
+    assert limiter.spend(1) is False
+    
+    # Advance to 60.1s - first call at t=0 expired (cutoff = 60.1-60 = 0.1, so 0.0 < 0.1)
+    fake_time[0] = 60.1
+    assert limiter.available() == 1
+    assert limiter.spend(1) is True
+    
+    # Advance to 61s - second call at t=1 expired (cutoff = 61-60 = 1, so 1.0 < 1 is False, but next check)
+    fake_time[0] = 61.1
+    assert limiter.available() == 1
+
+
+def test_rate_limiter_trending_before_new_pools():
+    """universe should fetch trending_pools before new_pools."""
+    import requests
+    
+    original_get = requests.get
+    call_order = []
+    
+    def mock_get(url, **kwargs):
+        if "trending_pools" in url:
+            call_order.append("trending")
+        elif "new_pools" in url:
+            call_order.append("new")
+        return Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": f"solana_tok1"}}}}]
+        })
+    
+    requests.get = mock_get
+    
+    try:
+        fake_time = [0.0]
+        limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
+        collect.universe(nets=("solana",), pages=2, include_trending=True, limiter=limiter)
+        
+        # Trending should come before all new_pools
+        assert call_order[0] == "trending", f"Expected trending first, got {call_order}"
+        # Then new_pools pages
+        assert "new" in call_order[1:], f"Expected new_pools after trending, got {call_order}"
+    finally:
+        requests.get = original_get
+
+
+def test_rate_limiter_429_retry_with_backoff():
+    """GT 429 on trending should retry once with backoff."""
+    import requests
+    
+    original_get = requests.get
+    call_count = [0]
+    
+    def mock_get(url, **kwargs):
+        call_count[0] += 1
+        if "trending_pools" in url:
+            if call_count[0] == 1:
+                # First call: 429 with Retry-After
+                return Mock(status_code=429, headers={"Retry-After": "0.1"})
+            else:
+                # Second call: success
+                return Mock(status_code=200, json=lambda: {"data": []})
+        return Mock(status_code=200, json=lambda: {"data": []})
+    
+    requests.get = mock_get
+    
+    try:
+        fake_time = [0.0]
+        limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
+        collect.universe(nets=("solana",), pages=1, include_trending=True, limiter=limiter)
+        
+        # Should have retried (2 calls total for trending: 429 + retry)
+        assert call_count[0] >= 2, f"Expected retry, got {call_count[0]} calls"
+    finally:
+        requests.get = original_get
+
+
+def test_rate_limiter_dossier_priority():
+    """Dossier calls (priority=True) can use reserved slots."""
+    fake_time = [0.0]
+    limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
+    limiter.reserve(3)
+    
+    # Use up non-priority budget (7 calls)
+    for _ in range(7):
+        assert limiter.spend(1, priority=False) is True
+    
+    # Non-priority exhausted
+    assert limiter.spend(1, priority=False) is False
+    
+    # Priority can still make 3 calls
+    for _ in range(3):
+        assert limiter.spend(1, priority=True) is True
+    
+    # Now fully exhausted
+    assert limiter.spend(1, priority=True) is False
 
 
 def test_universe_uses_limiter():
@@ -1402,8 +1536,9 @@ def test_universe_uses_limiter():
     requests.get = mock_get
     
     try:
-        # Limiter with only 3 tokens (should stop early)
-        limiter = collect.GTRateLimiter(capacity=3)
+        # Limiter with only 3 slots (should stop early)
+        fake_time = [0.0]
+        limiter = collect.GTRateLimiter(calls_per_min=3, time_fn=lambda: fake_time[0])
         ids = collect.universe(nets=("solana",), pages=5, include_trending=True, limiter=limiter)
         
         # Should have made at most 3 calls (budget exhausted)
@@ -1442,7 +1577,12 @@ def test_dossier_budget_exhausted_raises_retry():
                                             Mock(status_code=200, json=lambda: {"data": {"attributes": {}}}))
     
     try:
-        limiter = collect.GTRateLimiter(capacity=0)  # Budget exhausted
+        fake_time = [0.0]
+        limiter = collect.GTRateLimiter(calls_per_min=5, time_fn=lambda: fake_time[0])
+        # Exhaust budget
+        for _ in range(5):
+            limiter.spend(1, priority=True)
+        
         t = tok(1)
         
         try:
