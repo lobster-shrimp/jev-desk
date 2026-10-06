@@ -2490,8 +2490,13 @@ def test_fomo_partial_502_continues_with_partial_data(monkeypatch):
     assert "error" not in stats or stats.get("error") is None
 
 # ---- age-prioritized dossier work --------------------------------------------
-def test_young_tokens_get_dossier_before_old_with_budget_constraint(monkeypatch, caplog):
+def test_young_tokens_get_dossier_before_old_with_budget_constraint(monkeypatch):
     """When dossier budget is tight, young tokens (<60m) should get dossier attempts before old (≥60m)."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
     # Create 4 tokens: 2 young (<60m), 2 old (≥60m)
     # Old tokens have HIGHER turnover, so they'd normally be prioritized
     # Young tokens have LOWER turnover, but should still get dossier first due to age
