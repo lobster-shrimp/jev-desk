@@ -311,6 +311,32 @@ def trade_counts(t: dict) -> dict:
         return dict(_EMPTY_TRADES)
 
 
+def _normalize_authority(raw_value) -> tuple[bool | None, str | None]:
+    """Normalize GT authority field to tri-state: True=open, False=revoked, None=unknown.
+    
+    Returns (normalized, raw) where:
+    - True means authority is set (open/dangerous)
+    - False means authority is revoked or explicitly disabled
+    - None means unknown/missing data
+    - raw is the original value for debugging
+    """
+    if raw_value is None:
+        return (None, None)
+    if isinstance(raw_value, bool):
+        return (raw_value, str(raw_value))
+    if isinstance(raw_value, str):
+        normalized = raw_value.strip().lower()
+        # Revoked/disabled: 'no', 'false', '', 'null', 'none', '0'
+        if normalized in ('no', 'false', '', 'null', 'none', '0'):
+            return (False, raw_value)
+        # Open/set: 'yes', 'true', or any base58 address (non-empty after stripping)
+        if normalized in ('yes', 'true') or (normalized and normalized not in ('no', 'false', 'null', 'none', '0')):
+            return (True, raw_value)
+        return (None, raw_value)
+    # Unexpected type
+    return (None, str(raw_value))
+
+
 def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     """One GT call per token. Fills what the chain actually has, null where it does not.
     
@@ -330,6 +356,10 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     
     a = resp.json()["data"]["attributes"]
 
+    # Normalize authority fields for Solana tokens
+    mint_auth_normalized, mint_auth_raw = _normalize_authority(a.get("mint_authority"))
+    freeze_auth_normalized, freeze_auth_raw = _normalize_authority(a.get("freeze_authority"))
+
     holders = a.get("holders") or {}
     d = {**t, "chain": net,
          # GT first, FOMO as the fallback. On Robinhood GT is null and FOMO is all you get.
@@ -338,8 +368,10 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
          "developer_holding_percentage": a.get("developer_holding_percentage"),
          "gt_score_details": a.get("gt_score_details"),
          "is_honeypot": a.get("is_honeypot"),
-         "mint_authority": a.get("mint_authority"),
-         "freeze_authority": a.get("freeze_authority"),
+         "mint_authority": mint_auth_normalized,
+         "mint_authority_raw": mint_auth_raw,
+         "freeze_authority": freeze_auth_normalized,
+         "freeze_authority_raw": freeze_auth_raw,
          "description": a.get("description"),
          "x_handle": clean_handle(a.get("twitter_handle"))}
 

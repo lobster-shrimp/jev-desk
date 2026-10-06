@@ -25,7 +25,30 @@ CREATE TABLE IF NOT EXISTS defer(
   ready REAL NOT NULL,
   drop_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS migrations(
+  name TEXT PRIMARY KEY,
+  applied_at REAL NOT NULL
+);
 """)
+
+# One-time migration: clear authority_open bench entries (falsely benched due to 'no' string bug)
+def _apply_migration(name: str, fn):
+    """Apply migration if not already applied."""
+    applied = DB.execute("SELECT 1 FROM migrations WHERE name=?", (name,)).fetchone()
+    if not applied:
+        fn()
+        DB.execute("INSERT INTO migrations VALUES (?,?)", (name, time.time()))
+        DB.commit()
+
+def _clear_authority_open_bench():
+    """Remove bench entries with reason='authority_open' (bug fix migration)."""
+    deleted = DB.execute("DELETE FROM bench WHERE reason='authority_open'").rowcount
+    if deleted > 0:
+        import logging
+        log = logging.getLogger("book")
+        log.info("migration clear_authority_open_bench: removed %d falsely benched tokens", deleted)
+
+_apply_migration("clear_authority_open_bench", _clear_authority_open_bench)
 
 # how long a rejection stands, by what fired it (minutes)
 BENCH_MINUTES = {

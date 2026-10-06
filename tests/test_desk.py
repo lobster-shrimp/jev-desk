@@ -522,7 +522,10 @@ def test_chain_kill_facts_before_judgements():
     assert chain_kill({**base, "top_wallet_percent": 0.2}) == "top_wallet"
     assert chain_kill({**base, "top_10_percent": 80}) == "top_10"
     assert chain_kill({**base, "holder_count": 10}) == "holders"
-    assert chain_kill({**base, "mint_authority": "abc"}) == "authority_open"
+    # After normalization, authority fields are True (open), False (revoked), or None (unknown)
+    assert chain_kill({**base, "mint_authority": True}) == "authority_open"
+    assert chain_kill({**base, "freeze_authority": True}) == "authority_open"
+    assert chain_kill({**base, "mint_authority": False, "freeze_authority": False}) is None
     assert chain_kill({"chain": "bsc", "is_honeypot": True}) == "honeypot"
     assert chain_kill({"chain": "robinhood", "holder_count": None}) is None   # dark is not a kill
 
@@ -2065,4 +2068,246 @@ def test_defer_outcome_logging(monkeypatch, caplog):
     # Check for defer outcome log
     assert any("defer outcome" in rec.message and tid in rec.message and "liquidity" in rec.message
                for rec in caplog.records), "Expected defer outcome log with liquidity reason"
+
+
+# ---- authority normalization --------------------------------------------------
+def test_normalize_authority_revoked_strings():
+    """_normalize_authority should treat 'no', 'false', etc. as False (revoked)."""
+    from collect import _normalize_authority
+    
+    # All these should normalize to False (revoked)
+    for value in ['no', 'NO', 'No', 'false', 'FALSE', 'False', '', 'null', 'NULL', 'none', 'NONE', '0']:
+        normalized, raw = _normalize_authority(value)
+        assert normalized is False, f"Expected False for '{value}', got {normalized}"
+        assert raw == value
+
+
+def test_normalize_authority_open_strings():
+    """_normalize_authority should treat 'yes', 'true', or base58 addresses as True (open)."""
+    from collect import _normalize_authority
+    
+    # All these should normalize to True (open/set)
+    for value in ['yes', 'YES', 'Yes', 'true', 'TRUE', 'True', 
+                  'CBLx6CRcCTtbmgTdxpqnF2dP1MpWbMUjngtNbFTApump',  # base58 address
+                  '5VnbrKandP1dP1MpWbMUjngtNbFTApump']:
+        normalized, raw = _normalize_authority(value)
+        assert normalized is True, f"Expected True for '{value}', got {normalized}"
+        assert raw == value
+
+
+def test_normalize_authority_none_unknown():
+    """_normalize_authority should treat None as None (unknown)."""
+    from collect import _normalize_authority
+    
+    normalized, raw = _normalize_authority(None)
+    assert normalized is None
+    assert raw is None
+
+
+def test_normalize_authority_boolean_values():
+    """_normalize_authority should preserve boolean values."""
+    from collect import _normalize_authority
+    
+    normalized, raw = _normalize_authority(True)
+    assert normalized is True
+    assert raw == "True"
+    
+    normalized, raw = _normalize_authority(False)
+    assert normalized is False
+    assert raw == "False"
+
+
+def test_chain_kill_authority_open_only_on_true():
+    """chain_kill should only return authority_open when mint or freeze is True, not truthy strings."""
+    from filter import chain_kill
+    
+    base = {"chain": "solana", "addr": "test", "top_wallet_percent": 0.01, "top_10_percent": 30,
+            "holder_count": 300}
+    
+    # Both False (revoked): should pass
+    assert chain_kill({**base, "mint_authority": False, "freeze_authority": False}) is None
+    
+    # Both None (unknown): should pass (no kill on GT alone)
+    assert chain_kill({**base, "mint_authority": None, "freeze_authority": None}) is None
+    
+    # mint_authority True: should kill
+    assert chain_kill({**base, "mint_authority": True, "freeze_authority": False}) == "authority_open"
+    
+    # freeze_authority True: should kill
+    assert chain_kill({**base, "mint_authority": False, "freeze_authority": True}) == "authority_open"
+    
+    # Both True: should kill
+    assert chain_kill({**base, "mint_authority": True, "freeze_authority": True}) == "authority_open"
+
+
+def test_chain_kill_preserves_old_behavior_for_other_chains():
+    """chain_kill should not change behavior for bsc/base/robinhood."""
+    from filter import chain_kill
+    
+    # BSC honeypot still kills
+    assert chain_kill({"chain": "bsc", "is_honeypot": True}) == "honeypot"
+    assert chain_kill({"chain": "base", "is_honeypot": True}) == "honeypot"
+    
+    # Top wallet still kills
+    assert chain_kill({"chain": "bsc", "top_wallet_percent": 0.2, "holder_count": 300}) == "top_wallet"
+
+
+def test_dossier_normalizes_authority_fields(monkeypatch):
+    """dossier should normalize mint_authority and freeze_authority and preserve raw values."""
+    import requests
+    from collect import dossier
+    
+    original_get = requests.get
+    
+    def mock_gt_response(*args, **kwargs):
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "data": {
+                "attributes": {
+                    "mint_authority": "no",      # GeckoTerminal returns 'no' as string
+                    "freeze_authority": "no",
+                    "holders": {"count": 500},
+                    "is_honeypot": None
+                }
+            }
+        }
+        return mock_resp
+    
+    requests.get = mock_gt_response
+    
+    try:
+        t = tok(1)
+        result = dossier(t)
+        
+        # Should normalize 'no' to False
+        assert result["mint_authority"] is False, f"Expected False, got {result['mint_authority']}"
+        assert result["freeze_authority"] is False, f"Expected False, got {result['freeze_authority']}"
+        
+        # Should preserve raw values
+        assert result["mint_authority_raw"] == "no"
+        assert result["freeze_authority_raw"] == "no"
+    finally:
+        requests.get = original_get
+
+
+def test_migration_clears_authority_open_bench():
+    """Migration should remove bench entries with reason='authority_open'."""
+    # Insert fake authority_open bench entries
+    now = time.time()
+    book.DB.execute("DELETE FROM bench")
+    book.DB.execute("INSERT INTO bench VALUES (?,?,?)", ("fake1:1399811149", "authority_open", now + 3600))
+    book.DB.execute("INSERT INTO bench VALUES (?,?,?)", ("fake2:1399811149", "authority_open", now + 3600))
+    book.DB.execute("INSERT INTO bench VALUES (?,?,?)", ("fake3:1399811149", "liquidity", now + 3600))
+    book.DB.commit()
+    
+    # Check that they exist
+    rows = book.DB.execute("SELECT COUNT(*) FROM bench WHERE reason='authority_open'").fetchone()
+    assert rows[0] == 2, f"Expected 2 authority_open rows before migration, got {rows[0]}"
+    
+    # Run migration
+    book._clear_authority_open_bench()
+    
+    # Check that authority_open rows are gone
+    rows = book.DB.execute("SELECT COUNT(*) FROM bench WHERE reason='authority_open'").fetchone()
+    assert rows[0] == 0, f"Expected 0 authority_open rows after migration, got {rows[0]}"
+    
+    # Check that other reason rows remain
+    rows = book.DB.execute("SELECT COUNT(*) FROM bench WHERE reason='liquidity'").fetchone()
+    assert rows[0] == 1, f"Expected 1 liquidity row after migration, got {rows[0]}"
+
+
+def test_end_to_end_authority_no_strings_pass(monkeypatch):
+    """End-to-end: token with 'no'/'no' from GT should pass authority check and not be benched."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"NoNoAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_pass(fomo, id_list):
+        return [tok(0, tid=tid, addr="NoNoAddr1", age_minutes=20, liquidity_usd=50000,
+                    volume_h24=100000, mcap_usd=500000)]
+    
+    def fake_dossier_no_no(t, limiter=None):
+        # Simulate GT returning 'no' strings
+        from collect import _normalize_authority
+        mint_norm, mint_raw = _normalize_authority("no")
+        freeze_norm, freeze_raw = _normalize_authority("no")
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None, 
+                "is_honeypot": None, 
+                "mint_authority": mint_norm, "mint_authority_raw": mint_raw,
+                "freeze_authority": freeze_norm, "freeze_authority_raw": freeze_raw,
+                "description": "a token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400, 
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_no_no)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Token should NOT be killed by chain_kill
+    assert stats.get("chain", {}).get("authority_open", 0) == 0, \
+        f"Expected no authority_open kills, got {stats.get('chain', {})}"
+    
+    # Token should NOT be benched as authority_open
+    bench_rows = book.DB.execute("SELECT reason FROM bench WHERE tid=?", (tid,)).fetchall()
+    authority_open_benched = any(row[0] == "authority_open" for row in bench_rows)
+    assert not authority_open_benched, \
+        f"Token should not be benched as authority_open, bench reasons: {[row[0] for row in bench_rows]}"
+
+
+def test_end_to_end_authority_yes_kills(monkeypatch):
+    """End-to-end: token with 'yes' from GT should be killed as authority_open."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"YesAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_pass(fomo, id_list):
+        return [tok(0, tid=tid, addr="YesAddr1", age_minutes=20, liquidity_usd=50000,
+                    volume_h24=100000, mcap_usd=500000)]
+    
+    def fake_dossier_yes(t, limiter=None):
+        # Simulate GT returning 'yes' for mint_authority
+        from collect import _normalize_authority
+        mint_norm, mint_raw = _normalize_authority("yes")
+        freeze_norm, freeze_raw = _normalize_authority("no")
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None, 
+                "is_honeypot": None,
+                "mint_authority": mint_norm, "mint_authority_raw": mint_raw,
+                "freeze_authority": freeze_norm, "freeze_authority_raw": freeze_raw,
+                "description": "a token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400, 
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_yes)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Token SHOULD be killed by chain_kill as authority_open
+    assert stats.get("chain", {}).get("authority_open", 0) == 1, \
+        f"Expected 1 authority_open kill, got {stats.get('chain', {})}"
+    
+    # Token should be benched as authority_open
+    assert book.benched(tid), f"Token should be benched"
+    bench_rows = book.DB.execute("SELECT reason FROM bench WHERE tid=?", (tid,)).fetchall()
+    assert len(bench_rows) == 1
+    assert bench_rows[0][0] == "authority_open"
+
 

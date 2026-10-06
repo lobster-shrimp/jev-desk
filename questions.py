@@ -50,12 +50,13 @@ DEV_LOADED = Noul(
 CHAIN_SOLANA = {                      # 1399811149
     "authority_risk": Choice(
         instructions="Judge contract control risk from `mint_authority` and "
-                     "`freeze_authority`.",
+                     "`freeze_authority`. These fields are normalized: True means open/set, "
+                     "False means revoked, None means unknown.",
         criteria={
-            "renounced": "Both null. Supply cannot be inflated, balances cannot be frozen.",
-            "mint_open": "mint_authority is set. Supply can be inflated at will.",
-            "freeze_open": "freeze_authority is set. Balances can be frozen at will.",
-            "both_open": "Both are set.",
+            "renounced": "Both False or None. Supply cannot be inflated, balances cannot be frozen.",
+            "mint_open": "mint_authority is True. Supply can be inflated at will.",
+            "freeze_open": "freeze_authority is True. Balances can be frozen at will.",
+            "both_open": "Both are True.",
         }),
     "concentration_is_exit_risk": CONCENTRATION,
     "dev_still_loaded": DEV_LOADED,
