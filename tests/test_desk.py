@@ -535,11 +535,16 @@ def test_soft_kill_reads_noul_and_score_and_shape():
             "shape": {"choice": "crowd", "probabilities": {"crowd": 0.8}},
             "effort": {"score": 2.0}}
     assert soft_kill(good) is None
-    assert soft_kill({**good, "concentration_is_exit_risk": {"noul": 0.9}}) == "concentration_is_exit_risk"
-    assert soft_kill({**good, "effort": {"score": 0.2}}) == "effort"
-    assert soft_kill({**good, "shape": {"choice": "fading", "probabilities": {"crowd": 0.1}}}) == "shape"
-    assert soft_kill({**good, "shape": {"choice": "too_early", "probabilities": {"crowd": 0.3}}}) == "shape_weak"
-    assert soft_kill({**good, "sell_side_risk": {"choice": "flagged"}}) == "sell_side"
+    result = soft_kill({**good, "concentration_is_exit_risk": {"noul": 0.9}})
+    assert result == ("concentration_is_exit_risk", 0.9)
+    result = soft_kill({**good, "effort": {"score": 0.2}})
+    assert result == ("effort", 0.2)
+    result = soft_kill({**good, "shape": {"choice": "fading", "probabilities": {"crowd": 0.1}}})
+    assert result == ("shape", 0.1)
+    result = soft_kill({**good, "shape": {"choice": "too_early", "probabilities": {"crowd": 0.3}}})
+    assert result == ("shape_weak", 0.3)
+    result = soft_kill({**good, "sell_side_risk": {"choice": "flagged"}})
+    assert result == ("sell_side", None)
 
 
 # ---- questions / judge contract ----------------------------------------------
@@ -2262,6 +2267,77 @@ def test_end_to_end_authority_no_strings_pass(monkeypatch):
     authority_open_benched = any(row[0] == "authority_open" for row in bench_rows)
     assert not authority_open_benched, \
         f"Token should not be benched as authority_open, bench reasons: {[row[0] for row in bench_rows]}"
+
+
+def test_soft_kill_logs_noul_and_records_in_state(monkeypatch, caplog):
+    """Soft kill should log noul and ticker, and record should store soft_noul and soft_scores."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"SoftKillAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_pass(fomo, id_list):
+        return [tok(0, tid=tid, addr="SoftKillAddr1", age_minutes=20, liquidity_usd=50000,
+                    volume_h24=100000, mcap_usd=500000)]
+    
+    # Mock judge to return a soft kill answer
+    def fake_judge(question_set, state):
+        if question_set == "market":
+            return {"model": "test", "answers": {
+                "concentration_is_exit_risk": {"type": "noul", "noul": 0.75},  # Will kill (max 0.55)
+                "momentum_already_spent": {"type": "noul", "noul": 0.40},
+                "shape": {"type": "choice", "choice": "crowd", "probabilities": {"crowd": 0.8}}
+            }, "usage": {}}
+        elif question_set == "solana":
+            return {"model": "test", "answers": {}, "usage": {}}
+        return {"model": "test", "answers": {}, "usage": {}}
+    
+    def fake_dossier(t, limiter=None):
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None, 
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None, "net": 1399811149}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400, 
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier)
+    
+    desk = FakeDesk()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), fake_judge, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Should have soft-killed
+    assert stats.get("soft", {}).get("concentration_is_exit_risk", 0) == 1
+    
+    # Check log contains detailed soft kill info
+    soft_logs = [r for r in caplog.records if "soft tid=" in r.message and "noul=" in r.message]
+    assert len(soft_logs) >= 1, f"Expected soft kill log, got: {[r.message for r in caplog.records if 'soft' in r.message]}"
+    
+    log_msg = soft_logs[0].message
+    assert "ticker=T0" in log_msg
+    assert "reason=concentration_is_exit_risk" in log_msg
+    assert "noul=0.75" in log_msg
+    assert "age_minutes=" in log_msg  # age is computed from timestamp, just verify it's logged
+    assert "soft_scores=" in log_msg
+    
+    # Check state.json includes soft_noul and soft_scores
+    token_rows = stats.get("tokens", [])
+    soft_killed_rows = [t for t in token_rows if t.get("stage") == "soft"]
+    assert len(soft_killed_rows) == 1, f"Expected 1 soft-killed row, got {len(soft_killed_rows)}"
+    
+    soft_row = soft_killed_rows[0]
+    assert soft_row["reason"] == "concentration_is_exit_risk"
+    assert soft_row.get("soft_noul") == 0.75
+    assert "soft_scores" in soft_row
+    assert soft_row["soft_scores"]["concentration_is_exit_risk"] == 0.75
+    assert soft_row["soft_scores"]["momentum_already_spent"] == 0.40
 
 
 def test_end_to_end_authority_yes_kills(monkeypatch):

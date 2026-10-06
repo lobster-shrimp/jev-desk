@@ -26,7 +26,7 @@ import book
 from collect import universe, shortlist, trade_counts, dossier, social_state, GTRateLimiter, DossierRetryNeeded
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from pick import pick, size_factor_for
-from thresholds import HARD
+from thresholds import HARD, SOFT
 
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
 CYCLE_SECONDS = 900
@@ -60,15 +60,20 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         gt_limiter = _gt_limiter
     gt_limiter.reserve(gt_dossier_reserve)  # Log how much reserved
 
-    def record(t, stage, reason=None):
+    def record(t, stage, reason=None, soft_noul=None, soft_scores=None):
         """One row per token for the log and the ops panel: where it stopped and why."""
-        stats["tokens"].append({
+        row = {
             "tid": t.get("tid"), "ticker": t.get("ticker"), "chain": t.get("chain"),
             "mcap_usd": t.get("mcap_usd"), "liquidity_usd": t.get("liquidity_usd"),
             "age_minutes": t.get("age_minutes"),
             "stage": stage, "reason": reason,
             "verdict": "PASS" if reason is None else "DROP"
-        })
+        }
+        if soft_noul is not None:
+            row["soft_noul"] = soft_noul
+        if soft_scores:
+            row["soft_scores"] = soft_scores
+        stats["tokens"].append(row)
 
     ids = universe(limiter=gt_limiter)           # fresh + trending pools, budget-aware
     book.expire_defer()                          # drop rows past max age
@@ -191,12 +196,26 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             log.warning("judge failed %s: %s", d["ticker"], e)
             continue                             # no bench: the token is not at fault
 
-        if (k := soft_kill(ans)):
-            book.sit(t["tid"], k)
-            log.info("defer outcome tid=%s reason=%s", t["tid"], k)
+        soft_result = soft_kill(ans)
+        if soft_result:
+            reason, noul = soft_result
+            # Collect all SOFT scores that were asked (compact one-line summary)
+            soft_scores = {}
+            for name in SOFT.keys():
+                a = ans.get(name)
+                if a:
+                    v = a.get("noul", a.get("score"))
+                    if v is not None:
+                        soft_scores[name] = v
+            # Log detailed soft kill with noul and age
+            log.info("soft tid=%s ticker=%s reason=%s noul=%s age_minutes=%s soft_scores=%s",
+                     d.get("tid"), d.get("ticker"), reason, noul, d.get("age_minutes"),
+                     {k: round(v, 3) for k, v in soft_scores.items()})
+            book.sit(t["tid"], reason)
+            log.info("defer outcome tid=%s reason=%s", t["tid"], reason)
             book.forget_defer(t["tid"])
-            stats["soft"][k] = stats["soft"].get(k, 0) + 1
-            record(d, "soft", k)
+            stats["soft"][reason] = stats["soft"].get(reason, 0) + 1
+            record(d, "soft", reason, soft_noul=noul, soft_scores=soft_scores)
             continue
 
         record(d, "judged", None)
