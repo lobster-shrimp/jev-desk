@@ -17,6 +17,40 @@ from fomo_api import Fomo                      # Privy bearer out of Chrome over
 
 log = logging.getLogger("collect")
 
+
+class GTRateLimiter:
+    """Token bucket rate limiter for GeckoTerminal API calls.
+    
+    Shared across universe() and dossier() within a cycle. Starts each cycle with
+    a fresh budget (10 calls/min free tier). Prioritizes dossier calls for tokens
+    that passed free_kill over universe pagination."""
+    
+    def __init__(self, capacity: int = 10):
+        self.capacity = capacity
+        self.tokens = capacity
+        self.last_refill = time.time()
+    
+    def available(self) -> int:
+        """How many GT calls remain in this cycle's budget."""
+        return self.tokens
+    
+    def spend(self, cost: int = 1) -> bool:
+        """Try to spend `cost` tokens. Returns True if budget available, False otherwise."""
+        if self.tokens >= cost:
+            self.tokens -= cost
+            log.debug("GT budget: spent %d, %d remain", cost, self.tokens)
+            return True
+        log.warning("GT budget exhausted: tried to spend %d, only %d remain", cost, self.tokens)
+        return False
+    
+    def reserve(self, amount: int) -> int:
+        """Reserve `amount` tokens for priority use (e.g. dossiers). Returns actual reserved."""
+        reserved = min(amount, self.tokens)
+        if reserved > 0:
+            log.info("GT budget: reserved %d for dossiers, %d remain for universe", 
+                     reserved, self.tokens - reserved)
+        return reserved
+
 GT  = "https://api.geckoterminal.com/api/v2"
 DEX = "https://api.dexscreener.com/latest/dex/tokens"
 SOL_RPC = "https://api.mainnet-beta.solana.com"
@@ -26,6 +60,11 @@ UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) desk/1.0",
 # the three chains the desk trades, plus Base which shares the BSC question set
 GT_NET   = {1399811149: "solana", 4663: "robinhood", 56: "bsc", 8453: "base"}
 FOMO_NET = {v: k for k, v in GT_NET.items()}
+
+# Special marker for dossier failures that should trigger retry
+class DossierRetryNeeded(Exception):
+    """Dossier failed due to rate limit / transient error and should be retried."""
+    pass
 
 
 def age_minutes(created) -> float:
@@ -38,7 +77,8 @@ def age_minutes(created) -> float:
     return max(0.0, (time.time() - c) / 60)
 
 
-def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True) -> list[str]:
+def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, 
+             limiter: GTRateLimiter | None = None) -> list[str]:
     """Where the whole thing starts. Fresh pools per chain -> ['<addr>:<netId>', ...].
        Costs one GeckoTerminal slot per chain per page, so keep pages small.
        
@@ -49,13 +89,16 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
        to widen the universe beyond just new (<15m old) pools. This helps find tokens
        with durable liquidity that passed the 15m age threshold.
        
-       Total GT slots: new_pools (2+2+1=5) + trending_pools (3) = 8."""
+       If limiter is provided, checks budget before each call and skips when exhausted."""
     ids, seen = [], set()
     
     # Phase 1: new_pools (existing behavior)
     for net in nets:
         net_pages = 1 if net == "robinhood" else pages
         for page in range(1, net_pages + 1):
+            if limiter and not limiter.spend(1):
+                log.warning("GT budget exhausted, skipping %s new_pools page %d", net, page)
+                break
             try:
                 resp = requests.get(f"{GT}/networks/{net}/new_pools",
                                     params={"page": page}, headers=UA, timeout=20)
@@ -81,6 +124,9 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
     # Phase 2: trending_pools (1 page per network)
     if include_trending:
         for net in nets:
+            if limiter and not limiter.spend(1):
+                log.warning("GT budget exhausted, skipping %s trending_pools", net)
+                continue
             try:
                 resp = requests.get(f"{GT}/networks/{net}/trending_pools",
                                     params={"page": 1}, headers=UA, timeout=20)
@@ -171,12 +217,21 @@ def trade_counts(t: dict) -> dict:
         return dict(_EMPTY_TRADES)
 
 
-def dossier(t: dict) -> dict:
-    """One GT call per token. Fills what the chain actually has, null where it does not."""
+def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
+    """One GT call per token. Fills what the chain actually has, null where it does not.
+    
+    If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
+    On GT 429, raises DossierRetryNeeded (caller should requeue for next cycle)."""
+    if limiter and not limiter.spend(1):
+        log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
+        raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
+    
     net = GT_NET[t["net"]]
     resp = requests.get(f"{GT}/networks/{net}/tokens/{t['addr']}/info", headers=UA, timeout=20)
     if resp.status_code == 429:
-        raise RuntimeError("GeckoTerminal 429: over 10/min")
+        log.warning("GeckoTerminal 429 on dossier for %s, will retry next cycle", t["ticker"])
+        raise DossierRetryNeeded(f"GT 429 for {t['ticker']}")
+    
     a = resp.json()["data"]["attributes"]
 
     holders = a.get("holders") or {}

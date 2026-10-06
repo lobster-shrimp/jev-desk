@@ -3,16 +3,18 @@ THE SHIFT — the process that never stops. Owns the cycle, calls everything in 
 hands finished orders to the seats. Start it with shadow=True and leave it that way
 for a week.
 
-The budget is the design. GeckoTerminal gives ten calls a minute, six go to listing
-fresh pools across three chains, so three dossiers per cycle is what is left. Want more
-dossiers, cut pages to 1 and you get six.
+The budget is the design. GeckoTerminal gives ten calls a minute. A shared rate limiter
+allocates them: reserve slots for dossiers (the priority work), then use what remains
+for universe pagination. When a dossier fails due to 429/budget exhaustion, requeue
+the token via defer for immediate retry next cycle.
 
 Failure handling (runs unattended):
-  429 GeckoTerminal  -> back off a full minute, do not retry in place. Persisting? pages=1.
+  429 GeckoTerminal  -> dossier: requeue via defer for next cycle.
+                        universe: skip remaining pages, continue with what we have.
   429 DexScreener    -> lower DEX_BUDGET.
   429/529 Jev        -> the SDK retries with backoff on its own.
   422 Jev            -> question is malformed. Never retry. Log and stop the cycle.
-  dossier throws     -> skip that token. Not a pass, not a retry loop.
+  dossier throws     -> if DossierRetryNeeded: defer for retry. else: skip that token.
   judge unreachable  -> skip the cycle entirely. No judge, no guessing, stand down.
   FOMO token expired -> refresh the Privy bearer out of Chrome and continue.
 """
@@ -20,7 +22,7 @@ import logging
 import time
 
 import book
-from collect import universe, shortlist, trade_counts, dossier, social_state
+from collect import universe, shortlist, trade_counts, dossier, social_state, GTRateLimiter, DossierRetryNeeded
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from pick import pick, size_factor_for
 from thresholds import HARD
@@ -28,8 +30,7 @@ from thresholds import HARD
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
 CYCLE_SECONDS = 900
 GT_PER_MINUTE = 10          # free tier
-GT_UNIVERSE   = 8           # new_pools (2+2+1) + trending_pools (1+1+1) = 8 GT slots
-GT_DOSSIER    = 2           # what is left for dossiers in the same minute
+GT_DOSSIER_RESERVE = 3      # reserve this many slots for dossiers before calling universe
 DEX_BUDGET    = 25          # DexScreener calls per cycle, pass two only
 log = logging.getLogger("desk")
 
@@ -38,16 +39,20 @@ class JudgeDown(Exception):
     """The judge is unreachable or a question set is malformed. The cycle stands down."""
 
 
-def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
+def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER_RESERVE):
     if (h := book.held()):                       # RISK owns the desk right now
         log.info("holding %s for %.0f min, no scan this cycle",
                  h["ticker"], h["minutes"])
         return None, {"held": h["ticker"], "minutes": round(h["minutes"])}
 
     stats = {"seen": 0, "benched": 0, "free": {}, "trade": {},
-             "chain": {}, "soft": {}, "judged": 0, "tokens": []}
+             "chain": {}, "soft": {}, "judged": 0, "tokens": [], "requeued": 0}
     survivors = []
-    gt_slots, dex_slots = gt_dossier, DEX_BUDGET
+    dex_slots = DEX_BUDGET
+    
+    # Shared GT rate limiter: prioritize dossiers over universe pagination
+    gt_limiter = GTRateLimiter(capacity=GT_PER_MINUTE)
+    gt_limiter.reserve(gt_dossier_reserve)  # Log how much reserved
 
     def record(t, stage, reason=None):
         """One row per token for the log and the ops panel: where it stopped and why."""
@@ -59,7 +64,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
             "verdict": "PASS" if reason is None else "DROP"
         })
 
-    ids = universe()                             # fresh pools, 3 chains, GT_UNIVERSE slots
+    ids = universe(limiter=gt_limiter)           # fresh + trending pools, budget-aware
     book.expire_defer()                          # drop rows past max age
     due = book.defer_due()                       # ids ready for rescoring
     seen_ids = set()
@@ -123,7 +128,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
         book.forget_defer(t["tid"])
         log.info("defer outcome tid=%s reason=pass", t["tid"])
 
-        if dex_slots <= 0 or gt_slots <= 0:
+        if dex_slots <= 0 or gt_limiter.available() <= 0:
             break                                # out of budget, not out of ideas
 
         t |= trade_counts(t)                     # pass two: one DexScreener call
@@ -137,11 +142,18 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
             continue
 
         try:
-            d = dossier(t)                       # pass three: one GeckoTerminal slot
-            gt_slots -= 1
+            d = dossier(t, limiter=gt_limiter)   # pass three: one GeckoTerminal slot (budget-aware)
+        except DossierRetryNeeded as e:
+            log.info("dossier retry needed for %s, requeuing: %s", t["ticker"], e)
+            # Requeue for immediate retry next cycle (ready=now, drop after max_age)
+            now = time.time()
+            drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+            book.defer(t["tid"], now, drop_at)
+            stats["requeued"] += 1
+            record(t, "chain", "requeued")
+            continue
         except Exception as e:
             log.warning("dossier failed %s: %s", t["ticker"], e)
-            gt_slots -= 1                        # a failed call still cost you the slot
             book.sit(t["tid"], "dossier_failed")
             log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
             book.forget_defer(t["tid"])
@@ -185,7 +197,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
         survivors.append((d, ans))
 
     log.info("cycle: %(seen)s seen, %(benched)s benched, free %(free)s, "
-             "trade %(trade)s, chain %(chain)s, soft %(soft)s, judged %(judged)s", stats)
+             "trade %(trade)s, chain %(chain)s, soft %(soft)s, judged %(judged)s, requeued %(requeued)s", stats)
 
     if not survivors:
         return None, stats

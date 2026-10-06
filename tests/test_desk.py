@@ -686,11 +686,11 @@ class FakeDesk:
 def test_run_once_shadow_never_takes_book(monkeypatch):
     book.release()
     ids = [f"Addr{i}:1399811149" for i in range(12)]
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {
         "buys_h1": 540, "sells_h1": 0 if t["ticker"] == NO_SELL else 120,
         "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000})
-    monkeypatch.setattr(shift, "dossier", lambda t: {
+    monkeypatch.setattr(shift, "dossier", lambda t, limiter=None: {
         **t, "chain": "solana", "top_10_percent": 30,
         "top_wallet_percent": 0.2 if t["ticker"] == WHALE else 0.02,
         "developer_holding_percentage": 2,
@@ -698,7 +698,7 @@ def test_run_once_shadow_never_takes_book(monkeypatch):
         "mint_authority": None, "freeze_authority": None,
         "description": "a token", "x_handle": None})
     desk = FakeDesk()
-    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     assert order is None                                   # shadow never returns an order
     assert book.held() is None                             # and never takes the book
     assert stats["seen"] == 12 and stats["judged"] >= 1
@@ -721,7 +721,7 @@ def test_run_once_shadow_never_takes_book(monkeypatch):
 def test_held_position_means_no_scan(monkeypatch):
     book.take({"token": {"ticker": "HELD", "address": "a", "network_id": 56}})
     called = []
-    monkeypatch.setattr(shift, "universe", lambda: called.append(1) or [])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: called.append(1) or [])
     order, stats = shift.run_once(FakeFomo(), JUDGE, FakeDesk(), 1000.0)
     assert order is None and stats["held"] == "HELD" and not called
     book.release()
@@ -960,7 +960,7 @@ def test_run_once_records_tokens(monkeypatch):
     
     ids = [f"UniqueAddr{i}_{unique_suffix}:1399811149" for i in range(5)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(collect, "shortlist", fake_shortlist)
     
     # Monkeypatch book.benched to ensure tokens aren't skipped
@@ -969,7 +969,7 @@ def test_run_once_records_tokens(monkeypatch):
     monkeypatch.setattr(shift, "trade_counts", lambda t: {
         "buys_h1": 540, "sells_h1": 120,
         "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000})
-    monkeypatch.setattr(shift, "dossier", lambda t: {
+    monkeypatch.setattr(shift, "dossier", lambda t, limiter=None: {
         **t, "chain": "solana", "top_10_percent": 30,
         "top_wallet_percent": 0.02, "developer_holding_percentage": 2,
         "gt_score_details": None, "is_honeypot": None,
@@ -977,7 +977,7 @@ def test_run_once_records_tokens(monkeypatch):
         "description": "a token", "x_handle": None})
     
     desk = FakeDesk()
-    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     assert "tokens" in stats
     assert len(stats["tokens"]) >= 1, f"Expected at least 1 token record, got {len(stats['tokens'])}"
@@ -1269,13 +1269,13 @@ def test_free_kill_logs_fomo_metrics(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="LogTestAddr1", age_minutes=42, liquidity_usd=5000,
                     volume_h24=20000, mcap_usd=100000)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_low_liq)
     
     desk = FakeDesk()
     caplog.clear()
     with caplog.at_level(logging.INFO):
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     # Find the free kill log line
     free_logs = [r for r in caplog.records if "free tid=" in r.message and "reason=liquidity" in r.message]
@@ -1303,7 +1303,7 @@ def test_free_pass_logs_fomo_metrics(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="PassTestAddr1", age_minutes=42, liquidity_usd=50000,
                     volume_h24=100000, mcap_usd=500000)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_pass)
     # Make it fail at trade stage so we can see the free pass log
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 0, "sells_h1": 0, 
@@ -1313,7 +1313,7 @@ def test_free_pass_logs_fomo_metrics(monkeypatch, caplog):
     desk = FakeDesk()
     caplog.clear()
     with caplog.at_level(logging.INFO):
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     # Find the free pass log line
     free_logs = [r for r in caplog.records if "free tid=" in r.message and "reason=pass" in r.message]
@@ -1341,13 +1341,13 @@ def test_free_kill_logs_none_values(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="NoneTestAddr1", age_minutes=42, liquidity_usd=None,
                     volume_h24=None, mcap_usd=None)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_none)
     
     desk = FakeDesk()
     caplog.clear()
     with caplog.at_level(logging.INFO):
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     # Find the free kill log line
     free_logs = [r for r in caplog.records if "free tid=" in r.message and "reason=no_liq" in r.message]
@@ -1358,6 +1358,257 @@ def test_free_kill_logs_none_values(monkeypatch, caplog):
     assert "liquidity_usd=None" in log_msg
     assert "volume_usd=None" in log_msg
     assert "mcap_usd=None" in log_msg
+
+
+# ---- rate limiter -------------------------------------------------------------
+def test_rate_limiter_spends_budget():
+    """GTRateLimiter should track and spend tokens."""
+    limiter = collect.GTRateLimiter(capacity=10)
+    assert limiter.available() == 10
+    
+    assert limiter.spend(3) is True
+    assert limiter.available() == 7
+    
+    assert limiter.spend(7) is True
+    assert limiter.available() == 0
+    
+    # Budget exhausted
+    assert limiter.spend(1) is False
+    assert limiter.available() == 0
+
+
+def test_rate_limiter_reserve():
+    """GTRateLimiter.reserve() should reserve budget for priority use."""
+    limiter = collect.GTRateLimiter(capacity=10)
+    reserved = limiter.reserve(3)
+    assert reserved == 3
+    # Tokens still available (reserve just logs, doesn't spend)
+    assert limiter.available() == 10
+
+
+def test_universe_uses_limiter():
+    """universe should spend budget from limiter and skip pages when exhausted."""
+    import requests
+    
+    original_get = requests.get
+    call_count = [0]
+    
+    def mock_get(url, **kwargs):
+        call_count[0] += 1
+        return Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": f"solana_tok{call_count[0]}"}}}}]
+        })
+    
+    requests.get = mock_get
+    
+    try:
+        # Limiter with only 3 tokens (should stop early)
+        limiter = collect.GTRateLimiter(capacity=3)
+        ids = collect.universe(nets=("solana",), pages=5, include_trending=True, limiter=limiter)
+        
+        # Should have made at most 3 calls (budget exhausted)
+        assert call_count[0] <= 3
+        assert limiter.available() == 0
+    finally:
+        requests.get = original_get
+
+
+def test_dossier_429_raises_retry_needed():
+    """dossier on GT 429 should raise DossierRetryNeeded, not RuntimeError."""
+    import requests
+    
+    original_get = requests.get
+    mock_resp = Mock(status_code=429)
+    requests.get = lambda *args, **kwargs: mock_resp
+    
+    try:
+        t = tok(1)
+        try:
+            collect.dossier(t)
+            assert False, "should have raised DossierRetryNeeded"
+        except collect.DossierRetryNeeded as e:
+            assert "429" in str(e)
+    finally:
+        requests.get = original_get
+
+
+def test_dossier_budget_exhausted_raises_retry():
+    """dossier with exhausted limiter should raise DossierRetryNeeded without calling GT."""
+    import requests
+    
+    original_get = requests.get
+    call_count = [0]
+    requests.get = lambda *args, **kwargs: (call_count.__setitem__(0, call_count[0] + 1), 
+                                            Mock(status_code=200, json=lambda: {"data": {"attributes": {}}}))
+    
+    try:
+        limiter = collect.GTRateLimiter(capacity=0)  # Budget exhausted
+        t = tok(1)
+        
+        try:
+            collect.dossier(t, limiter=limiter)
+            assert False, "should have raised DossierRetryNeeded"
+        except collect.DossierRetryNeeded as e:
+            assert "budget" in str(e).lower()
+        
+        # Should NOT have called GT (budget check happens first)
+        assert call_count[0] == 0
+    finally:
+        requests.get = original_get
+
+
+def test_run_once_requeues_on_dossier_retry(monkeypatch, caplog):
+    """When dossier raises DossierRetryNeeded, token should be requeued via defer."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"RetryAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_pass(fomo, id_list):
+        return [tok(0, tid=tid, addr="RetryAddr1", age_minutes=20, liquidity_usd=50000,
+                    volume_h24=100000, mcap_usd=500000)]
+    
+    def fake_dossier_429(t, limiter=None):
+        raise collect.DossierRetryNeeded(f"GT 429 for {t['ticker']}")
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400, 
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_429)
+    
+    desk = FakeDesk()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Should have requeued the token
+    assert stats["requeued"] == 1
+    
+    # Check defer table has the token
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 1, f"Expected token in defer table, got {len(defer_rows)} rows"
+    
+    # Check log
+    assert any("dossier retry needed" in rec.message and "T0" in rec.message 
+               for rec in caplog.records), "Expected dossier retry log"
+
+
+def test_requeued_token_retried_next_cycle(monkeypatch):
+    """Token requeued due to dossier failure should be retried next cycle."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"RetryAddr2:{1399811149}"
+    
+    # Cycle 1: dossier fails, token requeued
+    def fake_shortlist_cycle1(fomo, id_list):
+        return [tok(0, tid=tid, addr="RetryAddr2", age_minutes=20, liquidity_usd=50000,
+                    volume_h24=100000, mcap_usd=500000)]
+    
+    dossier_calls = [0]
+    def fake_dossier_cycle1(t, limiter=None):
+        dossier_calls[0] += 1
+        raise collect.DossierRetryNeeded(f"GT 429 for {t['ticker']}")
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [tid])
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist_cycle1)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400, 
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_cycle1)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    assert stats["requeued"] == 1
+    assert dossier_calls[0] == 1
+    
+    # Cycle 2: universe returns empty, but defer_due should include our token
+    def fake_dossier_cycle2(t, limiter=None):
+        dossier_calls[0] += 1
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None, 
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [])  # Empty universe
+    monkeypatch.setattr(shift, "dossier", fake_dossier_cycle2)
+    
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Dossier should have been called again (retry succeeded)
+    assert dossier_calls[0] == 2, f"Expected dossier called twice, got {dossier_calls[0]}"
+    
+    # Token should no longer be in defer (either passed or failed for real)
+    defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
+    assert len(defer_rows) == 0, f"Token should be cleared from defer after retry"
+
+
+def test_limiter_prioritizes_dossier_over_universe(monkeypatch, caplog):
+    """Limiter should reserve budget for dossiers, limiting universe pagination."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    # Track GT calls
+    gt_calls = []
+    
+    original_universe = collect.universe
+    def spy_universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, limiter=None):
+        result = original_universe(nets=nets, pages=pages, include_trending=include_trending, limiter=limiter)
+        if limiter:
+            gt_calls.append(("universe", limiter.available()))
+        return result
+    
+    original_dossier = collect.dossier
+    def spy_dossier(t, limiter=None):
+        if limiter:
+            gt_calls.append(("dossier", limiter.available()))
+        return original_dossier(t, limiter=limiter)
+    
+    monkeypatch.setattr(shift, "universe", spy_universe)
+    monkeypatch.setattr(shift, "dossier", spy_dossier)
+    
+    # Create tokens that pass free and trade
+    tid1 = f"PrioAddr1:{1399811149}"
+    tid2 = f"PrioAddr2:{1399811149}"
+    
+    def fake_shortlist_prio(fomo, id_list):
+        tokens = []
+        if tid1 in id_list:
+            tokens.append(tok(0, tid=tid1, addr="PrioAddr1", age_minutes=20, liquidity_usd=50000,
+                            volume_h24=100000, mcap_usd=500000))
+        if tid2 in id_list:
+            tokens.append(tok(1, tid=tid2, addr="PrioAddr2", age_minutes=25, liquidity_usd=60000,
+                            volume_h24=120000, mcap_usd=600000))
+        return tokens
+    
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist_prio)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400, 
+                                                            "trades_h24": 4000})
+    
+    desk = FakeDesk()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        # Reserve 3 for dossiers, leaving 7 for universe
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Check that reserve was logged
+    assert any("reserved 3 for dossiers" in rec.message for rec in caplog.records), \
+        "Expected reserve log"
+    
+    # Verify gt_calls shows universe ran before dossiers
+    assert len(gt_calls) > 0
+    assert gt_calls[0][0] == "universe", "Universe should be called first"
 
 
 
@@ -1376,11 +1627,11 @@ def test_defer_young_token_not_benched(monkeypatch):
         t = tok(0, tid=tid, addr="DeferAddr1", age_minutes=2, liquidity_usd=50000)
         return [t]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     
     desk = FakeDesk()
-    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     assert not book.benched(tid), f"Token {tid} should not be benched"
     defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
@@ -1399,7 +1650,7 @@ def test_defer_due_token_passed_to_fomo(monkeypatch):
     book.DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, now - 1, now + 3600))
     book.DB.commit()
     
-    monkeypatch.setattr(shift, "universe", lambda: [])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [])
     
     fomo_calls = []
     original_shortlist = collect.shortlist
@@ -1409,7 +1660,7 @@ def test_defer_due_token_passed_to_fomo(monkeypatch):
     monkeypatch.setattr(shift, "shortlist", spy_shortlist)
     
     desk = FakeDesk()
-    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     assert len(fomo_calls) > 0
     assert tid in fomo_calls[0]
@@ -1435,11 +1686,11 @@ def test_old_token_benched_not_deferred(monkeypatch):
     def fake_shortlist_old(fomo, id_list):
         return [tok(0, tid=tid, addr="OldAddr1", age_minutes=80 * 60)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_old)
     
     desk = FakeDesk()
-    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     assert book.benched(tid)
     defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
@@ -1466,11 +1717,11 @@ def test_judge_not_called_for_young_token(monkeypatch):
         judge_calls.append((question_set, state))
         return JUDGE(question_set, state)
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     
     desk = FakeDesk()
-    order, stats = shift.run_once(FakeFomo(), spy_judge, desk, desk.bank(), shadow=True, gt_dossier=12)
+    order, stats = shift.run_once(FakeFomo(), spy_judge, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     assert len(judge_calls) == 0
 
@@ -1486,7 +1737,7 @@ def test_defer_miss_forgotten_and_logged(monkeypatch, caplog):
     book.DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, now - 1, now + 3600))
     book.DB.commit()
     
-    monkeypatch.setattr(shift, "universe", lambda: [])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [])
     
     def fake_tokens_miss(self, ids):
         return {}
@@ -1494,7 +1745,7 @@ def test_defer_miss_forgotten_and_logged(monkeypatch, caplog):
     
     desk = FakeDesk()
     with caplog.at_level(logging.INFO):
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     assert any("defer outcome" in rec.message and tid in rec.message and "miss" in rec.message 
                for rec in caplog.records)
@@ -1520,12 +1771,12 @@ def test_defer_cap_200(monkeypatch, caplog):
     def fake_shortlist_cap(fomo, id_list):
         return [tok(0, tid=new_tid, addr=f"CapAddr{book.DEFER_CAP}", age_minutes=5)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_cap)
     
     desk = FakeDesk()
     with caplog.at_level(logging.INFO):
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     defer_count = book.DB.execute("SELECT COUNT(*) FROM defer").fetchone()[0]
     assert defer_count == book.DEFER_CAP
@@ -1548,12 +1799,12 @@ def test_defer_gate_below_threshold(monkeypatch, caplog):
         # $8k liquidity, below the $12k threshold
         return [tok(0, tid=tid, addr="BelowGateAddr1", age_minutes=5, liquidity_usd=8000)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_below_gate)
     
     desk = FakeDesk()
     with caplog.at_level(logging.INFO):
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     # Should be benched, not deferred
     assert book.benched(tid), f"Token {tid} should be benched"
@@ -1579,12 +1830,12 @@ def test_defer_gate_at_threshold(monkeypatch, caplog):
         # Exactly $12k liquidity, at the threshold
         return [tok(0, tid=tid, addr="AtGateAddr1", age_minutes=5, liquidity_usd=12000)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_at_gate)
     
     desk = FakeDesk()
     with caplog.at_level(logging.INFO):
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     # Should be deferred, not benched
     assert not book.benched(tid), f"Token {tid} should not be benched"
@@ -1610,12 +1861,12 @@ def test_defer_gate_null_liquidity(monkeypatch, caplog):
         # liquidity_usd is None
         return [tok(0, tid=tid, addr="NullLiqAddr1", age_minutes=5, liquidity_usd=None)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_null_liq)
     
     desk = FakeDesk()
     with caplog.at_level(logging.INFO):
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     # Should be benched, not deferred
     assert book.benched(tid), f"Token {tid} should be benched"
@@ -1642,11 +1893,11 @@ def test_defer_outcome_logging(monkeypatch, caplog):
     def fake_shortlist_defer(fomo, id_list):
         return [tok(0, tid=tid, addr="OutcomeAddr1", age_minutes=5, liquidity_usd=20000)]
     
-    monkeypatch.setattr(shift, "universe", lambda: ids1)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids1)
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_defer)
     
     desk = FakeDesk()
-    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     # Verify it was deferred
     defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
@@ -1660,12 +1911,12 @@ def test_defer_outcome_logging(monkeypatch, caplog):
         # Now has low liquidity
         return [tok(0, tid=tid, addr="OutcomeAddr1", age_minutes=16, liquidity_usd=5000)]
     
-    monkeypatch.setattr(shift, "universe", lambda: [])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [])
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_fail_liq)
     
     caplog.clear()
     with caplog.at_level(logging.INFO):
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
     
     # Should be forgotten with liquidity reason
     defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
