@@ -279,7 +279,7 @@ def test_filter_tokens_retries_multiple_502s():
 
 
 def test_filter_tokens_exhausts_retries_on_persistent_502():
-    """_filter_tokens should raise HTTPError after 5 failed attempts."""
+    """_filter_tokens should return empty dict after 5 failed attempts (graceful degrade)."""
     fomo = Fomo(bearer="fake-token")
     mock_502 = Mock()
     mock_502.status_code = 502
@@ -287,11 +287,10 @@ def test_filter_tokens_exhausts_retries_on_persistent_502():
     
     fomo.s.post = Mock(return_value=mock_502)
     
-    try:
-        fomo._filter_tokens(["addr1:56"])
-        assert False, "should have raised HTTPError"
-    except requests.exceptions.HTTPError:
-        pass
+    result = fomo._filter_tokens(["addr1:56"])
+    
+    # Should return empty dict instead of raising (graceful degrade)
+    assert result == {}
     
     # Should have tried 5 times (initial + 4 retries)
     assert fomo.s.post.call_count == 5
@@ -2385,5 +2384,107 @@ def test_end_to_end_authority_yes_kills(monkeypatch):
     bench_rows = book.DB.execute("SELECT reason FROM bench WHERE tid=?", (tid,)).fetchall()
     assert len(bench_rows) == 1
     assert bench_rows[0][0] == "authority_open"
+
+
+def test_fomo_502_after_retries_does_not_crash_cycle(monkeypatch, caplog):
+    """FOMO 502 after all retries should degrade gracefully: empty shortlist, cycle completes as NO TRADE."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    ids = [f"Addr{i}:1399811149" for i in range(5)]
+    
+    # Mock FOMO to always return 502
+    class Fomo502:
+        def token(self): return "fake-token"
+        def tokens(self, ids):
+            # Simulate _filter_tokens returning empty dict after 502 retries
+            from fomo_api import Fomo
+            fomo = Fomo(bearer="fake-token")
+            mock_502 = Mock()
+            mock_502.status_code = 502
+            fomo.s.post = Mock(return_value=mock_502)
+            # This will now return {} instead of raising
+            return fomo._filter_tokens(ids)
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    
+    desk = FakeDesk()
+    caplog.clear()
+    
+    # Should NOT raise, cycle should complete
+    with caplog.at_level(logging.ERROR):
+        order, stats = shift.run_once(Fomo502(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Order should be None (NO TRADE outcome)
+    assert order is None, "Expected NO TRADE outcome"
+    
+    # Stats should show seen=0 (empty shortlist after FOMO failure)
+    assert stats["seen"] == 0, f"Expected seen=0, got {stats['seen']}"
+    
+    # Should have logged FOMO error
+    error_logs = [r for r in caplog.records if "FOMO" in r.message and "502" in r.message and "gateway" in r.message]
+    assert len(error_logs) > 0, "Expected FOMO 502 error log"
+    
+    # Should NOT have "cycle blew up" in logs (that's the bug we're fixing)
+    blew_up_logs = [r for r in caplog.records if "cycle blew up" in r.message]
+    assert len(blew_up_logs) == 0, f"Expected no 'cycle blew up', got: {[r.message for r in blew_up_logs]}"
+
+
+def test_fomo_partial_502_continues_with_partial_data(monkeypatch):
+    """If FOMO fails on some chunks but not others, cycle continues with partial shortlist."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    # Test that FOMO API returns partial results when one chunk fails
+    from fomo_api import Fomo
+    
+    # Track call count across chunks
+    call_tracker = {"count": 0}
+    
+    def mock_filter_tokens(self, chunk):
+        call_tracker["count"] += 1
+        if call_tracker["count"] == 1:
+            # First chunk succeeds with 10 tokens
+            return {
+                f"Addr{i}:1399811149": {
+                    "symbol": f"T{i}", "mcap": 500000, "liq": 50000, 
+                    "vol24": 100000, "price": 0.01, "holders": 500,
+                    "change": {300: 0.02, 3600: 0.05, 14400: 0.1, 86400: 0.15},
+                    "created": int(time.time() * 1000 - 3600000)
+                } for i in range(10)
+            }
+        else:
+            # Second chunk 502s - returns empty dict (graceful degrade)
+            logging.getLogger("fomo").error("FOMO 502 gateway error persisted after retries, returning empty result for this chunk")
+            return {}
+    
+    monkeypatch.setattr(Fomo, "_filter_tokens", mock_filter_tokens)
+    
+    ids = [f"Addr{i}:1399811149" for i in range(25)]
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    
+    # Make tokens pass through to judging
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400, 
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", lambda t, limiter=None: {
+        **t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+        "developer_holding_percentage": 2, "gt_score_details": None, 
+        "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+        "description": "a token", "x_handle": None})
+    
+    fomo = Fomo(bearer="fake-token")
+    desk = FakeDesk()
+    order, stats = shift.run_once(fomo, JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=25)
+    
+    # Should have seen 10 tokens (first chunk), not all 25
+    assert stats["seen"] == 10, f"Expected 10 tokens from successful chunk, got {stats['seen']}"
+    
+    # Should have completed successfully (not crashed)
+    assert "error" not in stats or stats.get("error") is None
 
 
