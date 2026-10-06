@@ -92,7 +92,14 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             log.info("defer outcome tid=%s reason=miss", tid)
             book.forget_defer(tid)
     
-    for t in shortlist_result:                   # pass one: free, no per-token requests
+    # Age-prioritize for dossier work: separate young (<60m) vs old (≥60m) tokens.
+    # Within each group, preserve turnover ordering from shortlist.
+    # Process young tokens first to ensure they get dossier budget before old requeues.
+    young_tokens = [t for t in shortlist_result if t.get("age_minutes", 0) < 60]
+    old_tokens = [t for t in shortlist_result if t.get("age_minutes", 0) >= 60]
+    age_prioritized = young_tokens + old_tokens
+    
+    for t in age_prioritized:                    # pass one: free, no per-token requests
         stats["seen"] += 1
         t.setdefault("chain", CHAIN_SET.get(t["net"]))
         if book.benched(t["tid"]):               # already judged, still serving its time
