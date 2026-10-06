@@ -57,9 +57,58 @@ def chain_kill(d) -> str | None:
         return "top_10"
     if d.get("holder_count") is not None and d["holder_count"] < HARD["min_holders"]:
         return "holders"
-    if d["chain"] == "solana" and (d.get("mint_authority") or d.get("freeze_authority")):
-        return "authority_open"          # a fact, no model needed
-    if d["chain"] in ("bsc", "base") and d.get("is_honeypot") is True:
+    
+    # Solana authority check: only kill when either authority is True (explicitly open)
+    if d.get("chain") == "solana":
+        mint_auth = d.get("mint_authority")
+        freeze_auth = d.get("freeze_authority")
+        
+        # If both are explicitly True (open), kill
+        if mint_auth is True or freeze_auth is True:
+            return "authority_open"
+        
+        # If both are None (unknown from GT) and we have addr, optionally check RPC as fallback
+        if mint_auth is None and freeze_auth is None and d.get("addr"):
+            import logging
+            import os
+            log = logging.getLogger("filter")
+            
+            # Optional RPC fallback (cheap, public mainnet endpoint)
+            rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+            try:
+                import requests
+                resp = requests.post(
+                    rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getAccountInfo",
+                        "params": [d["addr"], {"encoding": "jsonParsed"}]
+                    },
+                    timeout=10
+                )
+                result = resp.json().get("result")
+                if result and result.get("value"):
+                    parsed = result["value"].get("data", {}).get("parsed", {})
+                    mint_info = parsed.get("info", {})
+                    rpc_mint_auth = mint_info.get("mintAuthority")
+                    rpc_freeze_auth = mint_info.get("freezeAuthority")
+                    
+                    # If RPC confirms either authority is set (non-null), kill
+                    if rpc_mint_auth or rpc_freeze_auth:
+                        ticker = d.get("ticker", d.get("addr", "unknown"))
+                        log.info("authority_open %s via RPC fallback: mint=%s freeze=%s", 
+                                ticker, rpc_mint_auth, rpc_freeze_auth)
+                        return "authority_open"
+                    else:
+                        ticker = d.get("ticker", d.get("addr", "unknown"))
+                        log.debug("authority_check %s via RPC: both revoked", ticker)
+            except Exception as e:
+                # RPC failure means unknown, don't kill on absence of proof
+                ticker = d.get("ticker", d.get("addr", "unknown"))
+                log.debug("authority_check %s RPC failed: %s, treating as unknown", ticker, e)
+    
+    if d.get("chain") in ("bsc", "base") and d.get("is_honeypot") is True:
         return "honeypot"                # also a fact
     return None
 
