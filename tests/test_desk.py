@@ -2386,13 +2386,15 @@ def test_end_to_end_authority_yes_kills(monkeypatch):
     assert bench_rows[0][0] == "authority_open"
 
 
-def test_fomo_502_after_retries_does_not_crash_cycle(monkeypatch, caplog):
-    """FOMO 502 after all retries should degrade gracefully: empty shortlist, cycle completes as NO TRADE."""
     book.release()
     book.DB.execute("DELETE FROM defer")
     book.DB.execute("DELETE FROM bench")
     book.DB.commit()
     
+
+
+def test_fomo_502_after_retries_does_not_crash_cycle(monkeypatch, caplog):
+    """FOMO 502 after all retries should degrade gracefully: empty shortlist, cycle completes as NO TRADE."""
     ids = [f"Addr{i}:1399811149" for i in range(5)]
     
     # Mock FOMO to always return 502
@@ -2487,4 +2489,181 @@ def test_fomo_partial_502_continues_with_partial_data(monkeypatch):
     # Should have completed successfully (not crashed)
     assert "error" not in stats or stats.get("error") is None
 
+# ---- age-prioritized dossier work --------------------------------------------
+def test_young_tokens_get_dossier_before_old_with_budget_constraint(monkeypatch):
+    """When dossier budget is tight, young tokens (<60m) should get dossier attempts before old (≥60m)."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    # Create 4 tokens: 2 young (<60m), 2 old (≥60m)
+    # Old tokens have HIGHER turnover, so they'd normally be prioritized
+    # Young tokens have LOWER turnover, but should still get dossier first due to age
+    young1_tid = f"YoungAddr1:{1399811149}"
+    young2_tid = f"YoungAddr2:{1399811149}"
+    old1_tid = f"OldAddr1:{1399811149}"
+    old2_tid = f"OldAddr2:{1399811149}"
+    
+    # shortlist returns tokens sorted by turnover (high to low): [old1, old2, young1, young2]
+    # After age-prioritization in main.py: [young1, young2, old1, old2]
+    def fake_shortlist_mixed(fomo, id_list):
+        # Return in turnover order (high to low)
+        tokens = []
+        # Old tokens with high turnover come first in turnover-sorted list
+        tokens.append({"tid": old1_tid, "addr": "OldAddr1", "net": 1399811149, "ticker": "OLD1",
+                      "age_minutes": 75.0, "liquidity_usd": 50000, "volume_h24": 500000, 
+                      "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+                      "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}})
+        tokens.append({"tid": old2_tid, "addr": "OldAddr2", "net": 1399811149, "ticker": "OLD2",
+                      "age_minutes": 90.0, "liquidity_usd": 50000, "volume_h24": 400000,
+                      "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+                      "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}})
+        # Young tokens with lower turnover come after in turnover-sorted list
+        tokens.append({"tid": young1_tid, "addr": "YoungAddr1", "net": 1399811149, "ticker": "YOUNG1",
+                      "age_minutes": 25.0, "liquidity_usd": 50000, "volume_h24": 200000,
+                      "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+                      "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}})
+        tokens.append({"tid": young2_tid, "addr": "YoungAddr2", "net": 1399811149, "ticker": "YOUNG2",
+                      "age_minutes": 40.0, "liquidity_usd": 50000, "volume_h24": 150000,
+                      "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+                      "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}})
+        return tokens
+    
+    dossier_calls = []
+    def fake_dossier_track(t, limiter=None):
+        dossier_calls.append((t["tid"], t["age_minutes"]))
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [old1_tid, old2_tid, young1_tid, young2_tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_mixed)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_track)
+    
+    desk = FakeDesk()
+    # Large budget to ensure all tokens can get through dossier stage
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=10)
+    
+    # Verify that young tokens were dossier'd before old ones
+    assert len(dossier_calls) >= 2, f"Expected at least 2 dossier calls, got {len(dossier_calls)}: {dossier_calls}"
+    
+    # First two dossier calls should be young tokens (ages 25, 40)
+    first_call_age = dossier_calls[0][1]
+    second_call_age = dossier_calls[1][1]
+    
+    assert first_call_age < 60, f"First dossier call should be young (<60m), got {first_call_age}m for {dossier_calls[0][0]}"
+    assert second_call_age < 60, f"Second dossier call should be young (<60m), got {second_call_age}m for {dossier_calls[1][0]}"
 
+
+def test_old_requeue_does_not_starve_young_first_timer(monkeypatch):
+    """An old token (≥60m) requeued due to GT 429 should not prevent a young first-timer from getting dossier."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    young_tid = f"YoungFirstTimer:{1399811149}"
+    old_requeue_tid = f"OldRequeue:{1399811149}"
+    
+    # Requeue an old token (simulating a previous GT 429)
+    now = time.time()
+    book.defer(old_requeue_tid, ready=now - 1, drop_at=now + 3600)
+    
+    def fake_shortlist_mixed(fomo, id_list):
+        tokens = []
+        # Old requeue with high turnover (would normally be prioritized, comes first in turnover order)
+        tokens.append({"tid": old_requeue_tid, "addr": "OldRequeue", "net": 1399811149, "ticker": "OLDREQ",
+                      "age_minutes": 75.0, "liquidity_usd": 50000, "volume_h24": 600000,
+                      "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+                      "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}})
+        # Young first-timer with lower turnover (comes after in turnover order)
+        tokens.append({"tid": young_tid, "addr": "YoungFirstTimer", "net": 1399811149, "ticker": "YOUNGFT",
+                      "age_minutes": 30.0, "liquidity_usd": 50000, "volume_h24": 200000,
+                      "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+                      "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}})
+        return tokens
+    
+    dossier_calls = []
+    def fake_dossier_track(t, limiter=None):
+        dossier_calls.append((t["tid"], t["age_minutes"]))
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_mixed)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_track)
+    
+    desk = FakeDesk()
+    # Budget for only 1 dossier
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=1)
+    
+    # The young token should get the dossier slot, not the old requeue
+    assert len(dossier_calls) >= 1, "Expected at least 1 dossier call"
+    first_call_tid, first_call_age = dossier_calls[0]
+    
+    assert first_call_age < 60, f"First dossier should be young (<60m), got {first_call_age}m for {first_call_tid}"
+    assert first_call_tid == young_tid, f"Young token should get dossier before old requeue"
+
+
+def test_age_prioritization_preserves_turnover_within_groups(monkeypatch):
+    """Within young and old groups, turnover ordering should be preserved."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    # 3 young tokens with different turnovers
+    young_high_tid = f"YoungHigh:{1399811149}"
+    young_mid_tid = f"YoungMid:{1399811149}"
+    young_low_tid = f"YoungLow:{1399811149}"
+    
+    def fake_shortlist_young_group(fomo, id_list):
+        # Already sorted by turnover (high to low)
+        return [
+            {"tid": young_high_tid, "addr": "YoungHigh", "net": 1399811149, "ticker": "YHIGH",
+             "age_minutes": 30.0, "liquidity_usd": 50000, "volume_h24": 500000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}},
+            {"tid": young_mid_tid, "addr": "YoungMid", "net": 1399811149, "ticker": "YMID",
+             "age_minutes": 40.0, "liquidity_usd": 50000, "volume_h24": 300000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}},
+            {"tid": young_low_tid, "addr": "YoungLow", "net": 1399811149, "ticker": "YLOW",
+             "age_minutes": 50.0, "liquidity_usd": 50000, "volume_h24": 100000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}},
+        ]
+    
+    dossier_calls = []
+    def fake_dossier_track(t, limiter=None):
+        dossier_calls.append(t["tid"])
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_high_tid, young_mid_tid, young_low_tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_young_group)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_track)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=10)
+    
+    # All young tokens should be processed in their turnover order
+    assert len(dossier_calls) == 3
+    assert dossier_calls[0] == young_high_tid, "Highest turnover young token should be first"
+    assert dossier_calls[1] == young_mid_tid, "Mid turnover young token should be second"
+    assert dossier_calls[2] == young_low_tid, "Low turnover young token should be third"
