@@ -38,13 +38,21 @@ def age_minutes(created) -> float:
     return max(0.0, (time.time() - c) / 60)
 
 
-def universe(nets=("solana", "bsc", "robinhood"), pages=2) -> list[str]:
+def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True) -> list[str]:
     """Where the whole thing starts. Fresh pools per chain -> ['<addr>:<netId>', ...].
        Costs one GeckoTerminal slot per chain per page, so keep pages small.
        
        robinhood is capped at 1 page to avoid 429 rate limits every cycle.
-       Other networks fetch 2 pages. This gives 5 GT slots total (2+2+1)."""
+       Other networks fetch 2 pages from new_pools.
+       
+       When include_trending=True, also fetches 1 page of trending_pools per network
+       to widen the universe beyond just new (<15m old) pools. This helps find tokens
+       with durable liquidity that passed the 15m age threshold.
+       
+       Total GT slots: new_pools (2+2+1=5) + trending_pools (3) = 8."""
     ids, seen = [], set()
+    
+    # Phase 1: new_pools (existing behavior)
     for net in nets:
         net_pages = 1 if net == "robinhood" else pages
         for page in range(1, net_pages + 1):
@@ -53,7 +61,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2) -> list[str]:
                                     params={"page": page}, headers=UA, timeout=20)
                 if resp.status_code == 429:
                     # Stop paging this network only, preserve IDs from other nets/pages
-                    log.warning("GeckoTerminal 429 on %s page %s, stopping pagination for this network", net, page)
+                    log.warning("GeckoTerminal 429 on %s new_pools page %s, stopping pagination for this network", net, page)
                     break
                 r = resp.json()
             except Exception as e:
@@ -69,6 +77,31 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2) -> list[str]:
                 if tid not in seen:
                     seen.add(tid)
                     ids.append(tid)
+    
+    # Phase 2: trending_pools (1 page per network)
+    if include_trending:
+        for net in nets:
+            try:
+                resp = requests.get(f"{GT}/networks/{net}/trending_pools",
+                                    params={"page": 1}, headers=UA, timeout=20)
+                if resp.status_code == 429:
+                    log.warning("GeckoTerminal 429 on %s trending_pools, skipping trending for this network", net)
+                    continue
+                r = resp.json()
+            except Exception as e:
+                log.warning("trending_pools %s failed: %s", net, e)
+                continue
+            for pool in r.get("data", []):
+                base = ((pool.get("relationships") or {}).get("base_token") or {})
+                gid  = (base.get("data") or {}).get("id")      # 'solana_<addr>'
+                if not gid or "_" not in gid:
+                    continue
+                addr = gid.split("_", 1)[1]
+                tid  = f"{addr}:{FOMO_NET[net]}"
+                if tid not in seen:
+                    seen.add(tid)
+                    ids.append(tid)
+    
     return ids
 
 

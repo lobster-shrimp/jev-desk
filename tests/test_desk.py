@@ -1086,7 +1086,7 @@ def test_universe_robinhood_one_page():
     requests.get = tracked_get
     
     try:
-        ids = collect.universe(nets=("solana", "bsc", "robinhood"), pages=2)
+        ids = collect.universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=False)
         
         # Should have collected 5 IDs total (2 solana + 2 bsc + 1 robinhood)
         assert len(ids) == 5
@@ -1118,6 +1118,246 @@ def test_universe_robinhood_one_page():
         assert bsc_calls[1][1]["page"] == 2
     finally:
         requests.get = original_get
+
+
+def test_universe_includes_trending_pools():
+    """universe should fetch trending_pools in addition to new_pools and dedupe."""
+    import requests
+    
+    # Mock responses: new_pools for 2 networks + trending_pools for 2 networks
+    mock_responses = [
+        # Solana new_pools page 1
+        Mock(status_code=200, json=lambda: {
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}},
+                {"relationships": {"base_token": {"data": {"id": "solana_new2"}}}}
+            ]
+        }),
+        # Solana new_pools page 2
+        Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "solana_new3"}}}}]
+        }),
+        # BSC new_pools page 1
+        Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_new1"}}}}]
+        }),
+        # BSC new_pools page 2
+        Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_new2"}}}}]
+        }),
+        # Solana trending_pools page 1
+        Mock(status_code=200, json=lambda: {
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "solana_trend1"}}}},
+                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}}  # duplicate
+            ]
+        }),
+        # BSC trending_pools page 1
+        Mock(status_code=200, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_trend1"}}}}]
+        })
+    ]
+    
+    original_get = requests.get
+    call_info = []
+    
+    def tracked_get(url, **kwargs):
+        call_info.append((url, kwargs.get("params", {})))
+        return mock_responses.pop(0)
+    
+    requests.get = tracked_get
+    
+    try:
+        ids = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
+        
+        # Should have 7 unique IDs (3 solana new + 2 bsc new + 1 solana trend + 1 bsc trend - 1 duplicate)
+        assert len(ids) == 7
+        
+        # Verify no duplicates
+        assert len(ids) == len(set(ids))
+        
+        # Verify trending IDs are included (after split on "_", "solana_trend1" -> "trend1")
+        assert any("trend1:1399811149" in tid for tid in ids)
+        assert any("trend1:56" in tid for tid in ids)
+        
+        # Verify we made calls to both new_pools and trending_pools
+        new_pool_calls = [c for c in call_info if "new_pools" in c[0]]
+        trending_calls = [c for c in call_info if "trending_pools" in c[0]]
+        
+        assert len(new_pool_calls) == 4  # 2 solana + 2 bsc
+        assert len(trending_calls) == 2  # 1 solana + 1 bsc
+        
+        # Verify total call count: 4 new_pools + 2 trending_pools = 6
+        assert len(call_info) == 6
+    finally:
+        requests.get = original_get
+
+
+def test_universe_trending_429_continues():
+    """GeckoTerminal 429 on trending_pools should skip that network's trending but continue."""
+    import requests
+    
+    original_get = requests.get
+    
+    def mock_get(url, **kwargs):
+        """Return different responses based on URL."""
+        if "solana" in url and "new_pools" in url:
+            page = kwargs.get("params", {}).get("page", 1)
+            if page == 1:
+                return Mock(status_code=200, json=lambda: {
+                    "data": [{"relationships": {"base_token": {"data": {"id": "solana_new1"}}}}]
+                })
+            elif page == 2:
+                return Mock(status_code=200, json=lambda: {
+                    "data": [{"relationships": {"base_token": {"data": {"id": "solana_new2"}}}}]
+                })
+        elif "solana" in url and "trending_pools" in url:
+            return Mock(status_code=429)  # Solana trending gets 429
+        elif "bsc" in url and "new_pools" in url:
+            page = kwargs.get("params", {}).get("page", 1)
+            if page == 1:
+                return Mock(status_code=200, json=lambda: {
+                    "data": [{"relationships": {"base_token": {"data": {"id": "bsc_new1"}}}}]
+                })
+            elif page == 2:
+                return Mock(status_code=200, json=lambda: {
+                    "data": [{"relationships": {"base_token": {"data": {"id": "bsc_new2"}}}}]
+                })
+        elif "bsc" in url and "trending_pools" in url:
+            return Mock(status_code=200, json=lambda: {
+                "data": [{"relationships": {"base_token": {"data": {"id": "bsc_trend1"}}}}]
+            })
+        return Mock(status_code=404, json=lambda: {})
+    
+    requests.get = mock_get
+    
+    try:
+        ids = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
+        
+        # Should have collected: 2 solana new + 2 bsc new + 1 bsc trending = 5
+        # (solana trending skipped due to 429)
+        assert len(ids) == 5
+        
+        # Verify we have IDs from both networks' new_pools
+        assert any("1399811149" in tid for tid in ids)  # Solana
+        assert any("56" in tid for tid in ids)          # BSC
+        
+        # Verify BSC trending was included (despite solana trending 429)
+        # "bsc_trend1" becomes "trend1:56" after splitting on "_"
+        assert any("trend1:56" in tid for tid in ids)
+        
+        # Verify solana trending is NOT included (429)
+        # Solana should only have new1 and new2, no trend
+        solana_ids = [tid for tid in ids if "1399811149" in tid]
+        assert len(solana_ids) == 2
+        assert all("new" in tid for tid in solana_ids)
+    finally:
+        requests.get = original_get
+
+
+def test_free_kill_logs_fomo_metrics(monkeypatch, caplog):
+    """free_kill should log age_minutes, liquidity_usd, volume_usd, mcap_usd on every kill."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"LogTestAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_low_liq(fomo, id_list):
+        return [tok(0, tid=tid, addr="LogTestAddr1", age_minutes=42, liquidity_usd=5000,
+                    volume_h24=20000, mcap_usd=100000)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_low_liq)
+    
+    desk = FakeDesk()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    # Find the free kill log line
+    free_logs = [r for r in caplog.records if "free tid=" in r.message and "reason=liquidity" in r.message]
+    assert len(free_logs) >= 1, f"Expected free kill log, got: {[r.message for r in caplog.records]}"
+    
+    log_msg = free_logs[0].message
+    assert "age_minutes=42" in log_msg or "age_minutes=42.0" in log_msg
+    assert "liquidity_usd=5000" in log_msg or "liquidity_usd=5000.0" in log_msg
+    assert "volume_usd=20000" in log_msg or "volume_usd=20000.0" in log_msg
+    assert "mcap_usd=100000" in log_msg or "mcap_usd=100000.0" in log_msg
+
+
+def test_free_pass_logs_fomo_metrics(monkeypatch, caplog):
+    """free pass should log age_minutes, liquidity_usd, volume_usd, mcap_usd."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"PassTestAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_pass(fomo, id_list):
+        # Token that passes free_kill (good values)
+        return [tok(0, tid=tid, addr="PassTestAddr1", age_minutes=42, liquidity_usd=50000,
+                    volume_h24=100000, mcap_usd=500000)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_pass)
+    # Make it fail at trade stage so we can see the free pass log
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 0, "sells_h1": 0, 
+                                                            "buys_h6": 0, "sells_h6": 0, 
+                                                            "trades_h24": 0})
+    
+    desk = FakeDesk()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    # Find the free pass log line
+    free_logs = [r for r in caplog.records if "free tid=" in r.message and "reason=pass" in r.message]
+    assert len(free_logs) >= 1, f"Expected free pass log, got: {[r.message for r in caplog.records]}"
+    
+    log_msg = free_logs[0].message
+    assert "age_minutes=42" in log_msg or "age_minutes=42.0" in log_msg
+    assert "liquidity_usd=50000" in log_msg or "liquidity_usd=50000.0" in log_msg
+    assert "volume_usd=100000" in log_msg or "volume_usd=100000.0" in log_msg
+    assert "mcap_usd=500000" in log_msg or "mcap_usd=500000.0" in log_msg
+
+
+def test_free_kill_logs_none_values(monkeypatch, caplog):
+    """free_kill logs should preserve None for missing data, not convert to 0."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"NoneTestAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_none(fomo, id_list):
+        # Token with None liquidity (should be no_liq kill)
+        return [tok(0, tid=tid, addr="NoneTestAddr1", age_minutes=42, liquidity_usd=None,
+                    volume_h24=None, mcap_usd=None)]
+    
+    monkeypatch.setattr(shift, "universe", lambda: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_none)
+    
+    desk = FakeDesk()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier=12)
+    
+    # Find the free kill log line
+    free_logs = [r for r in caplog.records if "free tid=" in r.message and "reason=no_liq" in r.message]
+    assert len(free_logs) >= 1, f"Expected free no_liq log, got: {[r.message for r in caplog.records]}"
+    
+    log_msg = free_logs[0].message
+    # None values should appear as "None" in the log, not "0" or "0.0"
+    assert "liquidity_usd=None" in log_msg
+    assert "volume_usd=None" in log_msg
+    assert "mcap_usd=None" in log_msg
 
 
 

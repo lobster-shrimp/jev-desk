@@ -28,8 +28,8 @@ from thresholds import HARD
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
 CYCLE_SECONDS = 900
 GT_PER_MINUTE = 10          # free tier
-GT_UNIVERSE   = 5           # 2+2+1 pages (solana+bsc+robinhood; robinhood capped at 1 to avoid 429)
-GT_DOSSIER    = 3           # what is left for dossiers in the same minute
+GT_UNIVERSE   = 8           # new_pools (2+2+1) + trending_pools (1+1+1) = 8 GT slots
+GT_DOSSIER    = 2           # what is left for dossiers in the same minute
 DEX_BUDGET    = 25          # DexScreener calls per cycle, pass two only
 log = logging.getLogger("desk")
 
@@ -83,6 +83,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
             stats["benched"] += 1
             continue
         if (k := free_kill(t)):
+            # Log FOMO metrics on every free kill (missing values stay None)
+            log.info("free tid=%s reason=%s age_minutes=%s liquidity_usd=%s volume_usd=%s mcap_usd=%s",
+                     t["tid"], k, 
+                     t.get("age_minutes"), 
+                     t.get("liquidity_usd"), 
+                     t.get("volume_h24"), 
+                     t.get("mcap_usd"))
             if k == "age" and t["age_minutes"] < HARD["min_age_minutes"]:
                 # Gate defer on liquidity: only defer if liquidity is known and >= threshold
                 liq_usd = t.get("liquidity_usd")
@@ -106,6 +113,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier=GT_DOSSIER):
             record(t, "free", k)
             continue
 
+        # Log FOMO metrics on free pass
+        log.info("free tid=%s reason=pass age_minutes=%s liquidity_usd=%s volume_usd=%s mcap_usd=%s",
+                 t["tid"], 
+                 t.get("age_minutes"), 
+                 t.get("liquidity_usd"), 
+                 t.get("volume_h24"), 
+                 t.get("mcap_usd"))
         book.forget_defer(t["tid"])
         log.info("defer outcome tid=%s reason=pass", t["tid"])
 
