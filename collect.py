@@ -9,7 +9,9 @@ NEVER let null mean fine. Missing data gets its own option and its own consequen
 NEVER pull a dossier for a token stage 2 killed. That is a wasted rate limit slot.
 """
 import logging
+import os
 import time
+from collections import deque
 
 import requests
 
@@ -19,36 +21,79 @@ log = logging.getLogger("collect")
 
 
 class GTRateLimiter:
-    """Token bucket rate limiter for GeckoTerminal API calls.
+    """Rolling-window rate limiter for GeckoTerminal API calls.
     
-    Shared across universe() and dossier() within a cycle. Starts each cycle with
-    a fresh budget (10 calls/min free tier). Prioritizes dossier calls for tokens
-    that passed free_kill over universe pagination."""
+    Tracks call timestamps in a 60s window. Before each call, blocks until
+    fewer than N calls have been made in the last 60s. Prioritizes dossier
+    calls over universe pagination via reservation.
     
-    def __init__(self, capacity: int = 10):
-        self.capacity = capacity
-        self.tokens = capacity
-        self.last_refill = time.time()
+    Shared across the entire process, not per-cycle."""
+    
+    def __init__(self, calls_per_min: int = 8, window_sec: float = 60.0, time_fn=None):
+        self.calls_per_min = calls_per_min
+        self.window_sec = window_sec
+        self.time_fn = time_fn or time.time
+        self.calls = deque()  # timestamps of calls in the window
+        self.reserved = 0     # slots reserved for dossiers
     
     def available(self) -> int:
-        """How many GT calls remain in this cycle's budget."""
-        return self.tokens
+        """How many GT calls can be made without waiting."""
+        self._expire_old_calls()
+        return max(0, self.calls_per_min - len(self.calls))
     
-    def spend(self, cost: int = 1) -> bool:
-        """Try to spend `cost` tokens. Returns True if budget available, False otherwise."""
-        if self.tokens >= cost:
-            self.tokens -= cost
-            log.debug("GT budget: spent %d, %d remain", cost, self.tokens)
+    def _expire_old_calls(self):
+        """Remove calls that fell outside the rolling window."""
+        now = self.time_fn()
+        cutoff = now - self.window_sec
+        while self.calls and self.calls[0] < cutoff:
+            self.calls.popleft()
+    
+    def wait_if_needed(self, priority: bool = False):
+        """Block until a call can be made within rate limits.
+        
+        If priority=True (dossier), can use reserved slots.
+        If priority=False (universe), cannot use reserved slots.
+        Returns immediately if a slot is available."""
+        self._expire_old_calls()
+        now = self.time_fn()
+        
+        # Determine effective limit based on priority
+        effective_limit = self.calls_per_min if priority else (self.calls_per_min - self.reserved)
+        
+        if len(self.calls) < effective_limit:
+            return
+        
+        # Wait until the oldest call expires
+        wait_until = self.calls[0] + self.window_sec
+        wait_sec = max(0, wait_until - now)
+        if wait_sec > 0:
+            log.info("GT pace: waited %.1fs", wait_sec)
+            time.sleep(wait_sec)
+            self._expire_old_calls()
+    
+    def spend(self, cost: int = 1, priority: bool = False) -> bool:
+        """Try to spend `cost` slots. Returns True if budget available, False otherwise.
+        
+        Does NOT block - use wait_if_needed() before calling this if you want blocking behavior.
+        This is for backwards compatibility with tests that check budget without waiting."""
+        self._expire_old_calls()
+        effective_limit = self.calls_per_min if priority else (self.calls_per_min - self.reserved)
+        
+        if len(self.calls) + cost <= effective_limit:
+            for _ in range(cost):
+                self.calls.append(self.time_fn())
+            log.debug("GT budget: spent %d, %d available", cost, self.available())
             return True
-        log.warning("GT budget exhausted: tried to spend %d, only %d remain", cost, self.tokens)
+        log.warning("GT budget exhausted: tried to spend %d, only %d available", cost, self.available())
         return False
     
     def reserve(self, amount: int) -> int:
-        """Reserve `amount` tokens for priority use (e.g. dossiers). Returns actual reserved."""
-        reserved = min(amount, self.tokens)
+        """Reserve `amount` slots for priority use (e.g. dossiers). Returns actual reserved."""
+        reserved = min(amount, self.calls_per_min)
+        self.reserved = reserved
         if reserved > 0:
             log.info("GT budget: reserved %d for dossiers, %d remain for universe", 
-                     reserved, self.tokens - reserved)
+                     reserved, self.calls_per_min - reserved)
         return reserved
 
 GT  = "https://api.geckoterminal.com/api/v2"
@@ -77,6 +122,53 @@ def age_minutes(created) -> float:
     return max(0.0, (time.time() - c) / 60)
 
 
+def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None, 
+                        priority: bool = False, retry_on_429: bool = False) -> tuple[dict | None, bool]:
+    """Make a rate-limited GT API call with optional 429 retry.
+    
+    Returns (response_json, should_continue):
+      - (None, False): hard error, stop this feed
+      - (None, True): budget exhausted, skip but continue other feeds
+      - (data, True): success
+    
+    If retry_on_429=True (trending feeds), retries once on 429 with backoff."""
+    if limiter:
+        if not limiter.spend(1, priority=priority):
+            return None, True  # budget exhausted, but continue other feeds
+        limiter.wait_if_needed(priority=priority)
+    
+    try:
+        resp = requests.get(url, params=params, headers=UA, timeout=20)
+        if resp.status_code == 429:
+            if not retry_on_429:
+                return None, False  # trending feed, don't retry
+            
+            # Retry once with backoff
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    backoff = float(retry_after)
+                except ValueError:
+                    backoff = 60.0
+            else:
+                backoff = 60.0
+            
+            log.info("GT 429, backing off %.1fs before retry", backoff)
+            time.sleep(backoff)
+            
+            # Retry
+            if limiter:
+                limiter.wait_if_needed(priority=priority)
+            resp = requests.get(url, params=params, headers=UA, timeout=20)
+            if resp.status_code == 429:
+                return None, False  # still 429 after retry, give up
+        
+        return resp.json(), True
+    except Exception as e:
+        log.warning("GT call failed: %s", e)
+        return None, False
+
+
 def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, 
              limiter: GTRateLimiter | None = None) -> list[str]:
     """Where the whole thing starts. Fresh pools per chain -> ['<addr>:<netId>', ...].
@@ -85,31 +177,31 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
        robinhood is capped at 1 page to avoid 429 rate limits every cycle.
        Other networks fetch 2 pages from new_pools.
        
-       When include_trending=True, also fetches 1 page of trending_pools per network
-       to widen the universe beyond just new (<15m old) pools. This helps find tokens
-       with durable liquidity that passed the 15m age threshold.
+       When include_trending=True, fetches 1 page of trending_pools per network BEFORE
+       new_pools pagination. This prioritizes the high-yield trending feed.
        
-       If limiter is provided, checks budget before each call and skips when exhausted."""
+       If limiter is provided, paces calls to stay under rate limits. Trending feeds
+       retry once on 429 with Retry-After backoff; new_pools pages skip on 429."""
     ids, seen = [], set()
     
-    # Phase 1: new_pools (existing behavior)
-    for net in nets:
-        net_pages = 1 if net == "robinhood" else pages
-        for page in range(1, net_pages + 1):
-            if limiter and not limiter.spend(1):
-                log.warning("GT budget exhausted, skipping %s new_pools page %d", net, page)
-                break
-            try:
-                resp = requests.get(f"{GT}/networks/{net}/new_pools",
-                                    params={"page": page}, headers=UA, timeout=20)
-                if resp.status_code == 429:
-                    # Stop paging this network only, preserve IDs from other nets/pages
-                    log.warning("GeckoTerminal 429 on %s new_pools page %s, stopping pagination for this network", net, page)
-                    break
-                r = resp.json()
-            except Exception as e:
-                log.warning("new_pools %s p%s failed: %s", net, page, e)
-                break
+    # Phase 1: trending_pools (1 page per network, before new_pools)
+    if include_trending:
+        for net in nets:
+            r, should_continue = _gt_call_with_retry(
+                f"{GT}/networks/{net}/trending_pools",
+                {"page": 1},
+                limiter,
+                priority=False,
+                retry_on_429=True  # trending feeds retry once
+            )
+            if r is None:
+                if should_continue:
+                    log.warning("GT budget exhausted, skipping %s trending_pools", net)
+                    continue
+                else:
+                    log.warning("GeckoTerminal 429 on %s trending_pools, skipping trending for this network", net)
+                    continue
+            
             for pool in r.get("data", []):
                 base = ((pool.get("relationships") or {}).get("base_token") or {})
                 gid  = (base.get("data") or {}).get("id")      # 'solana_<addr>'
@@ -121,22 +213,24 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                     seen.add(tid)
                     ids.append(tid)
     
-    # Phase 2: trending_pools (1 page per network)
-    if include_trending:
-        for net in nets:
-            if limiter and not limiter.spend(1):
-                log.warning("GT budget exhausted, skipping %s trending_pools", net)
-                continue
-            try:
-                resp = requests.get(f"{GT}/networks/{net}/trending_pools",
-                                    params={"page": 1}, headers=UA, timeout=20)
-                if resp.status_code == 429:
-                    log.warning("GeckoTerminal 429 on %s trending_pools, skipping trending for this network", net)
-                    continue
-                r = resp.json()
-            except Exception as e:
-                log.warning("trending_pools %s failed: %s", net, e)
-                continue
+    # Phase 2: new_pools (existing behavior)
+    for net in nets:
+        net_pages = 1 if net == "robinhood" else pages
+        for page in range(1, net_pages + 1):
+            r, should_continue = _gt_call_with_retry(
+                f"{GT}/networks/{net}/new_pools",
+                {"page": page},
+                limiter,
+                priority=False,
+                retry_on_429=False  # new_pools doesn't retry
+            )
+            if r is None:
+                if should_continue:
+                    log.warning("GT budget exhausted, skipping %s new_pools page %d", net, page)
+                else:
+                    log.warning("GeckoTerminal 429 on %s new_pools page %s, stopping pagination for this network", net, page)
+                break  # stop paging this network
+            
             for pool in r.get("data", []):
                 base = ((pool.get("relationships") or {}).get("base_token") or {})
                 gid  = (base.get("data") or {}).get("id")      # 'solana_<addr>'
@@ -222,9 +316,11 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     
     If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
     On GT 429, raises DossierRetryNeeded (caller should requeue for next cycle)."""
-    if limiter and not limiter.spend(1):
-        log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
-        raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
+    if limiter:
+        if not limiter.spend(1, priority=True):
+            log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
+            raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
+        limiter.wait_if_needed(priority=True)
     
     net = GT_NET[t["net"]]
     resp = requests.get(f"{GT}/networks/{net}/tokens/{t['addr']}/info", headers=UA, timeout=20)
