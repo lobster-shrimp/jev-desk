@@ -138,6 +138,13 @@ class Fomo:
                                r.status_code, delay, attempt + 1, max_retries + 1)
                     time.sleep(delay)
                     continue
+                
+                # After exhausting retries, check for gateway errors one last time
+                if r.status_code in (502, 503, 504):
+                    log.error("FOMO %d gateway error persisted after %d retries, returning empty result for this chunk",
+                             r.status_code, max_retries)
+                    return {}
+                
                 r.raise_for_status()
                 break
             except (requests.exceptions.ConnectionError, ConnectionResetError) as e:
