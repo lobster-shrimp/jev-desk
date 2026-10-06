@@ -113,8 +113,11 @@ def chain_kill(d) -> str | None:
     return None
 
 
-def soft_kill(ans) -> str | None:
-    """Jev's answers against SOFT. First failure wins."""
+def soft_kill(ans) -> tuple[str, float] | None:
+    """Jev's answers against SOFT. First failure wins.
+    
+    Returns (reason, noul_value) on kill, None on pass.
+    """
     for name, (direction, limit) in SOFT.items():
         a = ans.get(name)
         if a is None:
@@ -122,14 +125,17 @@ def soft_kill(ans) -> str | None:
         v = a.get("noul", a.get("score"))
         if v is None:
             continue
-        if direction == "max" and v > limit: return name
-        if direction == "min" and v < limit: return name
+        if direction == "max" and v > limit: return (name, v)
+        if direction == "min" and v < limit: return (name, v)
 
     shape = ans.get("shape")
     if shape:
-        if shape["choice"] in ("fading", "one_buyer"):        return "shape"
-        if shape["probabilities"]["crowd"] < SHAPE_MIN_CROWD: return "shape_weak"
+        prob_crowd = shape["probabilities"]["crowd"]
+        if shape["choice"] in ("fading", "one_buyer"):        return ("shape", prob_crowd)
+        if prob_crowd < SHAPE_MIN_CROWD: return ("shape_weak", prob_crowd)
 
     chain = ans.get("sell_side_risk")
-    if chain and chain["choice"] in ("flagged", "suspicious"): return "sell_side"
+    if chain and chain["choice"] in ("flagged", "suspicious"):
+        # For categorical kills, return None as the value (no numeric score)
+        return ("sell_side", None)
     return None
