@@ -23,11 +23,12 @@ import os
 import time
 
 import book
-from collect import universe, shortlist, trade_counts, dossier, social_state, GTRateLimiter, DossierRetryNeeded
+from collect import universe, shortlist, trade_counts, dossier, social_state, GTRateLimiter, DossierRetryNeeded, dex_canary_check
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from fomo_api import FomoAuthError
 from pick import pick, size_factor_for
 import shadow_ledger
+import collect  # For fallback access
 from thresholds import HARD, SOFT
 
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
@@ -67,6 +68,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
              "chain": {}, "soft": {}, "judged": 0, "tokens": [], "requeued": 0}
     survivors = []
     dex_slots = DEX_BUDGET
+    dex_degraded = False  # track DexScreener health
+    free_passers = []  # tokens that passed free checks (for circuit breaker)
     
     # Use shared GT rate limiter (default to global singleton)
     if gt_limiter is None:
@@ -88,7 +91,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             row["soft_scores"] = soft_scores
         stats["tokens"].append(row)
 
-    ids = universe(limiter=gt_limiter)           # fresh + trending pools, budget-aware
+    ids, gt_txns_cache = universe(limiter=gt_limiter)           # fresh + trending pools, budget-aware
     book.expire_defer()                          # drop rows past max age
     due = book.defer_due()                       # ids ready for rescoring
     seen_ids = set()
@@ -161,22 +164,88 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                  t.get("mcap_usd"))
         book.forget_defer(t["tid"])
         log.info("defer outcome tid=%s reason=pass", t["tid"])
+        
+        # Track free passers for circuit breaker
+        free_passers.append(t)
 
         if dex_slots <= 0 or gt_limiter.available() <= 0:
             break                                # out of budget, not out of ideas
 
-        t |= trade_counts(t)                     # pass two: one DexScreener call
+        # Call trade_counts with new signature and GT fallback cache
+        trade_data, dex_status = trade_counts(t, gt_txns_cache=gt_txns_cache)
+        t.update(trade_data)
+        t["dex_status"] = dex_status
+        t["trades_source"] = "dex" if dex_status == "ok" else ("gt" if dex_status == "gt_fallback" else "none")
         dex_slots -= 1
+        
+        # Circuit breaker: check for consecutive empties (2-3 in a row)
+        # If we see empties piling up, run canary check BEFORE benching
+        if dex_status == "empty" and not dex_degraded:
+            # Count consecutive empty results so far
+            empty_count = sum(1 for fp in free_passers if fp.get("dex_status") == "empty")
+            if empty_count >= 2:  # 2+ empties (current + previous)
+                log.warning("DexScreener circuit breaker: %d consecutive empties, running canary check", empty_count + 1)
+                canary_net = t.get("net", 1399811149)
+                canary_healthy = dex_canary_check(canary_net)
+                
+                if not canary_healthy:
+                    dex_degraded = True
+                    log.warning("DexScreener DEGRADED: canary failed for net %s, "
+                                "requeuing empties and using GT fallback where available", canary_net)
+                    stats["dex_degraded"] = True
+                    
+                    # Requeue current token instead of benching
+                    log.info("requeuing %s due to DexScreener degradation", t["ticker"])
+                    now = time.time()
+                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                    book.defer(t["tid"], now + 60, drop_at)
+                    stats["requeued"] += 1
+                    record(t, "trade", "requeued_dex_degraded")
+                    continue
+                else:
+                    log.info("DexScreener canary healthy for net %s, empties are genuine", canary_net)
+        
         if (k := trade_kill(t)):
-            # Log trade kill with ticker, age, and tid for visibility
-            log.info("trade tid=%s ticker=%s reason=%s age_minutes=%s",
-                     t["tid"], t.get("ticker", "?"), k, t.get("age_minutes"))
+            # Special handling for dex_error: requeue instead of bench
+            if k == "dex_error":
+                log.warning("trade tid=%s ticker=%s reason=%s age_minutes=%s trades_source=%s (DexScreener error, requeueing)",
+                            t["tid"], t.get("ticker", "?"), k, t.get("age_minutes"), t.get("trades_source", "none"))
+                now = time.time()
+                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                book.defer(t["tid"], now + 60, drop_at)  # requeue after 1 min, no bench
+                stats["requeued"] += 1
+                log.info("defer outcome tid=%s reason=%s", t["tid"], k)
+                book.forget_defer(t["tid"])
+                record(t, "trade", k)
+                continue
+            
+            # If DexScreener is degraded and this is a no_pair kill, requeue instead
+            if k == "no_pair" and dex_degraded:
+                log.info("requeuing %s (no_pair during DexScreener degradation)", t["ticker"])
+                now = time.time()
+                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                book.defer(t["tid"], now + 60, drop_at)
+                stats["requeued"] += 1
+                record(t, "trade", "requeued_dex_degraded")
+                continue
+            
+            # Log trade kill with ticker, age, and source
+            log.info("trade tid=%s ticker=%s reason=%s age_minutes=%s dex_status=%s trades_source=%s",
+                     t["tid"], t.get("ticker", "?"), k, t.get("age_minutes"), dex_status, t.get("trades_source", "none"))
             book.sit(t["tid"], k)
             log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])
             stats["trade"][k] = stats["trade"].get(k, 0) + 1
+            # Track fallback usage in stats
+            if t.get("trades_source") == "gt":
+                stats.setdefault("gt_fallback_count", 0)
+                stats["gt_fallback_count"] += 1
             record(t, "trade", k)
             continue
+        
+        # Log passes with trades_source too
+        log.info("trade tid=%s ticker=%s reason=pass dex_status=%s trades_source=%s trades_h24=%s",
+                 t["tid"], t.get("ticker", "?"), dex_status, t.get("trades_source", "none"), t.get("trades_h24"))
 
         # Passed free & trade checks; track young tokens for in-cycle retry priority
         is_young = t.get("age_minutes", 0) < 60
@@ -204,36 +273,78 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             log.info("dossier retry needed for %s (age %.1fm): %s", 
                      t["ticker"], t.get("age_minutes", 0), e)
             
-            # Young tokens get one in-cycle retry after waiting for rate limit recovery
-            # The wait now happens inside dossier() before spending a slot
+            # Young tokens get one in-cycle retry if backoff fits (<=30s cap)
             if is_young:
-                log.info("young token %s (age %.1fm) hit 429, will retry in-cycle after backoff", 
-                         t["ticker"], t.get("age_minutes", 0))
-                try:
-                    d = dossier(t, limiter=gt_limiter)
-                    # Success on retry: remove from young pending
-                    if t in young_pending_dossier:
-                        young_pending_dossier.remove(t)
-                    log.info("young token %s dossier succeeded on in-cycle retry", t["ticker"])
-                except DossierRetryNeeded as retry_e:
-                    log.info("young token %s dossier failed on in-cycle retry, deferring: %s", 
-                             t["ticker"], retry_e)
-                    # Still failed after in-cycle retry: defer to next cycle
-                    # Keep in young_pending so old tokens don't get slots this cycle
-                    now = time.time()
-                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
-                    book.defer(t["tid"], now, drop_at)
-                    stats["requeued"] += 1
-                    record(t, "chain", "requeued_after_retry")
-                    continue
-                except Exception as retry_e:
-                    log.warning("young token %s dossier retry failed: %s", t["ticker"], retry_e)
-                    # Keep in young_pending so old tokens don't get slots this cycle
-                    book.sit(t["tid"], "dossier_failed")
-                    log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
-                    book.forget_defer(t["tid"])
-                    record(t, "chain", "dossier_failed")
-                    continue
+                # Check if backoff fits in-cycle (30s cap for in-cycle retry)
+                now = time.time()
+                wait_cap_sec = 30.0
+                
+                if gt_limiter.backoff_until > now:
+                    wait_needed = gt_limiter.backoff_until - now
+                    
+                    if wait_needed <= wait_cap_sec:
+                        # Backoff fits, wait and retry
+                        log.info("young token %s (age %.1fm) hit 429, waiting %.1fs for in-cycle retry", 
+                                 t["ticker"], t.get("age_minutes", 0), wait_needed)
+                        time.sleep(wait_needed)
+                        
+                        try:
+                            d = dossier(t, limiter=gt_limiter)
+                            # Success on retry: remove from young pending
+                            if t in young_pending_dossier:
+                                young_pending_dossier.remove(t)
+                            log.info("young token %s dossier succeeded on in-cycle retry after %.1fs wait", 
+                                     t["ticker"], wait_needed)
+                        except DossierRetryNeeded as retry_e:
+                            log.info("young token %s dossier failed on in-cycle retry, deferring: %s", 
+                                     t["ticker"], retry_e)
+                            now = time.time()
+                            drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                            book.defer(t["tid"], now, drop_at)
+                            stats["requeued"] += 1
+                            record(t, "chain", "requeued_after_retry")
+                            continue
+                        except Exception as retry_e:
+                            log.warning("young token %s dossier retry failed: %s", t["ticker"], retry_e)
+                            book.sit(t["tid"], "dossier_failed")
+                            log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
+                            book.forget_defer(t["tid"])
+                            record(t, "chain", "dossier_failed")
+                            continue
+                    else:
+                        # Backoff too long, defer
+                        log.info("young token %s (age %.1fm) hit 429, backoff %.1fs > cap %.1fs, deferring", 
+                                 t["ticker"], t.get("age_minutes", 0), wait_needed, wait_cap_sec)
+                        drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                        book.defer(t["tid"], now, drop_at)
+                        stats["requeued"] += 1
+                        record(t, "chain", "requeued_429_backoff")
+                        continue
+                else:
+                    # No backoff, try immediately
+                    log.info("young token %s (age %.1fm) retrying dossier (no backoff)", 
+                             t["ticker"], t.get("age_minutes", 0))
+                    try:
+                        d = dossier(t, limiter=gt_limiter)
+                        if t in young_pending_dossier:
+                            young_pending_dossier.remove(t)
+                        log.info("young token %s dossier succeeded on immediate retry", t["ticker"])
+                    except DossierRetryNeeded as retry_e:
+                        log.info("young token %s dossier failed on immediate retry, deferring: %s", 
+                                 t["ticker"], retry_e)
+                        now = time.time()
+                        drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                        book.defer(t["tid"], now, drop_at)
+                        stats["requeued"] += 1
+                        record(t, "chain", "requeued_after_retry")
+                        continue
+                    except Exception as retry_e:
+                        log.warning("young token %s dossier retry failed: %s", t["ticker"], retry_e)
+                        book.sit(t["tid"], "dossier_failed")
+                        log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
+                        book.forget_defer(t["tid"])
+                        record(t, "chain", "dossier_failed")
+                        continue
             else:
                 # Old token: defer without in-cycle retry
                 now = time.time()

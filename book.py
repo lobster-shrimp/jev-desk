@@ -64,6 +64,9 @@ BENCH_MINUTES = {
     "shape": 25, "shape_weak": 25, "momentum_already_spent": 25,
     "liquidity_fits_ticket": 25, "liquidity": 25, "volume": 25,
     "trades": 25, "mcap": 25, "age": 20,
+    # short bench for data provider issues (DexScreener empty pairs)
+    "no_pair": 12,  # short bench: suspect if FOMO shows liq/vol but DexScreener empty
+    # don't bench dex_error (will be requeued instead)
 }
 DEFAULT_BENCH = 45
 DEFER_CAP = 200

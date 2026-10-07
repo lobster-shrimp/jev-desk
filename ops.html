@@ -529,6 +529,7 @@ tr:hover td { background: #151515; }
 <h1>jev-desk ops<span id="mode-badge" class="badge shadow">shadow</span><span id="judge-badge" class="badge shadow" style="margin-left:4px;">live judge</span></h1>
 
 <div id="fomo-error-banner" class="error" style="display:none;"></div>
+<div id="dex-degraded-banner" class="error" style="display:none;"></div>
 <div id="error-box" class="error" style="display:none;"></div>
 
 <div id="fomo-panel" class="fomo-panel" style="display:none;">
@@ -1513,6 +1514,18 @@ async function refresh() {
       fomoBanner.style.display = 'block';
     } else {
       fomoBanner.style.display = 'none';
+    }
+    
+    // Show DexScreener degraded banner if present
+    const dexBanner = document.getElementById('dex-degraded-banner');
+    if (state.cycle && state.cycle.dex_degraded) {
+      dexBanner.textContent = '⚠️ DEXSCREENER DEGRADED: Provider returned empty pairs for known liquid tokens. no_pair/empty kills this cycle are suspect. DexScreener may be experiencing issues.';
+      dexBanner.style.display = 'block';
+      dexBanner.style.background = '#3d2814';
+      dexBanner.style.borderLeft = '4px solid #fb8c00';
+      dexBanner.style.color = '#ffcc80';
+    } else {
+      dexBanner.style.display = 'none';
     }
     
     document.getElementById('updated-at').textContent = formatTimestamp(state.updated_at);

@@ -40,10 +40,28 @@ def free_kill(t) -> str | None:
 
 
 def trade_kill(t) -> str | None:
-    """Pass two. One DexScreener call already spent on this token. Tens, not hundreds."""
-    if t["trades_h24"] is None:                             return "no_pair"
-    if t["trades_h24"] < HARD["min_trades_h24"]:            return "trades"
-    if t["sells_h1"] == 0 and (t["buys_h1"] or 0) > 20:     return "no_sells"
+    """Pass two. One DexScreener call already spent on this token. Tens, not hundreds.
+    
+    t now has 'dex_status' field: 'ok', 'empty', 'error', or 'gt_fallback'.
+    """
+    dex_status = t.get("dex_status", "ok")
+    
+    # Error: requeue (will be handled by caller, not benched here)
+    if dex_status == "error":
+        return "dex_error"
+    
+    # None trades_h24 = no data available, treat as no_pair regardless of status
+    # (handles cases where GT fallback has no data, or other edge cases)
+    if t["trades_h24"] is None:
+        return "no_pair"
+    
+    # Now we have a real number for trades_h24
+    if t["trades_h24"] < HARD["min_trades_h24"]:
+        return "trades"
+    
+    if t["sells_h1"] == 0 and (t["buys_h1"] or 0) > 20:
+        return "no_sells"
+    
     return None
 
 

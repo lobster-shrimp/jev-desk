@@ -31,13 +31,18 @@ class GTRateLimiter:
     
     Shared across the entire process, not per-cycle."""
     
-    def __init__(self, calls_per_min: int = 8, window_sec: float = 60.0, time_fn=None):
+    def __init__(self, calls_per_min: int = 8, window_sec: float = 60.0, time_fn=None,
+                 backoff_floor_sec: float = 25.0, backoff_max_sec: float = 120.0):
         self.calls_per_min = calls_per_min
         self.window_sec = window_sec
         self.time_fn = time_fn or time.time
         self.calls = deque()  # timestamps of calls in the window
         self.reserved = 0     # slots reserved for dossiers
         self.backoff_until = 0.0  # timestamp until which we must wait due to 429
+        self.backoff_floor_sec = backoff_floor_sec  # minimum backoff for 0/missing Retry-After
+        self.backoff_max_sec = backoff_max_sec  # cap on backoff duration
+        self.consecutive_429s = 0  # track consecutive 429s for adaptive backoff
+        self.saturated = False  # window is saturated after a 429
     
     def available(self) -> int:
         """How many GT calls can be made without waiting."""
@@ -55,15 +60,29 @@ class GTRateLimiter:
         """Record a 429 response and set backoff period.
         
         Args:
-            retry_after_sec: Value from Retry-After header, or None to use default (5s)
+            retry_after_sec: Value from Retry-After header, or None if missing/unparseable.
+                            When 0, missing, or unparseable, applies backoff_floor_sec.
+                            Grows on consecutive 429s, capped at backoff_max_sec.
         """
         now = self.time_fn()
-        backoff_duration = retry_after_sec if retry_after_sec is not None else 5.0
+        self.consecutive_429s += 1
+        self.saturated = True  # mark window as saturated
+        
+        # Apply floor backoff when Retry-After is 0, missing, or unparseable
+        # Grow on consecutive 429s: floor * (1.5 ** (consecutive - 1)), capped
+        if retry_after_sec is None or retry_after_sec <= 0:
+            growth_factor = 1.5 ** (self.consecutive_429s - 1)
+            backoff_duration = min(self.backoff_floor_sec * growth_factor, self.backoff_max_sec)
+            log.info("GT 429 received with Retry-After=%s, applying floor backoff: %.1fs "
+                     "(consecutive_429s=%d, floor=%.1fs, max=%.1fs)", 
+                     retry_after_sec, backoff_duration, self.consecutive_429s,
+                     self.backoff_floor_sec, self.backoff_max_sec)
+        else:
+            backoff_duration = min(retry_after_sec, self.backoff_max_sec)
+            log.info("GT 429 received, backing off for %.1fs (Retry-After: %.1fs, capped at %.1fs)", 
+                     backoff_duration, retry_after_sec, self.backoff_max_sec)
+        
         self.backoff_until = now + backoff_duration
-        log.info("GT 429 received, backing off for %.1fs until %s (Retry-After: %s)", 
-                 backoff_duration, 
-                 time.strftime("%H:%M:%S", time.localtime(self.backoff_until)),
-                 f"{retry_after_sec}s" if retry_after_sec is not None else "default")
     
     def wait_if_needed(self, priority: bool = False):
         """Block until a call can be made within rate limits.
@@ -99,6 +118,11 @@ class GTRateLimiter:
             time.sleep(wait_sec)
             self._expire_old_calls()
     
+    def record_success(self):
+        """Record a successful API call. Clears saturated flag and resets consecutive 429 counter."""
+        self.saturated = False
+        self.consecutive_429s = 0
+    
     def spend(self, cost: int = 1, priority: bool = False) -> bool:
         """Try to spend `cost` slots. Returns True if budget available, False otherwise.
         
@@ -125,7 +149,7 @@ class GTRateLimiter:
         return reserved
 
 GT  = "https://api.geckoterminal.com/api/v2"
-DEX = "https://api.dexscreener.com/latest/dex/tokens"
+DEX = "https://api.dexscreener.com/token-pairs/v1"  # New documented endpoint
 SOL_RPC = "https://api.mainnet-beta.solana.com"
 UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) desk/1.0",
       "Accept": "application/json"}
@@ -133,6 +157,9 @@ UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) desk/1.0",
 # the three chains the desk trades, plus Base which shares the BSC question set
 GT_NET   = {1399811149: "solana", 4663: "robinhood", 56: "bsc", 8453: "base"}
 FOMO_NET = {v: k for k, v in GT_NET.items()}
+
+# Map network IDs to DexScreener chain IDs
+DEX_CHAIN_ID = {1399811149: "solana", 56: "bsc", 8453: "base", 4663: "robinhood"}
 
 # Special marker for dossier failures that should trigger retry
 class DossierRetryNeeded(Exception):
@@ -161,36 +188,46 @@ def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None,
     
     If retry_on_429=True (trending feeds), retries once on 429 with backoff."""
     if limiter:
+        # Wait BEFORE spending to avoid burst after backoff
+        limiter.wait_if_needed(priority=priority)
         if not limiter.spend(1, priority=priority):
             return None, True  # budget exhausted, but continue other feeds
-        limiter.wait_if_needed(priority=priority)
     
     try:
         resp = requests.get(url, params=params, headers=UA, timeout=20)
         if resp.status_code == 429:
+            # Extract Retry-After and record with limiter
+            retry_after_sec = None
+            if resp.headers:
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        retry_after_sec = float(retry_after)
+                    except (ValueError, TypeError):
+                        retry_after_sec = None
+            
+            if limiter:
+                limiter.record_429(retry_after_sec)
+            
             if not retry_on_429:
-                return None, False  # trending feed, don't retry
+                return None, False  # non-retryable feed, stop
             
-            # Retry once with backoff
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    backoff = float(retry_after)
-                except ValueError:
-                    backoff = 60.0
-            else:
-                backoff = 60.0
-            
-            log.info("GT 429, backing off %.1fs before retry", backoff)
-            time.sleep(backoff)
-            
-            # Retry
+            # Retry once after backoff (wait_if_needed will honor the recorded backoff)
             if limiter:
                 limiter.wait_if_needed(priority=priority)
+            else:
+                # No limiter, manual backoff
+                backoff = retry_after_sec if retry_after_sec is not None else 60.0
+                log.info("GT 429 (no limiter), backing off %.1fs before retry", backoff)
+                time.sleep(backoff)
+            
+            # Retry
             resp = requests.get(url, params=params, headers=UA, timeout=20)
             if resp.status_code == 429:
                 return None, False  # still 429 after retry, give up
         
+        if limiter:
+            limiter.record_success()  # clear saturated flag on success
         return resp.json(), True
     except Exception as e:
         log.warning("GT call failed: %s", e)
@@ -198,8 +235,8 @@ def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None,
 
 
 def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, 
-             limiter: GTRateLimiter | None = None) -> list[str]:
-    """Where the whole thing starts. Fresh pools per chain -> ['<addr>:<netId>', ...].
+             limiter: GTRateLimiter | None = None) -> tuple[list[str], dict]:
+    """Where the whole thing starts. Fresh pools per chain -> (['<addr>:<netId>', ...], {tid: gt_txns}).
        Costs one GeckoTerminal slot per chain per page, so keep pages small.
        
        robinhood is capped at 1 page to avoid 429 rate limits every cycle.
@@ -209,8 +246,12 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
        new_pools pagination. This prioritizes the high-yield trending feed.
        
        If limiter is provided, paces calls to stay under rate limits. Trending feeds
-       retry once on 429 with Retry-After backoff; new_pools pages skip on 429."""
+       retry once on 429 with Retry-After backoff; new_pools pages skip on 429.
+       
+       Also returns gt_txns_cache: {tid: {"h1": {"buys": N, "sells": N}, "h6": {...}, "h24": {...}}}
+       for fallback when DexScreener is degraded."""
     ids, seen = [], set()
+    gt_txns_cache = {}  # {tid: transaction data from GT}
     
     # Phase 1: trending_pools (1 page per network, before new_pools)
     if include_trending:
@@ -240,6 +281,27 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 if tid not in seen:
                     seen.add(tid)
                     ids.append(tid)
+                
+                # Cache GT transaction data for DexScreener fallback
+                # Prefer highest liquidity pool if multiple pools for same token
+                attrs = pool.get("attributes", {})
+                txns = attrs.get("transactions", {})
+                if txns:
+                    # GT API returns reserve_in_usd as a string
+                    reserve_str = attrs.get("reserve_in_usd")
+                    try:
+                        liq_usd = float(reserve_str) if reserve_str else 0.0
+                    except (ValueError, TypeError):
+                        liq_usd = 0.0
+                    # Only cache if no existing data OR this pool has higher liquidity
+                    existing = gt_txns_cache.get(tid)
+                    if not existing or liq_usd > existing.get("_liq_usd", 0):
+                        gt_txns_cache[tid] = {
+                            "h1": txns.get("h1", {}),
+                            "h6": txns.get("h6", {}),
+                            "h24": txns.get("h24", {}),
+                            "_liq_usd": liq_usd  # track for comparison
+                        }
     
     # Phase 2: new_pools (existing behavior)
     for net in nets:
@@ -269,8 +331,29 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 if tid not in seen:
                     seen.add(tid)
                     ids.append(tid)
+                
+                # Cache GT transaction data for DexScreener fallback
+                # Prefer highest liquidity pool if multiple pools for same token
+                attrs = pool.get("attributes", {})
+                txns = attrs.get("transactions", {})
+                if txns:
+                    # GT API returns reserve_in_usd as a string
+                    reserve_str = attrs.get("reserve_in_usd")
+                    try:
+                        liq_usd = float(reserve_str) if reserve_str else 0.0
+                    except (ValueError, TypeError):
+                        liq_usd = 0.0
+                    # Only cache if no existing data OR this pool has higher liquidity
+                    existing = gt_txns_cache.get(tid)
+                    if not existing or liq_usd > existing.get("_liq_usd", 0):
+                        gt_txns_cache[tid] = {
+                            "h1": txns.get("h1", {}),
+                            "h6": txns.get("h6", {}),
+                            "h24": txns.get("h24", {}),
+                            "_liq_usd": liq_usd  # track for comparison
+                        }
     
-    return ids
+    return ids, gt_txns_cache
 
 
 def normalise(tid: str, m: dict) -> dict:
@@ -318,25 +401,171 @@ _EMPTY_TRADES = {"buys_h1": None, "sells_h1": None, "buys_h6": None, "sells_h6":
                  "trades_h24": None}
 
 
-def trade_counts(t: dict) -> dict:
+# Known liquid tokens for canary checks (Solana addresses)
+CANARY_TOKENS = {
+    1399811149: "So11111111111111111111111111111111111111112",  # Wrapped SOL
+}
+
+
+def dex_canary_check(net: int) -> bool:
+    """Check if DexScreener is healthy by querying a known liquid token.
+    
+    Returns True if canary is healthy (has pairs), False if degraded (empty/error).
+    """
+    canary_addr = CANARY_TOKENS.get(net)
+    chain_id = DEX_CHAIN_ID.get(net)
+    
+    if not canary_addr or not chain_id:
+        log.debug("No canary token/chain configured for net %s, skipping canary check", net)
+        return True  # no canary available, assume healthy
+    
+    try:
+        resp = requests.get(f"{DEX}/{chain_id}/{canary_addr}", headers=UA, timeout=20)
+        if resp.status_code != 200:
+            log.warning("DexScreener canary HTTP %d for net %s", resp.status_code, net)
+            return False
+        
+        try:
+            data = resp.json()
+        except Exception:
+            log.warning("DexScreener canary JSON parse error for net %s", net)
+            return False
+        
+        # New endpoint returns array directly - null or empty = degraded
+        if data is None or (isinstance(data, list) and len(data) == 0):
+            log.warning("DexScreener canary empty/null for net %s (known liquid token %s has no pairs)", 
+                        net, canary_addr)
+            return False
+        
+        log.info("DexScreener canary healthy for net %s (%d pairs)", net, len(data) if isinstance(data, list) else 0)
+        return True
+        
+    except Exception as e:
+        log.warning("DexScreener canary check failed for net %s: %s", net, e)
+        return False
+
+
+def trade_counts(t: dict, gt_txns_cache: dict = None) -> tuple[dict, str]:
     """buys and sells per window. FOMO does not return them, DexScreener does.
        Called ONLY for tokens that already cleared the free checks. One per token,
-       so this runs on tens, never on the whole universe."""
+       so this runs on tens, never on the whole universe.
+       
+       When DexScreener fails/degrades, falls back to GT transaction data from universe scan.
+       
+       Returns (trade_data, status):
+         status: 'ok' (got data), 'empty' (no pairs found), 'error' (HTTP/network error),
+                 'gt_fallback' (used GT data due to Dex error/empty)
+    """
+    gt_txns_cache = gt_txns_cache or {}
+    chain_id = DEX_CHAIN_ID.get(t["net"])
+    
+    if not chain_id:
+        log.warning("No DexScreener chain_id for net %s, using GT fallback", t["net"])
+        return _try_gt_fallback(t, gt_txns_cache, genuine_empty=False)
+    
     try:
-        pairs = requests.get(f"{DEX}/{t['addr']}", headers=UA, timeout=20).json().get("pairs") or []
-    except Exception:
-        return dict(_EMPTY_TRADES)
-    if not pairs:
-        return dict(_EMPTY_TRADES)
-    x = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0).get("txns") or {}
-    w = lambda k: x.get(k) or {}
+        resp = requests.get(f"{DEX}/{chain_id}/{t['addr']}", headers=UA, timeout=20)
+        
+        # Check HTTP status codes - only 200 is ok
+        if resp.status_code != 200:
+            log.warning("DexScreener HTTP %d for %s (%s)", resp.status_code, t["ticker"], t["addr"])
+            # Try GT fallback on HTTP errors
+            return _try_gt_fallback(t, gt_txns_cache)
+        
+        try:
+            data = resp.json()
+        except Exception as e:
+            log.warning("DexScreener JSON parse error for %s (%s): %s", t["ticker"], t["addr"], e)
+            return _try_gt_fallback(t, gt_txns_cache)
+        
+        # New endpoint returns array directly (not wrapped in {"pairs": ...})
+        # null or [] = genuinely no pairs found (no_pair)
+        if data is None or (isinstance(data, list) and len(data) == 0):
+            # Genuinely empty - try GT fallback first
+            log.info("DexScreener empty/null for %s, trying GT fallback", t["ticker"])
+            return _try_gt_fallback(t, gt_txns_cache, genuine_empty=True)
+        
+        if not isinstance(data, list):
+            log.warning("DexScreener unexpected response type for %s: %s", t["ticker"], type(data))
+            return _try_gt_fallback(t, gt_txns_cache)
+        
+    except requests.exceptions.Timeout:
+        log.warning("DexScreener timeout for %s (%s)", t["ticker"], t["addr"])
+        return _try_gt_fallback(t, gt_txns_cache)
+    except requests.exceptions.RequestException as e:
+        log.warning("DexScreener network error for %s (%s): %s", t["ticker"], t["addr"], e)
+        return _try_gt_fallback(t, gt_txns_cache)
+    except Exception as e:
+        log.warning("DexScreener unexpected error for %s (%s): %s", t["ticker"], t["addr"], e)
+        return _try_gt_fallback(t, gt_txns_cache)
+    
+    # Parse the pairs data - pick highest liquidity pair
     try:
-        return {"buys_h1": w("h1").get("buys"), "sells_h1": w("h1").get("sells"),
-                "buys_h6": w("h6").get("buys"), "sells_h6": w("h6").get("sells"),
-                "trades_h24": (w("h24").get("buys") or 0) + (w("h24").get("sells") or 0)
-                              if w("h24") else None}
-    except (TypeError, AttributeError):
-        return dict(_EMPTY_TRADES)
+        if not data:  # Empty list already handled above, but be defensive
+            return _try_gt_fallback(t, gt_txns_cache, genuine_empty=True)
+        
+        # Sort by liquidity, pick highest
+        pairs_with_liq = [(p, (p.get("liquidity") or {}).get("usd") or 0) for p in data]
+        best_pair, best_liq = max(pairs_with_liq, key=lambda x: x[1])
+        
+        txns = best_pair.get("txns") or {}
+        h1 = txns.get("h1") or {}
+        h6 = txns.get("h6") or {}
+        h24 = txns.get("h24") or {}
+        
+        buys_h24 = h24.get("buys") or 0
+        sells_h24 = h24.get("sells") or 0
+        
+        return {
+            "buys_h1": h1.get("buys"), 
+            "sells_h1": h1.get("sells"),
+            "buys_h6": h6.get("buys"), 
+            "sells_h6": h6.get("sells"),
+            "trades_h24": buys_h24 + sells_h24  # Always a number, never None
+        }, 'ok'
+    except (TypeError, AttributeError, KeyError, ValueError) as e:
+        log.warning("DexScreener data parse error for %s (%s): %s", t["ticker"], t["addr"], e)
+        return _try_gt_fallback(t, gt_txns_cache)
+
+
+def _try_gt_fallback(t: dict, gt_txns_cache: dict, genuine_empty: bool = False) -> tuple[dict, str]:
+    """Try to use GT transaction data as fallback for DexScreener.
+    
+    Args:
+        t: token dict
+        gt_txns_cache: {tid: {"h1": {"buys": N, "sells": N}, ...}} from universe()
+        genuine_empty: True if Dex returned empty/null (not error), False for errors
+    
+    Returns (trade_data, status) where status is 'gt_fallback', 'empty', or 'error'
+    """
+    tid = t.get("tid")
+    gt_txns = gt_txns_cache.get(tid) if tid else None
+    
+    if gt_txns and gt_txns.get("h24"):
+        # GT has data, use it
+        h1 = gt_txns.get("h1", {})
+        h6 = gt_txns.get("h6", {})
+        h24 = gt_txns.get("h24", {})
+        
+        buys_h24 = h24.get("buys") or 0
+        sells_h24 = h24.get("sells") or 0
+        
+        log.info("Using GT fallback for %s: h24 buys=%s sells=%s (DexScreener %s)", 
+                 t["ticker"], buys_h24, sells_h24, "empty" if genuine_empty else "error")
+        
+        return {
+            "buys_h1": h1.get("buys"),
+            "sells_h1": h1.get("sells"),
+            "buys_h6": h6.get("buys"),
+            "sells_h6": h6.get("sells"),
+            "trades_h24": buys_h24 + sells_h24  # Always a number, even if 0
+        }, 'gt_fallback'
+    
+    # No GT fallback available
+    if genuine_empty:
+        return dict(_EMPTY_TRADES), 'empty'
+    else:
+        return dict(_EMPTY_TRADES), 'error'
 
 
 def _normalize_authority(raw_value) -> tuple[bool | None, str | None]:
@@ -373,7 +602,15 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     if limiter:
         # Wait for any 429 backoff BEFORE spending a slot (order matters!)
         # This ensures young in-cycle retries honor the backoff period set by record_429()
+        wait_start = limiter.time_fn()
         limiter.wait_if_needed(priority=True)
+        wait_duration = limiter.time_fn() - wait_start
+        
+        # Log actual wait duration if we waited
+        if wait_duration >= 0.1:  # only log waits >= 100ms
+            log.info("dossier for %s waited %.1fs for GT rate limit/429 backoff", 
+                     t["ticker"], wait_duration)
+        
         if not limiter.spend(1, priority=True):
             log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
             raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
@@ -395,8 +632,12 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
         if limiter:
             limiter.record_429(retry_after_sec)
         
-        log.warning("GeckoTerminal 429 on dossier for %s, will retry next cycle", t["ticker"])
+        log.warning("GeckoTerminal 429 on dossier for %s (Retry-After: %s), will retry next cycle", 
+                    t["ticker"], retry_after_sec if retry_after_sec is not None else "missing/0")
         raise DossierRetryNeeded(f"GT 429 for {t['ticker']}")
+    
+    if limiter:
+        limiter.record_success()  # clear saturated flag on success
     
     a = resp.json()["data"]["attributes"]
 
