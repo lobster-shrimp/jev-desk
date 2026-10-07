@@ -2775,6 +2775,91 @@ def test_young_token_429_twice_defers_to_next_cycle(monkeypatch):
     assert stats.get("requeued", 0) >= 1, "Token should be marked as requeued"
 
 
+def test_young_token_429_backoff_actually_waits(monkeypatch):
+    """Verify that after a GT 429, in-cycle retry waits for proper backoff (not ~50ms)."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    young_tid = f"BackoffTest:{1399811149}"
+    
+    def fake_shortlist(fomo, id_list):
+        return [{"tid": young_tid, "addr": "BackoffTest", "net": 1399811149, "ticker": "BKOFF",
+                "age_minutes": 25.0, "liquidity_usd": 50000, "volume_h24": 200000,
+                "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+                "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}}]
+    
+    # Use fake time to track the backoff
+    fake_time = [1000.0]  # start at t=1000
+    
+    def time_fn():
+        return fake_time[0]
+    
+    # Track sleep calls and their durations
+    sleep_calls = []
+    original_sleep = time.sleep
+    def fake_sleep(duration):
+        sleep_calls.append(duration)
+        fake_time[0] += duration  # advance fake time
+    
+    # Create limiter with fake time
+    test_limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=time_fn)
+    
+    dossier_call_count = [0]
+    dossier_call_times = []
+    
+    def fake_dossier_429_then_success(t, limiter=None):
+        dossier_call_count[0] += 1
+        dossier_call_times.append(fake_time[0])
+        
+        if dossier_call_count[0] == 1:
+            # First call: simulate 429 with 5-second Retry-After
+            if limiter:
+                limiter.record_429(5.0)
+            raise collect.DossierRetryNeeded("GT 429 first attempt")
+        # Second call: succeed
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_429_then_success)
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, 
+                                  gt_dossier_reserve=2, gt_limiter=test_limiter)
+    
+    # Verify that dossier was called twice
+    assert dossier_call_count[0] == 2, f"Expected 2 dossier calls, got {dossier_call_count[0]}"
+    
+    # Verify that sleep was called with a reasonable backoff (should be 5 seconds from record_429)
+    assert len(sleep_calls) > 0, "Expected at least one sleep call for backoff"
+    
+    # Find sleep calls >= 1 second (backoff sleeps, not tiny waits)
+    backoff_sleeps = [s for s in sleep_calls if s >= 1.0]
+    assert len(backoff_sleeps) > 0, f"Expected backoff sleep >= 1s, got sleep_calls={sleep_calls}"
+    
+    # Verify the backoff was reasonable (should be ~5 seconds, allow some tolerance)
+    total_backoff = sum(backoff_sleeps)
+    assert total_backoff >= 4.0, f"Expected backoff >= 4s, got {total_backoff:.2f}s"
+    
+    # Verify calls were spaced apart (not ~50ms)
+    if len(dossier_call_times) == 2:
+        time_between_calls = dossier_call_times[1] - dossier_call_times[0]
+        assert time_between_calls >= 4.0, \
+            f"Expected >=4s between dossier calls after 429, got {time_between_calls:.2f}s"
+    
+    # Token should succeed after proper backoff
+    assert stats.get("judged", 0) >= 1, "Token should be judged after backoff and successful retry"
+
+
 def test_old_token_429_skips_while_young_pending(monkeypatch):
     """Old token (≥60m) should be deferred if young tokens still need dossiers this cycle."""
     book.release()
@@ -3239,3 +3324,152 @@ def test_chain_kill_logs_young_token_top_10(monkeypatch, caplog):
     
     # Verify stats tracked the kill
     assert stats.get("chain", {}).get("top_10", 0) == 1
+
+
+# ============================================================================
+# GTRateLimiter 429 backoff tests
+# ============================================================================
+
+def test_gt_rate_limiter_record_429_with_retry_after():
+    """GTRateLimiter should record 429 and set backoff based on Retry-After."""
+    fake_time = [1000.0]
+    
+    def time_fn():
+        return fake_time[0]
+    
+    limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=time_fn)
+    
+    # Record 429 with 10-second Retry-After
+    limiter.record_429(retry_after_sec=10.0)
+    
+    # Backoff should be set to now + 10 seconds
+    assert limiter.backoff_until == 1010.0, f"Expected backoff_until=1010.0, got {limiter.backoff_until}"
+
+
+def test_gt_rate_limiter_record_429_default_backoff():
+    """GTRateLimiter should use 5s default when Retry-After is None."""
+    fake_time = [1000.0]
+    
+    def time_fn():
+        return fake_time[0]
+    
+    limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=time_fn)
+    
+    # Record 429 without Retry-After
+    limiter.record_429(retry_after_sec=None)
+    
+    # Should use 5s default
+    assert limiter.backoff_until == 1005.0, f"Expected backoff_until=1005.0, got {limiter.backoff_until}"
+
+
+def test_gt_rate_limiter_wait_if_needed_enforces_429_backoff():
+    """wait_if_needed should sleep until backoff period expires."""
+    fake_time = [1000.0]
+    sleep_calls = []
+    
+    def time_fn():
+        return fake_time[0]
+    
+    def fake_sleep(duration):
+        sleep_calls.append(duration)
+        fake_time[0] += duration
+    
+    limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=time_fn)
+    
+    # Record 429 with 8-second backoff
+    limiter.record_429(retry_after_sec=8.0)
+    
+    # Monkey-patch time.sleep
+    import time as time_module
+    original_sleep = time_module.sleep
+    try:
+        time_module.sleep = fake_sleep
+        
+        # wait_if_needed should sleep for the backoff period
+        limiter.wait_if_needed(priority=True)
+        
+        # Should have slept for ~8 seconds
+        assert len(sleep_calls) > 0, "Expected at least one sleep call"
+        assert sleep_calls[0] >= 7.9, f"Expected sleep ~8s, got {sleep_calls[0]:.2f}s"
+        
+        # After backoff, time should have advanced
+        assert fake_time[0] >= 1008.0, f"Expected time >= 1008, got {fake_time[0]}"
+        
+    finally:
+        time_module.sleep = original_sleep
+
+
+def test_gt_rate_limiter_wait_if_needed_no_backoff_if_expired():
+    """wait_if_needed should not sleep if backoff period has already expired."""
+    fake_time = [1000.0]
+    sleep_calls = []
+    
+    def time_fn():
+        return fake_time[0]
+    
+    def fake_sleep(duration):
+        sleep_calls.append(duration)
+        fake_time[0] += duration
+    
+    limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=time_fn)
+    
+    # Record 429 with 5-second backoff
+    limiter.record_429(retry_after_sec=5.0)
+    
+    # Advance time past the backoff period
+    fake_time[0] = 1006.0
+    
+    # Monkey-patch time.sleep
+    import time as time_module
+    original_sleep = time_module.sleep
+    try:
+        time_module.sleep = fake_sleep
+        
+        # wait_if_needed should not sleep (backoff expired)
+        limiter.wait_if_needed(priority=True)
+        
+        # Should not have slept for backoff (backoff already expired)
+        backoff_sleeps = [s for s in sleep_calls if s >= 1.0]
+        assert len(backoff_sleeps) == 0, f"Expected no backoff sleep, got {backoff_sleeps}"
+        
+    finally:
+        time_module.sleep = original_sleep
+
+
+def test_dossier_429_calls_record_429_on_limiter(monkeypatch):
+    """dossier() should call limiter.record_429() when it gets a 429 response."""
+    fake_time = [1000.0]
+    
+    def time_fn():
+        return fake_time[0]
+    
+    limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=time_fn)
+    
+    # Create a fake 429 response
+    class FakeResponse:
+        status_code = 429
+        headers = {"Retry-After": "7"}
+    
+    def fake_get(url, headers=None, timeout=None):
+        return FakeResponse()
+    
+    # Monkey-patch requests.get
+    original_get = requests.get
+    try:
+        monkeypatch.setattr(requests, "get", fake_get)
+        
+        token = {"tid": "test:123", "ticker": "TEST", "addr": "testaddr", "net": 1399811149}
+        
+        try:
+            collect.dossier(token, limiter=limiter)
+            assert False, "Expected DossierRetryNeeded"
+        except collect.DossierRetryNeeded:
+            pass
+        
+        # Limiter should have recorded the 429 with Retry-After
+        assert limiter.backoff_until == 1007.0, \
+            f"Expected limiter.backoff_until=1007.0 (7s backoff), got {limiter.backoff_until}"
+        
+    finally:
+        requests.get = original_get
+

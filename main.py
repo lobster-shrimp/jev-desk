@@ -193,8 +193,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             
             # Young tokens get one in-cycle retry after waiting for rate limit recovery
             if is_young:
-                log.info("young token %s waiting for rate limit recovery before in-cycle retry", 
-                         t["ticker"])
+                log.info("young token %s (age %.1fm) hit 429, backing off before in-cycle retry", 
+                         t["ticker"], t.get("age_minutes", 0))
                 gt_limiter.wait_if_needed(priority=True)
                 try:
                     d = dossier(t, limiter=gt_limiter)
