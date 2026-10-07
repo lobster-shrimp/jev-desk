@@ -9,6 +9,7 @@ import time
 import pathlib
 from unittest.mock import Mock
 import requests
+import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -27,6 +28,19 @@ from fomo_api import Fomo                             # noqa: E402
 
 JUDGE = mock_judge_fn()
 NOW_MS = int(time.time() * 1000)
+
+
+@pytest.fixture(autouse=True)
+def reset_gt_limiter():
+    """Reset the global GT rate limiter before each test to ensure isolation.
+    
+    Without this, tests that use the default gt_limiter (via run_once without
+    explicit gt_limiter parameter) share state, causing budget exhaustion and
+    test failures when dossier() calls wait_if_needed() before spend()."""
+    shift._gt_limiter.calls.clear()
+    shift._gt_limiter.reserved = 0
+    shift._gt_limiter.backoff_until = 0.0
+    yield
 
 
 def tok(i, net=1399811149, **over):
