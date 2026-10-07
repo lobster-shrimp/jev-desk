@@ -19,6 +19,8 @@ from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import book
+import shadow_ledger
+from fomo_api import activate_fomo_tab
 from judge import app, DESK_SECRET
 
 HERE = pathlib.Path(__file__).parent
@@ -65,3 +67,50 @@ async def api_state():
     if not state_path.exists():
         return JSONResponse({"demo": False, "tokens": [], "cycle": None}, status_code=404)
     return JSONResponse(json.loads(state_path.read_text()))
+
+
+@app.get("/api/shadow_ledger")
+async def api_shadow_ledger():
+    """
+    Return shadow PnL ledger: open positions, closed positions, summary.
+    All data is hypothetical and labeled as such.
+    """
+    return JSONResponse({
+        "open_positions": shadow_ledger.open_positions(),
+        "closed_positions": shadow_ledger.closed_positions(limit=50),
+        "summary": shadow_ledger.summary()
+    })
+
+
+@app.get("/api/fomo_status")
+async def api_fomo_status():
+    """
+    Return FOMO health status. NEVER returns the bearer token itself.
+    Safe for ops panel display.
+    """
+    # Try to get FOMO health from the most recent state.json
+    state_path = OUTBOX / "state.json"
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+            if state.get("fomo_health"):
+                return JSONResponse(state["fomo_health"])
+        except Exception:
+            pass
+    
+    # Fallback: return minimal status
+    return JSONResponse({
+        "bearer_present": False,
+        "message": "No FOMO health data available yet. Wait for a cycle to complete."
+    })
+
+
+@app.post("/api/fomo_activate")
+async def api_fomo_activate():
+    """
+    Activate the fomo.family tab in the CDP Chrome instance.
+    Local-only endpoint (bind server to 127.0.0.1 for safety).
+    """
+    result = activate_fomo_tab()
+    status_code = 200 if result["success"] else 500
+    return JSONResponse(result, status_code=status_code)

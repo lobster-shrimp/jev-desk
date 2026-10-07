@@ -48,6 +48,9 @@ class Fomo:
     def __init__(self, bearer: str | None = None):
         self._bearer = bearer or os.environ.get("FOMO_BEARER")
         self._fetched_at = time.time() if self._bearer else 0.0
+        self._last_error = None          # Last FomoAuthError message
+        self._last_error_at = None       # When the last error occurred
+        self._cdp_reachable = None       # Last CDP reachability check result
         self.s = requests.Session()
         self.s.headers.update({"Content-Type": "application/json",
                                "Origin": "https://fomo.family",
@@ -63,17 +66,44 @@ class Fomo:
         fresh = self._from_chrome()
         if fresh:
             self._bearer, self._fetched_at = fresh, time.time()
+            self._last_error = None  # Clear error on successful refresh
         elif not self._bearer:
-            raise FomoAuthError("no FOMO bearer: log into fomo.family in Chrome started with "
-                                "--remote-debugging-port=9222, or set FOMO_BEARER")
+            err_msg = "no FOMO bearer: log into fomo.family in Chrome started with --remote-debugging-port=9222, or set FOMO_BEARER"
+            self._last_error = err_msg
+            self._last_error_at = time.time()
+            raise FomoAuthError(err_msg)
         return self._bearer
+    
+    def health(self) -> dict:
+        """
+        Return FOMO auth health status. NEVER returns the bearer token itself.
+        Safe for ops panel display and logging.
+        """
+        bearer_present = self._bearer is not None
+        bearer_age_seconds = time.time() - self._fetched_at if bearer_present else None
+        bearer_source = "env" if os.environ.get("FOMO_BEARER") else "cdp"
+        
+        return {
+            "bearer_present": bearer_present,
+            "bearer_age_seconds": bearer_age_seconds,
+            "bearer_source": bearer_source,
+            "last_refresh_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._fetched_at)) if bearer_present else None,
+            "ttl_seconds": TOKEN_TTL,
+            "needs_refresh": bearer_age_seconds > TOKEN_TTL if bearer_age_seconds else True,
+            "last_error": self._last_error,
+            "last_error_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self._last_error_at)) if self._last_error_at else None,
+            "cdp_reachable": self._cdp_reachable,
+            "cdp_url": CDP_URL,
+        }
 
     def _from_chrome(self) -> str | None:
         """Read the Privy token from the logged-in fomo.family tab via the DevTools protocol."""
         try:
             tabs = requests.get(f"{CDP_URL}/json", timeout=5).json()
+            self._cdp_reachable = True
         except Exception as e:
             log.debug("CDP not reachable at %s: %s", CDP_URL, e)
+            self._cdp_reachable = False
             return None
         tab = next((t for t in tabs if t.get("type") == "page" and "fomo.family" in t.get("url", "")),
                    None)
@@ -130,7 +160,10 @@ class Fomo:
                     r = self.s.post(f"{FOMO_API}/proxy/filterTokens", json=chunk, timeout=30,
                                     headers={"Authorization": f"Bearer {self.token(force=True)}"})
                     if r.status_code in (401, 403):
-                        raise FomoAuthError(f"FOMO {r.status_code}: log into fomo.family again")
+                        err_msg = f"FOMO {r.status_code}: log into fomo.family again"
+                        self._last_error = err_msg
+                        self._last_error_at = time.time()
+                        raise FomoAuthError(err_msg)
                 # Retry on 502 Bad Gateway and similar transient failures
                 if r.status_code in (502, 503, 504) and attempt < max_retries:
                     delay = base_delay * (2 ** attempt)
@@ -275,3 +308,65 @@ def _i(v):
         return int(v) if v is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def activate_fomo_tab() -> dict:
+    """
+    Bring the fomo.family tab to the front in the CDP Chrome instance.
+    If no tab exists, open https://fomo.family/ in a new tab.
+    
+    Returns dict with success status and message for the operator.
+    """
+    try:
+        tabs_resp = requests.get(f"{CDP_URL}/json", timeout=5)
+        tabs_resp.raise_for_status()
+        tabs = tabs_resp.json()
+    except Exception as e:
+        log.error("CDP not reachable at %s: %s", CDP_URL, e)
+        return {
+            "success": False,
+            "message": f"CDP not reachable at {CDP_URL}. Is Chrome running with --remote-debugging-port=9222?",
+            "error": str(e)
+        }
+    
+    # Find existing fomo.family tab
+    fomo_tab = next((t for t in tabs if t.get("type") == "page" and "fomo.family" in t.get("url", "")), None)
+    
+    if fomo_tab:
+        # Activate existing tab
+        tab_id = fomo_tab["id"]
+        try:
+            activate_resp = requests.get(f"{CDP_URL}/json/activate/{tab_id}", timeout=5)
+            activate_resp.raise_for_status()
+            log.info("activated fomo.family tab %s", tab_id)
+            return {
+                "success": True,
+                "message": "Brought fomo.family tab to front. Log in to FOMO in THIS window (the CDP Chrome instance).",
+                "tab_url": fomo_tab.get("url"),
+                "action": "activated"
+            }
+        except Exception as e:
+            log.error("failed to activate tab %s: %s", tab_id, e)
+            return {
+                "success": False,
+                "message": f"Found fomo.family tab but could not activate it: {e}",
+                "error": str(e)
+            }
+    else:
+        # No fomo.family tab, open one
+        try:
+            new_resp = requests.get(f"{CDP_URL}/json/new?https://fomo.family/", timeout=5)
+            new_resp.raise_for_status()
+            log.info("opened new fomo.family tab in CDP Chrome")
+            return {
+                "success": True,
+                "message": "Opened https://fomo.family/ in a new tab. Log in to FOMO in THIS window (the CDP Chrome instance).",
+                "action": "created"
+            }
+        except Exception as e:
+            log.error("failed to open new tab: %s", e)
+            return {
+                "success": False,
+                "message": f"Could not open fomo.family tab: {e}",
+                "error": str(e)
+            }
