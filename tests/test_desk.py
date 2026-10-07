@@ -1064,7 +1064,7 @@ def test_universe_429_stops_network_not_all():
     requests.get = mock_get
     
     try:
-        ids = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
+        ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
         
         # Should have IDs from solana trending, solana page 1, and both bsc new_pools pages
         # (bsc trending 429'd, solana new_pools stopped at page 2 due to 429, but BSC new_pools continued)
@@ -1117,7 +1117,7 @@ def test_universe_robinhood_one_page():
     requests.get = tracked_get
     
     try:
-        ids = collect.universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=False)
+        ids, gt_cache = collect.universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=False)
         
         # Should have collected 5 IDs total (2 solana + 2 bsc + 1 robinhood)
         assert len(ids) == 5
@@ -1199,7 +1199,7 @@ def test_universe_includes_trending_pools():
     requests.get = tracked_get
     
     try:
-        ids = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
+        ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
         
         # Should have 7 unique IDs (2 solana trend + 3 solana new + 1 bsc trend + 2 bsc new - 1 duplicate)
         assert len(ids) == 7
@@ -1263,7 +1263,7 @@ def test_universe_trending_429_continues():
     requests.get = mock_get
     
     try:
-        ids = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
+        ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
         
         # Should have collected: 2 solana new + 2 bsc new + 1 bsc trending = 5
         # (solana trending skipped due to 429)
@@ -1560,7 +1560,7 @@ def test_universe_uses_limiter():
         # Limiter with only 3 slots (should stop early)
         fake_time = [0.0]
         limiter = collect.GTRateLimiter(calls_per_min=3, time_fn=lambda: fake_time[0])
-        ids = collect.universe(nets=("solana",), pages=5, include_trending=True, limiter=limiter)
+        ids, gt_cache = collect.universe(nets=("solana",), pages=5, include_trending=True, limiter=limiter)
         
         # Should have made at most 3 calls (budget exhausted)
         assert call_count[0] <= 3
