@@ -160,6 +160,35 @@ h1 {
   font-weight: 700;
   color: #fff;
 }
+.funnel-guide {
+  background: #0a0a0a;
+  padding: 15px;
+  margin-bottom: 15px;
+  border-left: 3px solid #fb8c00;
+}
+.funnel-guide-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fb8c00;
+  margin-bottom: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.funnel-guide-title:hover {
+  color: #ffa726;
+}
+.funnel-guide-content {
+  font-size: 12px;
+  line-height: 1.6;
+  color: #bbb;
+  display: none;
+}
+.funnel-guide-content p {
+  margin-bottom: 8px;
+}
+.funnel-guide-content p:last-child {
+  margin-bottom: 0;
+}
 .funnel {
   display: flex;
   flex-direction: column;
@@ -175,10 +204,22 @@ h1 {
   background: #0a0a0a;
   border-left: 3px solid #333;
   transition: all 0.2s ease;
+  position: relative;
 }
 .funnel-stage:hover {
   background: #151515;
   border-left-color: #fb8c00;
+}
+.funnel-stage:hover .funnel-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+.funnel-stage.is-kill {
+  background: #0d0808;
+  border-left-style: dashed;
+}
+.funnel-stage.is-kill:hover {
+  background: #120a0a;
 }
 .funnel-stage.stage-seen { border-left-color: #42a5f5; }
 .funnel-stage.stage-free { border-left-color: #64748b; }
@@ -189,10 +230,39 @@ h1 {
 .funnel-stage.stage-judged { border-left-color: #66bb6a; }
 .funnel-stage.stage-pick { border-left-color: #ffc107; }
 .funnel-label {
-  flex: 0 0 120px;
+  flex: 0 0 180px;
   font-weight: 600;
   color: #fff;
   font-size: 13px;
+}
+.funnel-label-main {
+  display: block;
+}
+.funnel-label-desc {
+  display: block;
+  font-size: 10px;
+  font-weight: 400;
+  color: #888;
+  margin-top: 2px;
+}
+.funnel-tooltip {
+  position: absolute;
+  left: 200px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: #1a1a1a;
+  border: 1px solid #333;
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #bbb;
+  max-width: 300px;
+  z-index: 10;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+  line-height: 1.4;
 }
 .funnel-bar-container {
   flex: 1;
@@ -471,47 +541,163 @@ function renderFunnel(state) {
     return total > 0 ? (count / total * 100) : 0;
   };
   
-  // Funnel stages with colors and counts
+  // Funnel stages with colors, counts, descriptions, and tooltips
   const stages = [
-    { label: 'Seen', count: seen, color: '#42a5f5', stage: 'seen', width: 100 },
-    { label: 'Examined (−benched)', count: examined, color: '#64748b', stage: 'examined', width: safeWidthPct(examined, seen) },
-    { label: '↓ Free Kills', count: totalFreeKills, color: '#64748b', stage: 'free', isKill: true },
-    { label: 'After Free', count: afterFree, color: '#9e9e9e', stage: 'after-free', width: safeWidthPct(afterFree, seen) },
-    { label: '↓ Trade Kills', count: totalTradeKills, color: '#fb8c00', stage: 'trade', isKill: true },
-    { label: 'After Trade', count: afterTrade, color: '#fb8c00', stage: 'after-trade', width: safeWidthPct(afterTrade, seen) },
-    { label: '↓ Chain Kills', count: totalChainKills, color: '#e91e63', stage: 'chain', isKill: true },
-    { label: '↓ Requeued (429)', count: requeued, color: '#9e9e9e', stage: 'requeue', isKill: true },
-    { label: 'After Chain', count: afterChain, color: '#e91e63', stage: 'after-chain', width: safeWidthPct(afterChain, seen) },
-    { label: '↓ Soft Kills', count: totalSoftKills, color: '#ab47bc', stage: 'soft', isKill: true },
-    { label: 'Judged (passed all)', count: judged, color: '#66bb6a', stage: 'judged', width: safeWidthPct(judged, seen) },
-    { label: '→ Picked', count: picked, color: '#ffc107', stage: 'pick', width: safeWidthPct(picked, seen) },
+    { 
+      label: 'Seen', 
+      desc: 'all pools scanned',
+      count: seen, 
+      color: '#42a5f5', 
+      stage: 'seen', 
+      width: 100,
+      tooltip: 'Total tokens discovered in this scan cycle from all DEX sources. Starting point of the pipeline.'
+    },
+    { 
+      label: 'Examined', 
+      desc: 'minus benched/deferred',
+      count: examined, 
+      color: '#64748b', 
+      stage: 'examined', 
+      width: safeWidthPct(examined, seen),
+      tooltip: 'Tokens ready for evaluation. Benched tokens (too young, <15m) are deferred to future cycles.'
+    },
+    { 
+      label: '↓ Free Kills', 
+      desc: 'hard gate failures',
+      count: totalFreeKills, 
+      color: '#64748b', 
+      stage: 'free', 
+      isKill: true,
+      tooltip: 'Eliminated by hard gates: age (15m–72h), liquidity ≥$12k, volume_24h ≥$40k, mcap $60k–$8M. These never reach the judge.'
+    },
+    { 
+      label: 'After Free', 
+      desc: 'survived hard gates',
+      count: afterFree, 
+      color: '#9e9e9e', 
+      stage: 'after-free', 
+      width: safeWidthPct(afterFree, seen),
+      tooltip: 'Candidates that passed all hard threshold checks. Ready for trade context evaluation.'
+    },
+    { 
+      label: '↓ Trade Kills', 
+      desc: 'trade context fails',
+      count: totalTradeKills, 
+      color: '#fb8c00', 
+      stage: 'trade', 
+      isKill: true,
+      tooltip: 'Eliminated by trade viability checks: spreads, slippage, holder concentration, or other market microstructure issues.'
+    },
+    { 
+      label: 'After Trade', 
+      desc: 'trade-viable candidates',
+      count: afterTrade, 
+      color: '#fb8c00', 
+      stage: 'after-trade', 
+      width: safeWidthPct(afterTrade, seen),
+      tooltip: 'Survivors after trade checks. These are liquid enough and have acceptable market structure to trade.'
+    },
+    { 
+      label: '↓ Chain Kills', 
+      desc: 'blockchain/RPC fails',
+      count: totalChainKills, 
+      color: '#e91e63', 
+      stage: 'chain', 
+      isKill: true,
+      tooltip: 'Eliminated by on-chain checks: contract issues, honeypot detection, or chain data fetch failures.'
+    },
+    { 
+      label: '↓ Requeued', 
+      desc: 'rate-limited (429)',
+      count: requeued, 
+      color: '#9e9e9e', 
+      stage: 'requeue', 
+      isKill: true,
+      tooltip: 'Rate-limited by external APIs. These tokens will be retried in a future cycle, not permanently killed.'
+    },
+    { 
+      label: 'After Chain', 
+      desc: 'on-chain verified',
+      count: afterChain, 
+      color: '#e91e63', 
+      stage: 'after-chain', 
+      width: safeWidthPct(afterChain, seen),
+      tooltip: 'Passed all on-chain safety checks. Ready for soft momentum and ML judge evaluation.'
+    },
+    { 
+      label: '↓ Soft Kills', 
+      desc: 'momentum/ML fails',
+      count: totalSoftKills, 
+      color: '#ab47bc', 
+      stage: 'soft', 
+      isKill: true,
+      tooltip: 'Eliminated by age-aware momentum checks: young tokens (<60m) need 0.85+ momentum, older need 0.60+. Final filter before judge.'
+    },
+    { 
+      label: 'Judged', 
+      desc: 'passed all gates',
+      count: judged, 
+      color: '#66bb6a', 
+      stage: 'judged', 
+      width: safeWidthPct(judged, seen),
+      tooltip: 'Made it to the ML judge. These tokens passed free, trade, chain, and soft gates. Judge evaluates quality and fit.'
+    },
+    { 
+      label: '→ Picked', 
+      desc: 'selected for order',
+      count: picked, 
+      color: '#ffc107', 
+      stage: 'pick', 
+      width: safeWidthPct(picked, seen),
+      tooltip: 'Final winner selected by the judge for this cycle. In shadow mode, logged but not traded.'
+    },
   ];
   
   const funnelHTML = stages.map(s => {
     if (s.isKill) {
       return `
-        <div class="funnel-stage stage-${s.stage}">
-          <div class="funnel-label">${s.label}</div>
+        <div class="funnel-stage stage-${s.stage} is-kill">
+          <div class="funnel-label">
+            <span class="funnel-label-main">${s.label}</span>
+            <span class="funnel-label-desc">${s.desc}</span>
+          </div>
           <div class="funnel-count" style="color: #ef5350;">−${s.count}</div>
+          <div class="funnel-tooltip">${s.tooltip}</div>
         </div>
       `;
     } else {
       const widthPercent = Math.max(s.width || 0, 2);
       return `
         <div class="funnel-stage stage-${s.stage}">
-          <div class="funnel-label">${s.label}</div>
+          <div class="funnel-label">
+            <span class="funnel-label-main">${s.label}</span>
+            <span class="funnel-label-desc">${s.desc}</span>
+          </div>
           <div class="funnel-bar-container">
             <div class="funnel-bar" style="width: ${widthPercent}%; background: ${s.color};">
               ${widthPercent > 15 ? s.count : ''}
             </div>
           </div>
           <div class="funnel-count">${s.count}</div>
+          <div class="funnel-tooltip">${s.tooltip}</div>
         </div>
       `;
     }
   }).join('');
   
-  funnelDiv.innerHTML = `<div class="funnel">${funnelHTML}</div>`;
+  const guideHTML = `
+    <div class="funnel-guide">
+      <div class="funnel-guide-title">▶ How to Read This Funnel</div>
+      <div class="funnel-guide-content">
+        <p><strong>Flow:</strong> Each scan cycle starts with all tokens Seen, then filters through stages. Progress bars show survivors at each stage. Kill rows (dashed borders, red counts) subtract candidates.</p>
+        <p><strong>Stages:</strong> Tokens move through hard gates (Free: age, liq, vol, mcap) → trade checks → chain verification → soft momentum → ML judge. Only survivors reach Judged. One may be Picked.</p>
+        <p><strong>What kills mean:</strong> Free kills = hard threshold failures (never see judge). Trade/Chain kills = market or on-chain issues. Soft kills = momentum too weak. Requeued = rate-limited, will retry.</p>
+        <p><strong>Health indicator:</strong> If Judged = 0, the pipeline is clogged (nothing passed gates) or inactive. Healthy cycles should judge at least a few tokens. Hover over any stage for details.</p>
+      </div>
+    </div>
+  `;
+  
+  funnelDiv.innerHTML = guideHTML + `<div class="funnel">${funnelHTML}</div>`;
 }
 
 function renderAgeDistribution(tokens) {
@@ -994,6 +1180,16 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 20000);
+
+// Make funnel guide collapsible
+document.addEventListener('click', function(e) {
+  if (e.target.classList.contains('funnel-guide-title')) {
+    const content = e.target.nextElementSibling;
+    const isVisible = content.style.display !== 'none';
+    content.style.display = isVisible ? 'none' : 'block';
+    e.target.textContent = isVisible ? '▶ How to Read This Funnel' : '▼ How to Read This Funnel';
+  }
+});
 </script>
 </body>
 </html>
