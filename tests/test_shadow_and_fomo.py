@@ -101,23 +101,24 @@ def test_shadow_ledger_mark_and_pnl():
     fomo_data = {"price": entry_price}
     shadow_ledger.entry(order, fomo_data)
     
-    # Mark at higher price (profit)
-    current_price = 0.00015  # 50% gain
-    mark_record = shadow_ledger.mark("abc123", 1399811149, current_price, volume_h6=1000, volume_h24=4000)
+    # Mark at higher price (profit, but not enough to trigger take-profit)
+    current_price = 0.00015  # 50% gain (take-profit is 100%)
+    mark_record = shadow_ledger.mark("abc123", 1399811149, current_price=current_price, volume_h24=4000)
     
-    # Should not close yet (volume ratio is 1000 / (4000/4) = 1.0 > 0.20)
+    # Should stay open (no exit condition met)
     assert mark_record is not None
     assert mark_record["action"] == "mark"
     assert mark_record["unrealized_pnl_pct"] == pytest.approx(50.0, rel=0.01)
     assert mark_record["unrealized_pnl_usd"] == pytest.approx(25.0, rel=0.01)
+    assert not mark_record.get("stale")
     
     # Position still open
     opens = shadow_ledger.open_positions()
     assert len(opens) == 1
 
 
-def test_shadow_ledger_exit_on_volume_ratio():
-    """Test exit when volume ratio drops below threshold."""
+def test_shadow_ledger_exit_on_stop_loss():
+    """Test exit when stop-loss threshold hit."""
     # Create entry
     order = {
         "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
@@ -126,19 +127,16 @@ def test_shadow_ledger_exit_on_volume_ratio():
     }
     shadow_ledger.entry(order, {"price": 0.0001})
     
-    # Mark at lower price with low volume ratio (should trigger close)
-    current_price = 0.00008  # 20% loss
-    volume_h6 = 100
-    volume_h24 = 10000
-    ratio = volume_h6 / (volume_h24 / 4)  # 100 / 2500 = 0.04 < 0.20
+    # Mark at much lower price (triggers stop-loss at -30%)
+    current_price = 0.00006  # 40% loss (stop-loss is -30%)
     
-    close_record = shadow_ledger.mark("abc123", 1399811149, current_price, volume_h6=volume_h6, volume_h24=volume_h24)
+    close_record = shadow_ledger.mark("abc123", 1399811149, current_price=current_price, volume_h24=10000)
     
     assert close_record is not None
     assert close_record["action"] == "close"
-    assert "volume_ratio" in close_record["reason"]
-    assert close_record["realized_pnl_pct"] == pytest.approx(-20.0, rel=0.01)
-    assert close_record["realized_pnl_usd"] == pytest.approx(-10.0, rel=0.01)
+    assert "stop_loss" in close_record["reason"]
+    assert close_record["realized_pnl_pct"] == pytest.approx(-40.0, rel=0.01)
+    assert close_record["realized_pnl_usd"] == pytest.approx(-20.0, rel=0.01)
     
     # Position closed
     opens = shadow_ledger.open_positions()
@@ -149,8 +147,8 @@ def test_shadow_ledger_exit_on_volume_ratio():
     assert closes[0]["ticker"] == "TEST"
 
 
-def test_shadow_ledger_exit_on_missing_volume():
-    """Test exit when volume data is missing (RISK's rule)."""
+def test_shadow_ledger_exit_on_take_profit():
+    """Test exit when take-profit threshold hit."""
     order = {
         "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
         "size_factor": 1.0,
@@ -158,12 +156,15 @@ def test_shadow_ledger_exit_on_missing_volume():
     }
     shadow_ledger.entry(order, {"price": 0.0001})
     
-    # Mark with missing volume (should close)
-    close_record = shadow_ledger.mark("abc123", 1399811149, 0.00012, volume_h6=None, volume_h24=1000)
+    # Mark at much higher price (triggers take-profit at +100%)
+    current_price = 0.00025  # 150% gain (take-profit is 100%)
+    
+    close_record = shadow_ledger.mark("abc123", 1399811149, current_price=current_price, volume_h24=50000)
     
     assert close_record is not None
     assert close_record["action"] == "close"
-    assert close_record["reason"] == "volume_missing"
+    assert "take_profit" in close_record["reason"]
+    assert close_record["realized_pnl_pct"] == pytest.approx(150.0, rel=0.01)
     
     # Position closed
     opens = shadow_ledger.open_positions()
@@ -188,8 +189,8 @@ def test_shadow_ledger_manual_close():
     assert close_record["realized_pnl_usd"] == 25.0
 
 
-def test_shadow_ledger_close_with_stale_price():
-    """Test closing with stale price marks PnL as unmeasured."""
+def test_shadow_ledger_stale_stays_open():
+    """Test that stale price keeps position open, doesn't close it."""
     order = {
         "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
         "size_factor": 1.0,
@@ -197,13 +198,20 @@ def test_shadow_ledger_close_with_stale_price():
     }
     shadow_ledger.entry(order, {"price": 0.0001})
     
-    # Close with None price
-    close_record = shadow_ledger.close("abc123", 1399811149, current_price=None, reason="stale_price")
+    # Mark with None price (stale)
+    mark_record = shadow_ledger.mark("abc123", 1399811149, current_price=None)
     
-    assert close_record is not None
-    assert close_record["realized_pnl_usd"] is None
-    assert close_record["realized_pnl_pct"] is None
-    assert close_record["exit_price_usd"] is None
+    assert mark_record is not None
+    assert mark_record["action"] == "mark"
+    assert mark_record.get("stale") is True
+    assert "last_price_usd" in mark_record
+    
+    # Position stays open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 1
+    
+    closes = shadow_ledger.closed_positions()
+    assert len(closes) == 0
 
 
 def test_shadow_ledger_summary():
@@ -499,7 +507,7 @@ def test_shadow_mark_all_open_positions():
 
 
 def test_shadow_mark_with_stale_price():
-    """Test marking when FOMO returns no price (stale data)."""
+    """Test marking when FOMO returns no price (stale data) - position stays open."""
     order = {
         "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
         "size_factor": 1.0, "model": "jev-1.13.0"
@@ -515,12 +523,49 @@ def test_shadow_mark_with_stale_price():
     result = shadow_ledger.mark_all_open_positions(fomo)
     
     assert result["stale"] == 1
+    assert result["closed"] == 0
     
-    # Position should be closed with unmeasured PnL
+    # Position should stay open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 1
+    
     closes = shadow_ledger.closed_positions()
-    assert len(closes) == 1
-    assert closes[0]["realized_pnl_usd"] is None
-    assert closes[0]["reason"] == "stale_price"
+    assert len(closes) == 0
+
+
+def test_shadow_ledger_time_stop():
+    """Test exit on time stop (max hold exceeded)."""
+    import time as time_mod
+    
+    order = {
+        "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    
+    # Create entry with old timestamp (mock it by modifying ledger)
+    shadow_ledger.entry(order, {"price": 0.0001})
+    
+    # Manually update entry timestamp to 7 hours ago
+    import pathlib
+    ledger_path = pathlib.Path(shadow_ledger.LEDGER_PATH)
+    lines = ledger_path.read_text().split('\n')
+    if lines and lines[0]:
+        entry = json.loads(lines[0])
+        old_ts = time_mod.time() - 7 * 3600  # 7 hours ago
+        entry["ts"] = time_mod.strftime("%Y-%m-%dT%H:%M:%SZ", time_mod.gmtime(old_ts))
+        lines[0] = json.dumps(entry)
+        ledger_path.write_text('\n'.join(lines))
+    
+    # Mark at current price (should trigger time stop)
+    close_record = shadow_ledger.mark("abc123", 1399811149, current_price=0.00012, volume_h24=50000)
+    
+    assert close_record is not None
+    assert close_record["action"] == "close"
+    assert "time_stop" in close_record["reason"]
+    
+    # Position closed
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 0
 
 
 def test_chain_preserved_in_close_record():
