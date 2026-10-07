@@ -33,6 +33,7 @@ h1 {
 }
 .badge.shadow { background: #4a5568; color: #fff; }
 .badge.live { background: #e91e63; color: #fff; }
+.badge.mock { background: #ef5350; color: #fff; }
 .summary {
   margin-bottom: 25px;
   padding: 20px;
@@ -394,6 +395,128 @@ tr:hover td { background: #151515; }
   color: #ffcdd2;
   margin-bottom: 20px;
 }
+#fomo-error-banner {
+  background: #3d1414;
+  border-left: 4px solid #f44336;
+  font-weight: 600;
+}
+.fomo-panel {
+  margin-bottom: 30px;
+  padding: 15px;
+  background: #111;
+  border-left: 3px solid #fb8c00;
+}
+.fomo-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 10px;
+  color: #fff;
+}
+.fomo-status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px;
+  margin-bottom: 15px;
+}
+.fomo-status-item {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px;
+  background: #0a0a0a;
+  border-left: 2px solid #333;
+  font-size: 12px;
+}
+.fomo-status-label { color: #888; }
+.fomo-status-value { color: #e0e0e0; font-weight: 500; }
+.fomo-status-value.healthy { color: #66bb6a; }
+.fomo-status-value.warning { color: #fb8c00; }
+.fomo-status-value.error { color: #ef5350; }
+.fomo-fix-button {
+  padding: 8px 16px;
+  background: #fb8c00;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.fomo-fix-button:hover {
+  background: #f57c00;
+}
+.fomo-fix-button:disabled {
+  background: #555;
+  cursor: not-allowed;
+}
+.fomo-fix-message {
+  margin-top: 10px;
+  padding: 10px;
+  background: #1a1a1a;
+  border-left: 3px solid #fb8c00;
+  font-size: 12px;
+  display: none;
+}
+.fomo-embed {
+  margin-top: 15px;
+  width: 100%;
+  height: 400px;
+  border: 1px solid #333;
+  background: #0a0a0a;
+}
+.fomo-embed-fallback {
+  padding: 40px;
+  text-align: center;
+  color: #888;
+  font-size: 14px;
+}
+.fomo-embed-fallback a {
+  color: #fb8c00;
+  text-decoration: none;
+}
+.fomo-embed-fallback a:hover {
+  text-decoration: underline;
+}
+.shadow-disclaimer {
+  background: #1a1a0d;
+  border-left: 3px solid #ffc107;
+  padding: 12px;
+  margin-bottom: 15px;
+  font-size: 13px;
+  color: #ffd54f;
+}
+.pnl-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 15px;
+}
+.pnl-stat {
+  background: #0a0a0a;
+  padding: 12px;
+  border-left: 2px solid #333;
+}
+.pnl-label {
+  font-size: 11px;
+  color: #888;
+  text-transform: uppercase;
+  margin-bottom: 3px;
+}
+.pnl-value {
+  font-size: 18px;
+  font-weight: 700;
+  color: #fff;
+}
+.pnl-value.positive { color: #66bb6a; }
+.pnl-value.negative { color: #ef5350; }
+.token-link {
+  color: #fb8c00;
+  text-decoration: none;
+  margin-left: 4px;
+  font-size: 10px;
+}
+.token-link:hover {
+  text-decoration: underline;
+}
 @media (max-width: 768px) {
   body { padding: 10px; font-size: 12px; }
   .histogram { grid-template-columns: 1fr; }
@@ -403,12 +526,23 @@ tr:hover td { background: #151515; }
 </style>
 </head>
 <body>
-<h1>jev-desk ops<span id="mode-badge" class="badge shadow">shadow</span></h1>
+<h1>jev-desk ops<span id="mode-badge" class="badge shadow">shadow</span><span id="judge-badge" class="badge shadow" style="margin-left:4px;">live judge</span></h1>
 
+<div id="fomo-error-banner" class="error" style="display:none;"></div>
 <div id="error-box" class="error" style="display:none;"></div>
+
+<div id="fomo-panel" class="fomo-panel" style="display:none;">
+  <div class="fomo-panel-title">FOMO Auth Health</div>
+  <div id="fomo-status-grid" class="fomo-status-grid"></div>
+  <button id="fomo-fix-button" class="fomo-fix-button">Fix FOMO Login</button>
+  <div id="fomo-fix-message" class="fomo-fix-message"></div>
+</div>
 
 <div id="summary-box" class="summary" style="display:none;">
   <div class="summary-title">What Happened</div>
+  <div class="shadow-disclaimer" id="shadow-disclaimer" style="display:none;">
+    ⚠️ Shadow mode only: picks are not fills. The only score that counts is REALIZED PnL from FILLED CLOSES.
+  </div>
   <div id="summary-content"></div>
 </div>
 
@@ -479,7 +613,15 @@ tr:hover td { background: #151515; }
 </div>
 
 <div class="section">
-  <div class="section-title">Held Positions</div>
+  <div class="section-title">Shadow PnL Ledger (Hypothetical)</div>
+  <div class="shadow-disclaimer">
+    These are hypothetical positions using $50 entry tickets. Shadow picks are not fills. Only realized PnL from filled closes counts.
+  </div>
+  <div id="shadow-ledger-section"></div>
+</div>
+
+<div class="section">
+  <div class="section-title">Held Positions (Live)</div>
   <div id="held-section"></div>
 </div>
 
@@ -798,9 +940,105 @@ function formatTimestamp(iso) {
   return d.toLocaleString();
 }
 
+function renderFomoHealth(state) {
+  const panel = document.getElementById('fomo-panel');
+  const grid = document.getElementById('fomo-status-grid');
+  
+  if (!state.fomo_health) {
+    panel.style.display = 'none';
+    return;
+  }
+  
+  panel.style.display = 'block';
+  const health = state.fomo_health;
+  
+  const items = [];
+  
+  // Bearer status
+  const bearerStatus = health.bearer_present ? 'Present' : 'Missing';
+  const bearerClass = health.bearer_present ? 'healthy' : 'error';
+  items.push(`
+    <div class="fomo-status-item">
+      <span class="fomo-status-label">Bearer</span>
+      <span class="fomo-status-value ${bearerClass}">${bearerStatus}</span>
+    </div>
+  `);
+  
+  // Bearer age
+  if (health.bearer_age_seconds !== null) {
+    const ageMin = Math.floor(health.bearer_age_seconds / 60);
+    const ttlMin = Math.floor(health.ttl_seconds / 60);
+    const ageClass = ageMin > ttlMin ? 'warning' : 'healthy';
+    items.push(`
+      <div class="fomo-status-item">
+        <span class="fomo-status-label">Bearer Age</span>
+        <span class="fomo-status-value ${ageClass}">${ageMin}m / ${ttlMin}m</span>
+      </div>
+    `);
+  }
+  
+  // Bearer source
+  items.push(`
+    <div class="fomo-status-item">
+      <span class="fomo-status-label">Source</span>
+      <span class="fomo-status-value">${health.bearer_source}</span>
+    </div>
+  `);
+  
+  // CDP status
+  if (health.cdp_reachable !== null) {
+    const cdpStatus = health.cdp_reachable ? 'Reachable' : 'Unreachable';
+    const cdpClass = health.cdp_reachable ? 'healthy' : 'error';
+    items.push(`
+      <div class="fomo-status-item">
+        <span class="fomo-status-label">CDP Chrome</span>
+        <span class="fomo-status-value ${cdpClass}">${cdpStatus}</span>
+      </div>
+    `);
+  }
+  
+  // Last refresh
+  if (health.last_refresh_ts) {
+    items.push(`
+      <div class="fomo-status-item">
+        <span class="fomo-status-label">Last Refresh</span>
+        <span class="fomo-status-value">${formatTimestamp(health.last_refresh_ts)}</span>
+      </div>
+    `);
+  }
+  
+  // Last error
+  if (health.last_error) {
+    items.push(`
+      <div class="fomo-status-item" style="grid-column: 1 / -1;">
+        <span class="fomo-status-label">Last Error</span>
+        <span class="fomo-status-value error">${health.last_error}</span>
+      </div>
+    `);
+    if (health.last_error_ts) {
+      items.push(`
+        <div class="fomo-status-item">
+          <span class="fomo-status-label">Error Time</span>
+          <span class="fomo-status-value">${formatTimestamp(health.last_error_ts)}</span>
+        </div>
+      `);
+    }
+  }
+  
+  grid.innerHTML = items.join('');
+}
+
 function renderSummary(state) {
   const box = document.getElementById('summary-box');
   const content = document.getElementById('summary-content');
+  const disclaimer = document.getElementById('shadow-disclaimer');
+  
+  // Show shadow disclaimer if in shadow mode
+  if (state.mode === 'shadow') {
+    disclaimer.style.display = 'block';
+  } else {
+    disclaimer.style.display = 'none';
+  }
   
   if (!state.cycle) {
     box.style.display = 'none';
@@ -1054,6 +1292,132 @@ function renderHeld(held) {
   section.appendChild(table);
 }
 
+function makeTokenLinks(tid, ticker, chain) {
+  if (!tid) return '';
+  const parts = tid.split(':');
+  if (parts.length !== 2) return '';
+  const [address, networkId] = parts;
+  
+  const links = [];
+  
+  // DexScreener link (always available if we have address)
+  if (address) {
+    links.push(`<a href="https://dexscreener.com/${chain}/${address}" target="_blank" class="token-link" title="DexScreener">[DS]</a>`);
+  }
+  
+  // GeckoTerminal link
+  const gtNetwork = {
+    'solana': 'solana',
+    'bsc': 'bsc',
+    'base': 'base',
+    'robinhood': 'robinhood'
+  }[chain];
+  if (gtNetwork && address) {
+    links.push(`<a href="https://www.geckoterminal.com/${gtNetwork}/pools/${address}" target="_blank" class="token-link" title="GeckoTerminal">[GT]</a>`);
+  }
+  
+  // FOMO link (try to construct, may not work for all chains)
+  if (address) {
+    links.push(`<a href="https://fomo.family/token/${address}" target="_blank" class="token-link" title="FOMO">[FOMO]</a>`);
+  }
+  
+  return links.join(' ');
+}
+
+function renderShadowLedger(ledger) {
+  const section = document.getElementById('shadow-ledger-section');
+  
+  if (!ledger) {
+    section.innerHTML = '<div class="empty">Loading shadow ledger...</div>';
+    return;
+  }
+  
+  const { open_positions, closed_positions, summary } = ledger;
+  
+  if (!open_positions || open_positions.length === 0) {
+    if (!closed_positions || closed_positions.length === 0) {
+      section.innerHTML = '<div class="empty">No shadow picks yet (desk often ends NO TRADE)</div>';
+      return;
+    }
+  }
+  
+  let html = '';
+  
+  // Summary stats
+  html += '<div class="pnl-grid">';
+  html += `
+    <div class="pnl-stat">
+      <div class="pnl-label">Total Realized PnL</div>
+      <div class="pnl-value ${summary.total_realized_pnl_usd >= 0 ? 'positive' : 'negative'}">
+        $${summary.total_realized_pnl_usd.toFixed(2)}
+      </div>
+    </div>
+    <div class="pnl-stat">
+      <div class="pnl-label">Closed Trades</div>
+      <div class="pnl-value">${summary.closed_trades_count}</div>
+    </div>
+    <div class="pnl-stat">
+      <div class="pnl-label">Win Rate</div>
+      <div class="pnl-value">${(summary.win_rate * 100).toFixed(1)}%</div>
+    </div>
+    <div class="pnl-stat">
+      <div class="pnl-label">Open Positions</div>
+      <div class="pnl-value">${summary.open_positions_count}</div>
+    </div>
+    <div class="pnl-stat">
+      <div class="pnl-label">Winners</div>
+      <div class="pnl-value positive">${summary.winning_trades}</div>
+    </div>
+    <div class="pnl-stat">
+      <div class="pnl-label">Losers</div>
+      <div class="pnl-value negative">${summary.losing_trades}</div>
+    </div>
+  `;
+  html += '</div>';
+  
+  // Open positions
+  if (open_positions && open_positions.length > 0) {
+    html += '<h3 style="font-size:13px;margin:20px 0 10px;color:#fff;">Open Positions (Unrealized)</h3>';
+    html += '<table><thead><tr><th>Ticker</th><th>Chain</th><th>Entry Price</th><th>Size</th><th>Unrealized PnL</th><th>Links</th></tr></thead><tbody>';
+    open_positions.forEach(p => {
+      const tid = `${p.address}:${p.network_id}`;
+      const links = makeTokenLinks(tid, p.ticker, p.chain);
+      html += `<tr>
+        <td>${p.ticker}${links}</td>
+        <td>${p.chain}</td>
+        <td>$${p.entry_price_usd.toFixed(6)}</td>
+        <td>$${p.size_usd.toFixed(2)}</td>
+        <td>—</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  
+  // Closed positions
+  if (closed_positions && closed_positions.length > 0) {
+    html += '<h3 style="font-size:13px;margin:20px 0 10px;color:#fff;">Closed Positions (Realized)</h3>';
+    html += '<table><thead><tr><th>Ticker</th><th>Entry</th><th>Exit</th><th>PnL USD</th><th>PnL %</th><th>Reason</th><th>Links</th></tr></thead><tbody>';
+    closed_positions.slice(0, 20).forEach(c => {
+      const pnlClass = c.realized_pnl_usd !== null && c.realized_pnl_usd >= 0 ? 'positive' : 'negative';
+      const pnlStr = c.realized_pnl_usd !== null ? `$${c.realized_pnl_usd.toFixed(2)}` : 'unmeasured';
+      const pnlPctStr = c.realized_pnl_pct !== null ? `${c.realized_pnl_pct > 0 ? '+' : ''}${c.realized_pnl_pct.toFixed(1)}%` : '—';
+      const tid = `${c.address}:${c.network_id}`;
+      const links = makeTokenLinks(tid, c.ticker, 'solana'); // Assume solana for now, ideally store chain
+      html += `<tr>
+        <td>${c.ticker}${links}</td>
+        <td>$${c.entry_price_usd.toFixed(6)}</td>
+        <td>${c.exit_price_usd ? '$' + c.exit_price_usd.toFixed(6) : 'stale'}</td>
+        <td class="${pnlClass}">${pnlStr}</td>
+        <td class="${pnlClass}">${pnlPctStr}</td>
+        <td>${c.reason}</td>
+      </tr>`;
+    });
+    html += '</tbody></table>';
+  }
+  
+  section.innerHTML = html;
+}
+
 function renderTokens(tokens) {
   const section = document.getElementById('tokens-section');
   if (!tokens || tokens.length === 0) {
@@ -1083,11 +1447,13 @@ function renderTokens(tokens) {
         <th>MCap USD</th>
         <th>Liq USD</th>
         <th>Age min</th>
+        <th>Links</th>
       </tr>
     </thead>
     <tbody>
-      ${tokens.map(t => `
-        <tr>
+      ${tokens.map(t => {
+        const links = makeTokenLinks(t.tid, t.ticker, t.chain);
+        return `<tr>
           <td>${t.ticker || '—'}</td>
           <td>${t.chain || '—'}</td>
           <td class="stage-${t.stage}">${t.stage || '—'}</td>
@@ -1096,8 +1462,9 @@ function renderTokens(tokens) {
           <td>${formatMetric(t.mcap_usd)}</td>
           <td>${formatMetric(t.liquidity_usd)}</td>
           <td>${t.age_minutes != null ? Math.round(t.age_minutes) : '—'}</td>
-        </tr>
-      `).join('')}
+          <td>${links}</td>
+        </tr>`;
+      }).join('')}
     </tbody>
   `;
   section.innerHTML = '';
@@ -1129,9 +1496,24 @@ async function refresh() {
       return;
     }
     
+    // Update mode badges
     const badge = document.getElementById('mode-badge');
     badge.textContent = state.mode;
     badge.className = `badge ${state.mode}`;
+    
+    const judgeBadge = document.getElementById('judge-badge');
+    const judgeMode = state.judge_mode || 'live';
+    judgeBadge.textContent = judgeMode === 'mock' ? 'MOCK JUDGE' : 'live judge';
+    judgeBadge.className = `badge ${judgeMode === 'mock' ? 'mock' : 'shadow'}`;
+    
+    // Show FOMO error banner if present
+    const fomoBanner = document.getElementById('fomo-error-banner');
+    if (state.cycle && state.cycle.fomo_error) {
+      fomoBanner.textContent = `🚨 FOMO AUTH ERROR: ${state.cycle.fomo_error} — Click "Fix FOMO Login" below.`;
+      fomoBanner.style.display = 'block';
+    } else {
+      fomoBanner.style.display = 'none';
+    }
     
     document.getElementById('updated-at').textContent = formatTimestamp(state.updated_at);
     
@@ -1166,9 +1548,21 @@ async function refresh() {
     
     document.getElementById('stat-bench').textContent = state.bench || 0;
     
+    renderFomoHealth(state);
     renderHeld(state.held);
     renderTokens(state.tokens);
     renderAgeDistribution(state.tokens);
+    
+    // Fetch shadow ledger
+    try {
+      const ledgerResp = await fetch('/api/shadow_ledger');
+      if (ledgerResp.ok) {
+        const ledger = await ledgerResp.json();
+        renderShadowLedger(ledger);
+      }
+    } catch (e) {
+      console.warn('Could not fetch shadow ledger:', e);
+    }
     
     lastUpdated = state.updated_at;
   } catch (err) {
@@ -1177,6 +1571,47 @@ async function refresh() {
     document.getElementById('summary-box').style.display = 'none';
   }
 }
+
+// FOMO fix button handler
+document.getElementById('fomo-fix-button').addEventListener('click', async function() {
+  const button = this;
+  const message = document.getElementById('fomo-fix-message');
+  
+  button.disabled = true;
+  button.textContent = 'Activating...';
+  
+  try {
+    const resp = await fetch('/api/fomo_activate', { method: 'POST' });
+    const result = await resp.json();
+    
+    message.textContent = result.message;
+    message.style.display = 'block';
+    message.style.borderLeftColor = result.success ? '#66bb6a' : '#ef5350';
+    
+    if (result.success) {
+      button.textContent = 'Activated';
+      setTimeout(() => {
+        button.disabled = false;
+        button.textContent = 'Fix FOMO Login';
+      }, 5000);
+    } else {
+      button.textContent = 'Failed';
+      setTimeout(() => {
+        button.disabled = false;
+        button.textContent = 'Fix FOMO Login';
+      }, 3000);
+    }
+  } catch (err) {
+    message.textContent = `Error: ${err.message}`;
+    message.style.display = 'block';
+    message.style.borderLeftColor = '#ef5350';
+    button.textContent = 'Error';
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = 'Fix FOMO Login';
+    }, 3000);
+  }
+});
 
 refresh();
 setInterval(refresh, 20000);

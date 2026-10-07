@@ -25,6 +25,7 @@ import time
 import book
 from collect import universe, shortlist, trade_counts, dossier, social_state, GTRateLimiter, DossierRetryNeeded
 from filter import free_kill, trade_kill, chain_kill, soft_kill
+from fomo_api import FomoAuthError
 from pick import pick, size_factor_for
 from thresholds import HARD, SOFT
 
@@ -45,6 +46,10 @@ class JudgeDown(Exception):
 
 def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER_RESERVE, 
              gt_limiter=None):
+    mode_str = "SHADOW" if shadow else "LIVE"
+    judge_str = "MOCK" if os.environ.get("JUDGE_MOCK") == "1" else "LIVE"
+    log.info("cycle start: mode=%s judge=%s", mode_str, judge_str)
+    
     if (h := book.held()):                       # RISK owns the desk right now
         log.info("holding %s for %.0f min, no scan this cycle",
                  h["ticker"], h["minutes"])
@@ -316,7 +321,19 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         return None, stats
     order["order_id"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if shadow:
-        desk.log_shadow(order, stats)            # written, never sent
+        # Get current FOMO data for the picked token to pass to shadow ledger
+        picked_token = order["token"]
+        # Find the token in shortlist_result to get FOMO data
+        picked_fomo_data = None
+        for t in shortlist_result:
+            if t.get("addr") == picked_token["address"] and t.get("net") == picked_token["network_id"]:
+                picked_fomo_data = {
+                    "price": t.get("price"),
+                    "vol24": t.get("volume_h24"),
+                    "mcap": t.get("mcap_usd"),
+                }
+                break
+        desk.log_shadow(order, stats, fomo_data=picked_fomo_data)  # written, never sent
         return None, stats
 
     book.take(order)          # the desk is now held. No scan until RISK calls release().
@@ -331,6 +348,9 @@ def main(fomo, judge, desk, shadow=True, once=False):
          report(order, stats)   -> one line to Telegram, trade or no trade
          send_to_seats(order)   -> hand it to SIZE, then FILLS, then RISK, in that order
     """
+    # Wire fomo client to desk for health tracking
+    desk.fomo_client = fomo
+    
     while True:
         try:
             fomo.token()                         # Privy bearer lives ~60 min, refresh it
@@ -338,6 +358,21 @@ def main(fomo, judge, desk, shadow=True, once=False):
             desk.report(order, stats)            # every cycle, trade or not
             if order:
                 desk.send_to_seats(order)
+        except FomoAuthError as e:
+            log.error("FOMO auth failed: %s", e)
+            # Write error state with FOMO error flag for ops panel banner
+            desk.write_state(None, {
+                "error": f"FomoAuthError: {e}",
+                "fomo_error": str(e),
+                "seen": 0,
+                "benched": 0,
+                "judged": 0,
+                "free": {},
+                "trade": {},
+                "chain": {},
+                "soft": {},
+                "tokens": []
+            })
         except JudgeDown as e:
             log.error("judge down, standing down this cycle: %s", e)
             # JudgeDown: stand down without writing error state (not inventing tokens)

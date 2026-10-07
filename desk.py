@@ -24,6 +24,8 @@ import time
 
 import requests
 
+import shadow_ledger
+
 log = logging.getLogger("desk.side")
 
 OUTBOX = pathlib.Path(os.environ.get("DESK_OUTBOX", "outbox"))
@@ -37,6 +39,7 @@ class Desk:
         self.tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
         self.tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
         self.shadow_log = pathlib.Path(os.environ.get("SHADOW_LOG", OUTBOX / "shadow.jsonl"))
+        self.fomo_client = None  # Set by main.py when wiring
         (OUTBOX / "orders").mkdir(parents=True, exist_ok=True)
 
     # ---- inputs ---------------------------------------------------------------
@@ -58,8 +61,11 @@ class Desk:
             return None
 
     # ---- outputs --------------------------------------------------------------
-    def log_shadow(self, order: dict, stats: dict):
-        """One row per would-be trade. Read only the rows where you disagree."""
+    def log_shadow(self, order: dict, stats: dict, fomo_data: dict = None):
+        """
+        One row per would-be trade. Read only the rows where you disagree.
+        Also records hypothetical entry in the shadow PnL ledger.
+        """
         row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                "order": order, "stats": stats, "your_call": None}   # fill your_call by hand
         self.shadow_log.parent.mkdir(parents=True, exist_ok=True)
@@ -68,6 +74,10 @@ class Desk:
         log.info("SHADOW would trade %s (%s) size x%s conf %s",
                  order["token"]["ticker"], order["token"]["chain"],
                  order["size_factor"], order.get("confidence"))
+        
+        # Record hypothetical entry in shadow PnL ledger
+        if fomo_data:
+            shadow_ledger.entry(order, fomo_data)
 
     def report(self, order, stats):
         self.write_state(order, stats)
@@ -129,10 +139,23 @@ class Desk:
             outcome = "NO TRADE"
             error = None
         
+        # Determine judge mode
+        judge_mode = "mock" if os.environ.get("JUDGE_MOCK") == "1" else "live"
+        
+        # Get FOMO health if available
+        fomo_health = None
+        if self.fomo_client:
+            try:
+                fomo_health = self.fomo_client.health()
+            except Exception as e:
+                log.warning("failed to get FOMO health: %s", e)
+        
         state = {
             "updated_at": now,
             "demo": False,
             "mode": "live" if os.environ.get("CONFIRM_LIVE") == "yes" else "shadow",
+            "judge_mode": judge_mode,
+            "fomo_health": fomo_health,
             "cycle": {
                 "seen": stats.get("seen", 0),
                 "benched": stats.get("benched", 0),
@@ -140,7 +163,8 @@ class Desk:
                 "requeued": stats.get("requeued", 0),
                 "killed": kill_histograms,
                 "outcome": outcome,
-                "error": error
+                "error": error,
+                "fomo_error": stats.get("fomo_error"),  # Track FomoAuthError
             },
             "tokens": tokens,
             "held": [book.held()] if book.held() else [],
@@ -148,6 +172,7 @@ class Desk:
             "pick": order
         }
         
+        state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(state, default=str))
 
     def _telegram(self, text: str):
