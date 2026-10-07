@@ -3930,29 +3930,29 @@ def test_trade_counts_distinguishes_error_from_empty():
         mock_500.status_code = 500
         requests.get = Mock(return_value=mock_500)
         
-        token = {"addr": "test", "ticker": "TEST"}
+        token = {"addr": "test", "ticker": "TEST", "net": 1399811149}
         data, status = collect.trade_counts(token)
         assert status == "error"
         assert data["trades_h24"] is None
         
-        # HTTP 200 with empty pairs array
+        # HTTP 200 with empty array (genuine no_pair)
         mock_200_empty = Mock()
         mock_200_empty.status_code = 200
-        mock_200_empty.json.return_value = {"pairs": []}
+        mock_200_empty.json.return_value = []
         requests.get = Mock(return_value=mock_200_empty)
         
         data, status = collect.trade_counts(token)
         assert status == "empty"
         assert data["trades_h24"] is None
         
-        # HTTP 200 with null pairs
+        # HTTP 200 with null (genuine no_pair)
         mock_200_null = Mock()
         mock_200_null.status_code = 200
-        mock_200_null.json.return_value = {"pairs": None}
+        mock_200_null.json.return_value = None
         requests.get = Mock(return_value=mock_200_null)
         
         data, status = collect.trade_counts(token)
-        assert status == "error"  # null pairs is an error, not empty
+        assert status == "empty"  # null is genuine empty
         
         # Network error
         requests.get = Mock(side_effect=requests.exceptions.ConnectionError("Network error"))
@@ -3970,19 +3970,17 @@ def test_trade_counts_ok_status_with_pairs():
     try:
         mock_resp = Mock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "pairs": [{
-                "liquidity": {"usd": 50000},
-                "txns": {
-                    "h1": {"buys": 10, "sells": 8},
-                    "h6": {"buys": 50, "sells": 45},
-                    "h24": {"buys": 200, "sells": 180}
-                }
-            }]
-        }
+        mock_resp.json.return_value = [{
+            "liquidity": {"usd": 50000},
+            "txns": {
+                "h1": {"buys": 10, "sells": 8},
+                "h6": {"buys": 50, "sells": 45},
+                "h24": {"buys": 200, "sells": 180}
+            }
+        }]
         requests.get = Mock(return_value=mock_resp)
         
-        token = {"addr": "test", "ticker": "TEST"}
+        token = {"addr": "test", "ticker": "TEST", "net": 1399811149}
         data, status = collect.trade_counts(token)
         
         assert status == "ok"
@@ -4018,18 +4016,28 @@ def test_dex_canary_check_degraded():
     original_get = requests.get
     
     try:
-        # Empty pairs array
+        # Empty array
         mock_resp = Mock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"pairs": []}
+        mock_resp.json.return_value = []
         requests.get = Mock(return_value=mock_resp)
         
         healthy = collect.dex_canary_check(1399811149)
         assert healthy is False
         
+        # Null response
+        mock_resp_null = Mock()
+        mock_resp_null.status_code = 200
+        mock_resp_null.json.return_value = None
+        requests.get = Mock(return_value=mock_resp_null)
+        
+        healthy = collect.dex_canary_check(1399811149)
+        assert healthy is False
+        
         # HTTP error
-        mock_resp.status_code = 500
-        requests.get = Mock(return_value=mock_resp)
+        mock_resp_err = Mock()
+        mock_resp_err.status_code = 500
+        requests.get = Mock(return_value=mock_resp_err)
         
         healthy = collect.dex_canary_check(1399811149)
         assert healthy is False
@@ -4084,12 +4092,13 @@ def test_trade_counts_gt_fallback_on_dex_error():
         mock_500.status_code = 500
         requests.get = Mock(return_value=mock_500)
         
-        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149"}
+        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149", "net": 1399811149}
         gt_cache = {
             "test:1399811149": {
                 "h1": {"buys": 10, "sells": 5},
                 "h6": {"buys": 50, "sells": 25},
-                "h24": {"buys": 200, "sells": 100}
+                "h24": {"buys": 200, "sells": 100},
+                "_liq_usd": 1000
             }
         }
         
@@ -4104,22 +4113,23 @@ def test_trade_counts_gt_fallback_on_dex_error():
 
 
 def test_trade_counts_gt_fallback_on_dex_null_pairs():
-    """trade_counts should use GT fallback when DexScreener returns null pairs."""
+    """trade_counts should use GT fallback when DexScreener returns null."""
     original_get = requests.get
     
     try:
-        # DexScreener returns null pairs (degradation like BONK case)
+        # DexScreener returns null (degradation)
         mock_resp = Mock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"pairs": None}
+        mock_resp.json.return_value = None
         requests.get = Mock(return_value=mock_resp)
         
-        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149"}
+        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149", "net": 1399811149}
         gt_cache = {
             "test:1399811149": {
                 "h1": {"buys": 15, "sells": 8},
                 "h6": {"buys": 60, "sells": 30},
-                "h24": {"buys": 250, "sells": 120}
+                "h24": {"buys": 250, "sells": 120},
+                "_liq_usd": 1000
             }
         }
         
@@ -4132,22 +4142,23 @@ def test_trade_counts_gt_fallback_on_dex_null_pairs():
 
 
 def test_trade_counts_gt_fallback_on_dex_empty_with_gt_data():
-    """trade_counts should use GT fallback when Dex returns empty pairs but GT has data."""
+    """trade_counts should use GT fallback when Dex returns empty array but GT has data."""
     original_get = requests.get
     
     try:
-        # DexScreener returns empty pairs
+        # DexScreener returns empty array
         mock_resp = Mock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"pairs": []}
+        mock_resp.json.return_value = []
         requests.get = Mock(return_value=mock_resp)
         
-        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149"}
+        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149", "net": 1399811149}
         gt_cache = {
             "test:1399811149": {
                 "h1": {"buys": 20, "sells": 10},
                 "h6": {"buys": 80, "sells": 40},
-                "h24": {"buys": 300, "sells": 150}
+                "h24": {"buys": 300, "sells": 150},
+                "_liq_usd": 1000
             }
         }
         
@@ -4160,7 +4171,7 @@ def test_trade_counts_gt_fallback_on_dex_empty_with_gt_data():
 
 
 def test_trade_counts_empty_when_no_gt_fallback():
-    """trade_counts should return empty when Dex errors and no GT data available."""
+    """trade_counts should return error when Dex errors and no GT data available."""
     original_get = requests.get
     
     try:
@@ -4168,7 +4179,7 @@ def test_trade_counts_empty_when_no_gt_fallback():
         mock_500.status_code = 500
         requests.get = Mock(return_value=mock_500)
         
-        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149"}
+        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149", "net": 1399811149}
         # No GT cache
         data, status = collect.trade_counts(token, gt_txns_cache={})
         assert status == "error"
@@ -4235,5 +4246,116 @@ def test_filter_trade_kill_gt_fallback_treated_as_ok():
         "sells_h1": 2
     }
     assert trade_kill(token_low) == "trades"
+    
+    # GT fallback with zero trades should kill
+    token_zero = {
+        "dex_status": "gt_fallback",
+        "trades_h24": 0,  # zero trades
+        "buys_h1": 0,
+        "sells_h1": 0
+    }
+    assert trade_kill(token_zero) == "trades"
+
+
+def test_trade_kill_none_trades_always_no_pair():
+    """trade_kill should treat None trades_h24 as no_pair regardless of status."""
+    # None with ok status
+    token_none_ok = {
+        "dex_status": "ok",
+        "trades_h24": None,
+        "buys_h1": None,
+        "sells_h1": None
+    }
+    assert trade_kill(token_none_ok) == "no_pair"
+    
+    # None with gt_fallback status (GT had no data)
+    token_none_gt = {
+        "dex_status": "gt_fallback",
+        "trades_h24": None,
+        "buys_h1": None,
+        "sells_h1": None
+    }
+    assert trade_kill(token_none_gt) == "no_pair"
+    
+    # None with empty status
+    token_none_empty = {
+        "dex_status": "empty",
+        "trades_h24": None,
+        "buys_h1": None,
+        "sells_h1": None
+    }
+    assert trade_kill(token_none_empty) == "no_pair"
+
+
+def test_gt_fallback_zero_trades_returns_zero_not_none():
+    """GT fallback with 0 buys/0 sells should return trades_h24=0, not None."""
+    original_get = requests.get
+    
+    try:
+        # DexScreener errors
+        mock_500 = Mock()
+        mock_500.status_code = 500
+        requests.get = Mock(return_value=mock_500)
+        
+        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149", "net": 1399811149}
+        gt_cache = {
+            "test:1399811149": {
+                "h1": {"buys": 0, "sells": 0},
+                "h6": {"buys": 0, "sells": 0},
+                "h24": {"buys": 0, "sells": 0},
+                "_liq_usd": 1000
+            }
+        }
+        
+        data, status = collect.trade_counts(token, gt_txns_cache=gt_cache)
+        assert status == "gt_fallback"
+        assert data["trades_h24"] == 0  # Must be 0, not None
+        assert data["buys_h1"] == 0
+        
+    finally:
+        requests.get = original_get
+
+
+def test_early_canary_check_triggers_on_consecutive_empties(monkeypatch):
+    """Canary check should trigger after 2+ consecutive empties and requeue on degradation."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    # Create 3 tokens that will all return empty from DexScreener
+    tids = [f"Empty{i}:1399811149" for i in range(3)]
+    
+    def fake_shortlist(fomo, id_list):
+        return [tok(i, tid=tids[i], addr=f"Empty{i}", age_minutes=30, 
+                    liquidity_usd=50000, volume_h24=100000, mcap_usd=500000) 
+                for i in range(3)]
+    
+    # Track canary calls
+    canary_calls = []
+    def mock_canary(net):
+        canary_calls.append(net)
+        return False  # Canary fails (degraded)
+    
+    # Mock trade_counts to return empty
+    def mock_trade_counts(t, gt_txns_cache=None):
+        return {"buys_h1": None, "sells_h1": None, "buys_h6": None, "sells_h6": None, "trades_h24": None}, 'empty'
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (tids, {}))
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", mock_trade_counts)
+    monkeypatch.setattr(shift, "dex_canary_check", mock_canary)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
+    
+    # Canary should have been called after 2nd empty
+    assert len(canary_calls) >= 1, "Canary should be called after 2+ empties"
+    
+    # Should mark as degraded
+    assert stats.get("dex_degraded") is True
+    
+    # Tokens should be requeued, not benched
+    assert stats.get("requeued", 0) >= 2  # At least the 2nd and 3rd tokens requeued
 
 
