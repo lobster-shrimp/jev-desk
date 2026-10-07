@@ -264,7 +264,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             log.warning("judge failed %s: %s", d["ticker"], e)
             continue                             # no bench: the token is not at fault
 
-        soft_result = soft_kill(ans)
+        soft_result = soft_kill(ans, age_minutes=d.get("age_minutes"))
         if soft_result:
             reason, noul = soft_result
             # Collect all SOFT scores that were asked (compact one-line summary)

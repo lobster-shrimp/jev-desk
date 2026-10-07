@@ -2890,3 +2890,219 @@ def test_old_token_gets_dossier_after_young_clears(monkeypatch):
     # Neither should be deferred
     deferred = book.defer_due()
     assert young_tid not in deferred and old_tid not in deferred, "No tokens should be deferred on success"
+
+
+def test_soft_kill_age_aware_momentum_young_pass():
+    """Young token (<60m) with momentum noul 0.74 should pass (below young threshold 0.85)."""
+    from filter import soft_kill
+    
+    ans = {
+        "momentum_already_spent": {"type": "noul", "noul": 0.74},
+        "concentration_is_exit_risk": {"type": "noul", "noul": 0.45},
+    }
+    
+    # Young token: should pass with 0.74 (< 0.85 young threshold)
+    result = soft_kill(ans, age_minutes=22.7)
+    assert result is None, f"Young token with momentum 0.74 should pass, got {result}"
+
+
+def test_soft_kill_age_aware_momentum_young_kill():
+    """Young token (<60m) with very high momentum noul 0.90 should still be killed."""
+    from filter import soft_kill
+    
+    ans = {
+        "momentum_already_spent": {"type": "noul", "noul": 0.90},
+        "concentration_is_exit_risk": {"type": "noul", "noul": 0.45},
+    }
+    
+    # Young token but extremely high momentum: should kill (> 0.85)
+    result = soft_kill(ans, age_minutes=20.0)
+    assert result is not None, "Young token with momentum 0.90 should be killed"
+    assert result[0] == "momentum_already_spent"
+    assert result[1] == 0.90
+
+
+def test_soft_kill_age_aware_momentum_old_kill():
+    """Old token (>=60m) with momentum noul 0.65 should be killed (above old threshold 0.60)."""
+    from filter import soft_kill
+    
+    ans = {
+        "momentum_already_spent": {"type": "noul", "noul": 0.65},
+        "concentration_is_exit_risk": {"type": "noul", "noul": 0.45},
+    }
+    
+    # Old token: should kill with 0.65 (> 0.60 old threshold)
+    result = soft_kill(ans, age_minutes=120.0)
+    assert result is not None, "Old token with momentum 0.65 should be killed"
+    assert result[0] == "momentum_already_spent"
+    assert result[1] == 0.65
+
+
+def test_soft_kill_age_aware_momentum_old_pass():
+    """Old token (>=60m) with momentum noul 0.55 should pass (below old threshold 0.60)."""
+    from filter import soft_kill
+    
+    ans = {
+        "momentum_already_spent": {"type": "noul", "noul": 0.55},
+        "concentration_is_exit_risk": {"type": "noul", "noul": 0.45},
+    }
+    
+    # Old token: should pass with 0.55 (< 0.60 old threshold)
+    result = soft_kill(ans, age_minutes=1440.0)  # 24 hours
+    assert result is None, f"Old token with momentum 0.55 should pass, got {result}"
+
+
+def test_soft_kill_age_aware_momentum_boundary():
+    """Test age boundary at 60 minutes exactly."""
+    from filter import soft_kill
+    
+    ans_young = {
+        "momentum_already_spent": {"type": "noul", "noul": 0.74},
+    }
+    ans_old = {
+        "momentum_already_spent": {"type": "noul", "noul": 0.74},
+    }
+    
+    # 59.9 minutes: young threshold (0.85), should pass
+    result_young = soft_kill(ans_young, age_minutes=59.9)
+    assert result_young is None, "Token at 59.9m with momentum 0.74 should pass (young threshold)"
+    
+    # 60.0 minutes: old threshold (0.60), should kill
+    result_old = soft_kill(ans_old, age_minutes=60.0)
+    assert result_old is not None, "Token at 60m with momentum 0.74 should be killed (old threshold)"
+    assert result_old[0] == "momentum_already_spent"
+    assert result_old[1] == 0.74
+
+
+def test_soft_kill_other_checks_unaffected():
+    """Age-aware logic should only affect momentum_already_spent, not other soft kills."""
+    from filter import soft_kill
+    
+    # concentration_is_exit_risk should use same threshold regardless of age
+    ans_conc = {
+        "concentration_is_exit_risk": {"type": "noul", "noul": 0.58},
+        "momentum_already_spent": {"type": "noul", "noul": 0.30},
+    }
+    
+    # Should kill on concentration for both young and old (max 0.55)
+    result_young = soft_kill(ans_conc, age_minutes=20.0)
+    assert result_young is not None
+    assert result_young[0] == "concentration_is_exit_risk"
+    
+    result_old = soft_kill(ans_conc, age_minutes=120.0)
+    assert result_old is not None
+    assert result_old[0] == "concentration_is_exit_risk"
+
+
+def test_end_to_end_young_momentum_pass(monkeypatch):
+    """End-to-end: Young token with momentum 0.74 should pass soft and reach pick."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    import main as shift
+    import collect
+    
+    tid = f"YoungMomentum:{1399811149}"
+    
+    def fake_shortlist_young(fomo, id_list):
+        return [{"tid": tid, "addr": "YoungMomentum", "net": 1399811149, "ticker": "YMTM",
+                 "age_minutes": 22.7, "liquidity_usd": 50000, "volume_h24": 100000,
+                 "mcap_usd": 500000, "holder_count": 200, "price_usd": 0.005,
+                 "change": {"5m": 0.05, "1h": 0.15, "4h": 0.30, "24h": 0.50}}]
+    
+    def fake_judge_momentum(question_set, state):
+        if question_set == "market":
+            return {"model": "test", "answers": {
+                "momentum_already_spent": {"type": "noul", "noul": 0.74},  # Would kill old, passes young
+                "concentration_is_exit_risk": {"type": "noul", "noul": 0.45},
+                "liquidity_fits_ticket": {"type": "noul", "noul": 0.70},
+                "shape": {"type": "choice", "choice": "crowd", "probabilities": {"crowd": 0.8}}
+            }, "usage": {}}
+        elif question_set == "solana":
+            return {"model": "test", "answers": {}, "usage": {}}
+        return {"model": "test", "answers": {}, "usage": {}}
+    
+    def fake_dossier_young(t, limiter=None):
+        return {**t, "chain": "solana", "top_10_percent": 35, "top_wallet_percent": 0.03,
+                "developer_holding_percentage": 3, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a young token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_young)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), fake_judge_momentum, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Should NOT be soft-killed on momentum
+    assert stats.get("soft", {}).get("momentum_already_spent", 0) == 0, \
+        "Young token with momentum 0.74 should not be soft-killed"
+    assert stats.get("judged", 0) == 1, "Token should reach judged stage"
+    
+    # Check token record shows it passed soft stage
+    token_rows = stats.get("tokens", [])
+    judged_rows = [t for t in token_rows if t.get("stage") == "judged"]
+    assert len(judged_rows) == 1, f"Expected 1 judged token, got {len(judged_rows)}"
+
+
+def test_end_to_end_old_momentum_kill(monkeypatch):
+    """End-to-end: Old token with momentum 0.74 should be soft-killed."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    import main as shift
+    import collect
+    
+    tid = f"OldMomentum:{1399811149}"
+    
+    def fake_shortlist_old(fomo, id_list):
+        return [{"tid": tid, "addr": "OldMomentum", "net": 1399811149, "ticker": "OMTM",
+                 "age_minutes": 120.0, "liquidity_usd": 50000, "volume_h24": 100000,
+                 "mcap_usd": 500000, "holder_count": 200, "price_usd": 0.005,
+                 "change": {"5m": 0.02, "1h": 0.08, "4h": 0.20, "24h": 0.45}}]
+    
+    def fake_judge_momentum_old(question_set, state):
+        if question_set == "market":
+            return {"model": "test", "answers": {
+                "momentum_already_spent": {"type": "noul", "noul": 0.74},  # Kills old (> 0.60)
+                "concentration_is_exit_risk": {"type": "noul", "noul": 0.45},
+                "liquidity_fits_ticket": {"type": "noul", "noul": 0.70},
+                "shape": {"type": "choice", "choice": "crowd", "probabilities": {"crowd": 0.8}}
+            }, "usage": {}}
+        elif question_set == "solana":
+            return {"model": "test", "answers": {}, "usage": {}}
+        return {"model": "test", "answers": {}, "usage": {}}
+    
+    def fake_dossier_old(t, limiter=None):
+        return {**t, "chain": "solana", "top_10_percent": 35, "top_wallet_percent": 0.03,
+                "developer_holding_percentage": 3, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "an old token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_old)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_old)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), fake_judge_momentum_old, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Should be soft-killed on momentum
+    assert stats.get("soft", {}).get("momentum_already_spent", 0) == 1, \
+        "Old token with momentum 0.74 should be soft-killed"
+    
+    # Check token record shows soft kill
+    token_rows = stats.get("tokens", [])
+    soft_rows = [t for t in token_rows if t.get("stage") == "soft" and t.get("reason") == "momentum_already_spent"]
+    assert len(soft_rows) == 1, f"Expected 1 soft-killed token on momentum, got {len(soft_rows)}"
+    assert soft_rows[0].get("soft_noul") == 0.74
