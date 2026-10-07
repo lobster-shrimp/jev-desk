@@ -466,20 +466,25 @@ function renderFunnel(state) {
   const afterSoft = afterChain - totalSoftKills;
   const picked = cycle.outcome === 'SHADOW' || cycle.outcome === 'ORDER' ? 1 : 0;
   
+  // Helper to safely calculate width percentage (avoid division by zero)
+  const safeWidthPct = (count, total) => {
+    return total > 0 ? (count / total * 100) : 0;
+  };
+  
   // Funnel stages with colors and counts
   const stages = [
     { label: 'Seen', count: seen, color: '#42a5f5', stage: 'seen', width: 100 },
-    { label: 'Examined (−benched)', count: examined, color: '#64748b', stage: 'examined', width: examined / seen * 100 },
+    { label: 'Examined (−benched)', count: examined, color: '#64748b', stage: 'examined', width: safeWidthPct(examined, seen) },
     { label: '↓ Free Kills', count: totalFreeKills, color: '#64748b', stage: 'free', isKill: true },
-    { label: 'After Free', count: afterFree, color: '#9e9e9e', stage: 'after-free', width: afterFree / seen * 100 },
+    { label: 'After Free', count: afterFree, color: '#9e9e9e', stage: 'after-free', width: safeWidthPct(afterFree, seen) },
     { label: '↓ Trade Kills', count: totalTradeKills, color: '#fb8c00', stage: 'trade', isKill: true },
-    { label: 'After Trade', count: afterTrade, color: '#fb8c00', stage: 'after-trade', width: afterTrade / seen * 100 },
+    { label: 'After Trade', count: afterTrade, color: '#fb8c00', stage: 'after-trade', width: safeWidthPct(afterTrade, seen) },
     { label: '↓ Chain Kills', count: totalChainKills, color: '#e91e63', stage: 'chain', isKill: true },
     { label: '↓ Requeued (429)', count: requeued, color: '#9e9e9e', stage: 'requeue', isKill: true },
-    { label: 'After Chain', count: afterChain, color: '#e91e63', stage: 'after-chain', width: afterChain / seen * 100 },
+    { label: 'After Chain', count: afterChain, color: '#e91e63', stage: 'after-chain', width: safeWidthPct(afterChain, seen) },
     { label: '↓ Soft Kills', count: totalSoftKills, color: '#ab47bc', stage: 'soft', isKill: true },
-    { label: 'Judged (passed all)', count: judged, color: '#66bb6a', stage: 'judged', width: judged / seen * 100 },
-    { label: '→ Picked', count: picked, color: '#ffc107', stage: 'pick', width: picked / seen * 100 },
+    { label: 'Judged (passed all)', count: judged, color: '#66bb6a', stage: 'judged', width: safeWidthPct(judged, seen) },
+    { label: '→ Picked', count: picked, color: '#ffc107', stage: 'pick', width: safeWidthPct(picked, seen) },
   ];
   
   const funnelHTML = stages.map(s => {
@@ -622,6 +627,9 @@ function renderSummary(state) {
   const judged = cycle.judged || 0;
   const killed = cycle.killed || {};
   
+  // Hoist examined to function scope (used later in liquidity drain check)
+  const examined = (seen || 0) - (benched || 0);
+  
   const lines = [];
   
   // Outcome summary
@@ -648,7 +656,6 @@ function renderSummary(state) {
   
   // Flow summary
   if (seen > 0) {
-    const examined = seen - benched;
     lines.push(`Saw <span class="summary-highlight">${seen}</span> tokens, <span class="summary-highlight">${benched}</span> already benched, examined <span class="summary-highlight">${examined}</span>.`);
   }
   
@@ -743,7 +750,7 @@ function renderSummary(state) {
     
     // Liquidity drain story - when liquidity kills dominate
     const liquidityKills = (freeKills.liquidity || 0) + (freeKills.no_liq || 0);
-    if (liquidityKills > examined * 0.3) {
+    if (examined > 0 && liquidityKills > examined * 0.3) {
       const liqTokens = (state.tokens || []).filter(t => 
         (t.reason === 'liquidity' || t.reason === 'no_liq') && t.stage === 'free'
       );
