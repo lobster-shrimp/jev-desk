@@ -60,9 +60,10 @@ class GTRateLimiter:
         now = self.time_fn()
         backoff_duration = retry_after_sec if retry_after_sec is not None else 5.0
         self.backoff_until = now + backoff_duration
-        log.info("GT 429 received, backing off for %.1fs until %s", 
+        log.info("GT 429 received, backing off for %.1fs until %s (Retry-After: %s)", 
                  backoff_duration, 
-                 time.strftime("%H:%M:%S", time.localtime(self.backoff_until)))
+                 time.strftime("%H:%M:%S", time.localtime(self.backoff_until)),
+                 f"{retry_after_sec}s" if retry_after_sec is not None else "default")
     
     def wait_if_needed(self, priority: bool = False):
         """Block until a call can be made within rate limits.
@@ -370,10 +371,12 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
     On GT 429, records the backoff with the limiter and raises DossierRetryNeeded."""
     if limiter:
+        # Wait for any 429 backoff BEFORE spending a slot (order matters!)
+        # This ensures young in-cycle retries honor the backoff period set by record_429()
+        limiter.wait_if_needed(priority=True)
         if not limiter.spend(1, priority=True):
             log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
             raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
-        limiter.wait_if_needed(priority=True)
     
     net = GT_NET[t["net"]]
     resp = requests.get(f"{GT}/networks/{net}/tokens/{t['addr']}/info", headers=UA, timeout=20)
