@@ -30,9 +30,14 @@ from fomo_api import Fomo, activate_fomo_tab
 
 
 @pytest.fixture(autouse=True)
-def clean_ledger():
-    """Clean ledger file before each test."""
+def clean_ledger(monkeypatch):
+    """Point the ledger at this module's temp outbox and clean it before each test.
+
+    shadow_ledger may already have been imported by another test module with a
+    different DESK_OUTBOX, so patch LEDGER_PATH instead of relying on import order.
+    """
     ledger_path = TEST_OUTBOX / "shadow_ledger.jsonl"
+    monkeypatch.setattr(shadow_ledger, "LEDGER_PATH", ledger_path)
     if ledger_path.exists():
         ledger_path.unlink()
     yield

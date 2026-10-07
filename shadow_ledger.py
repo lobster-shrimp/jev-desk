@@ -7,6 +7,7 @@ Persists to outbox/shadow_ledger.jsonl (append-only, gitignored).
 The owner's success metric is REALIZED PnL from FILLED CLOSES. Shadow results are
 hypothetical and must be labeled as such everywhere.
 """
+import calendar
 import json
 import logging
 import os
@@ -338,7 +339,7 @@ def _append(record: dict):
 def _parse_ts(iso: str) -> float:
     """Parse ISO timestamp to unix time."""
     try:
-        return time.mktime(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ"))
+        return calendar.timegm(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ"))  # ts are UTC
     except (ValueError, TypeError):
         return time.time()
 
