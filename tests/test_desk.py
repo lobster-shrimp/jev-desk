@@ -2555,9 +2555,9 @@ def test_young_tokens_get_dossier_before_old_with_budget_constraint(monkeypatch)
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([old1_tid, old2_tid, young1_tid, young2_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_mixed)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_track)
     
     desk = FakeDesk()
@@ -2613,9 +2613,9 @@ def test_old_requeue_does_not_starve_young_first_timer(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_mixed)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_track)
     
     desk = FakeDesk()
@@ -2669,9 +2669,9 @@ def test_age_prioritization_preserves_turnover_within_groups(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_high_tid, young_mid_tid, young_low_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young_group)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_track)
     
     desk = FakeDesk()
@@ -2726,9 +2726,9 @@ def test_young_token_429_gets_in_cycle_retry(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_429_then_success)
     monkeypatch.setattr(collect.GTRateLimiter, "wait_if_needed", fake_wait_if_needed)
     
@@ -2772,9 +2772,9 @@ def test_young_token_429_twice_defers_to_next_cycle(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_always_429)
     
     desk = FakeDesk()
@@ -2853,9 +2853,9 @@ def test_young_token_429_backoff_actually_waits(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_429_then_success)
     monkeypatch.setattr(time, "sleep", fake_sleep)
     
@@ -2925,9 +2925,9 @@ def test_old_token_429_skips_while_young_pending(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid, old_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_young_429)
     
     desk = FakeDesk()
@@ -2984,9 +2984,9 @@ def test_old_token_gets_dossier_after_young_clears(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid, old_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_success)
     
     desk = FakeDesk()
@@ -3144,9 +3144,9 @@ def test_end_to_end_young_momentum_pass(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_young)
     
     desk = FakeDesk()
@@ -3201,9 +3201,9 @@ def test_end_to_end_old_momentum_kill(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: ([tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_old)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_old)
     
     desk = FakeDesk()
