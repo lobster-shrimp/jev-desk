@@ -2693,7 +2693,12 @@ def test_young_token_429_gets_in_cycle_retry(monkeypatch):
         if dossier_call_count[0] == 1:
             # First call: raise 429
             raise collect.DossierRetryNeeded("GT 429 first attempt")
-        # Second call (after wait): succeed
+        
+        # Second call: wait for backoff (dossier now waits before making request)
+        if limiter:
+            limiter.wait_if_needed(priority=True)
+        
+        # Then succeed
         return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
                 "developer_holding_percentage": 2, "gt_score_details": None,
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
@@ -2811,14 +2816,22 @@ def test_young_token_429_backoff_actually_waits(monkeypatch):
     
     def fake_dossier_429_then_success(t, limiter=None):
         dossier_call_count[0] += 1
-        dossier_call_times.append(fake_time[0])
         
         if dossier_call_count[0] == 1:
-            # First call: simulate 429 with 5-second Retry-After
+            # First call: record time, simulate 429 with 5-second Retry-After
+            dossier_call_times.append(fake_time[0])
             if limiter:
                 limiter.record_429(5.0)
             raise collect.DossierRetryNeeded("GT 429 first attempt")
-        # Second call: succeed
+        
+        # Second call: wait for backoff (dossier now waits before making request)
+        if limiter:
+            limiter.wait_if_needed(priority=True)
+        
+        # Record time after wait (simulates HTTP request time)
+        dossier_call_times.append(fake_time[0])
+        
+        # Then succeed
         return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
                 "developer_holding_percentage": 2, "gt_score_details": None,
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
@@ -3678,4 +3691,107 @@ def test_dossier_captures_rpc_status(monkeypatch):
     assert result["top_wallet_percent"] is None
     assert result["rpc_ok"] is False
     assert "Too Many Requests" in result["rpc_error"]
+def test_dossier_waits_before_spending_on_retry():
+    """dossier() should wait for backoff BEFORE spending a slot (verifies fix for ~50ms bug).
+    
+    This test verifies the root cause fix: wait_if_needed() is called BEFORE spend()
+    in dossier(), ensuring that retry attempts honor the backoff period set by record_429().
+    
+    Before the fix, spend() was called first, adding a timestamp to the rolling window
+    before waiting, which could cause the retry to happen ~50ms after the first 429
+    instead of honoring the Retry-After value.
+    """
+    fake_time = [1000.0]
+    sleep_calls = []
+    spend_calls = []
+    
+    def time_fn():
+        return fake_time[0]
+    
+    def fake_sleep(duration):
+        sleep_calls.append(("sleep", duration, fake_time[0]))
+        fake_time[0] += duration
+    
+    # Track when spend() is called relative to sleep
+    limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=time_fn)
+    original_spend = limiter.spend
+    def tracked_spend(cost=1, priority=False):
+        spend_calls.append(("spend", fake_time[0]))
+        return original_spend(cost, priority)
+    limiter.spend = tracked_spend
+    
+    # First call: 429 with 5-second Retry-After
+    class FakeResponse429:
+        status_code = 429
+        headers = {"Retry-After": "5"}
+    
+    # Second call: success
+    class FakeResponseOK:
+        status_code = 200
+        def json(self):
+            return {"data": {"attributes": {}}}
+    
+    call_count = [0]
+    def fake_get(url, headers=None, timeout=None):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return FakeResponse429()
+        return FakeResponseOK()
+    
+    import time as time_module
+    original_sleep = time_module.sleep
+    original_get = requests.get
+    
+    try:
+        time_module.sleep = fake_sleep
+        requests.get = fake_get
+        
+        token = {"tid": "test:123", "ticker": "TEST", "addr": "testaddr", "net": 1399811149,
+                 "holder_count": 500, "age_minutes": 30}
+        
+        # First call: should hit 429 and set backoff
+        try:
+            collect.dossier(token, limiter=limiter)
+            assert False, "Expected DossierRetryNeeded on first call"
+        except collect.DossierRetryNeeded:
+            pass
+        
+        # Verify backoff was set to T0 + 5
+        assert limiter.backoff_until == 1005.0, \
+            f"Expected backoff_until=1005.0, got {limiter.backoff_until}"
+        
+        # Reset counters for second call
+        sleep_calls.clear()
+        spend_calls.clear()
+        
+        # Second call: should wait for backoff BEFORE spending
+        d = collect.dossier(token, limiter=limiter)
+        
+        # Verify sequence: sleep BEFORE spend
+        assert len(sleep_calls) > 0, "Expected at least one sleep call"
+        assert len(spend_calls) > 0, "Expected at least one spend call"
+        
+        # Find the backoff sleep (>= 4 seconds)
+        backoff_sleep = next((s for s in sleep_calls if s[1] >= 4.0), None)
+        assert backoff_sleep is not None, f"Expected backoff sleep >= 4s, got {sleep_calls}"
+        
+        # Find the first spend call
+        first_spend = spend_calls[0]
+        
+        # Verify spend happened AFTER the backoff sleep
+        backoff_sleep_time = backoff_sleep[2]  # time when sleep started
+        backoff_duration = backoff_sleep[1]
+        spend_time = first_spend[1]
+        
+        assert spend_time >= backoff_sleep_time + backoff_duration, \
+            f"spend() should be called AFTER backoff sleep completes. " \
+            f"Backoff: {backoff_duration}s starting at T={backoff_sleep_time}, " \
+            f"spend() at T={spend_time}"
+        
+        # Verify the dossier succeeded
+        assert d["ticker"] == "TEST"
+        
+    finally:
+        time_module.sleep = original_sleep
+        requests.get = original_get
 
