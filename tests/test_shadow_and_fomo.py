@@ -30,9 +30,14 @@ from fomo_api import Fomo, activate_fomo_tab
 
 
 @pytest.fixture(autouse=True)
-def clean_ledger():
-    """Clean ledger file before each test."""
+def clean_ledger(monkeypatch):
+    """Point the ledger at this module's temp outbox and clean it before each test.
+
+    shadow_ledger may already have been imported by another test module with a
+    different DESK_OUTBOX, so patch LEDGER_PATH instead of relying on import order.
+    """
     ledger_path = TEST_OUTBOX / "shadow_ledger.jsonl"
+    monkeypatch.setattr(shadow_ledger, "LEDGER_PATH", ledger_path)
     if ledger_path.exists():
         ledger_path.unlink()
     yield
@@ -101,23 +106,24 @@ def test_shadow_ledger_mark_and_pnl():
     fomo_data = {"price": entry_price}
     shadow_ledger.entry(order, fomo_data)
     
-    # Mark at higher price (profit)
-    current_price = 0.00015  # 50% gain
-    mark_record = shadow_ledger.mark("abc123", 1399811149, current_price, volume_h6=1000, volume_h24=4000)
+    # Mark at higher price (profit, but not enough to trigger take-profit)
+    current_price = 0.00015  # 50% gain (take-profit is 100%)
+    mark_record = shadow_ledger.mark("abc123", 1399811149, current_price=current_price, volume_h24=4000)
     
-    # Should not close yet (volume ratio is 1000 / (4000/4) = 1.0 > 0.20)
+    # Should stay open (no exit condition met)
     assert mark_record is not None
     assert mark_record["action"] == "mark"
     assert mark_record["unrealized_pnl_pct"] == pytest.approx(50.0, rel=0.01)
     assert mark_record["unrealized_pnl_usd"] == pytest.approx(25.0, rel=0.01)
+    assert not mark_record.get("stale")
     
     # Position still open
     opens = shadow_ledger.open_positions()
     assert len(opens) == 1
 
 
-def test_shadow_ledger_exit_on_volume_ratio():
-    """Test exit when volume ratio drops below threshold."""
+def test_shadow_ledger_exit_on_stop_loss():
+    """Test exit when stop-loss threshold hit."""
     # Create entry
     order = {
         "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
@@ -126,19 +132,16 @@ def test_shadow_ledger_exit_on_volume_ratio():
     }
     shadow_ledger.entry(order, {"price": 0.0001})
     
-    # Mark at lower price with low volume ratio (should trigger close)
-    current_price = 0.00008  # 20% loss
-    volume_h6 = 100
-    volume_h24 = 10000
-    ratio = volume_h6 / (volume_h24 / 4)  # 100 / 2500 = 0.04 < 0.20
+    # Mark at much lower price (triggers stop-loss at -30%)
+    current_price = 0.00006  # 40% loss (stop-loss is -30%)
     
-    close_record = shadow_ledger.mark("abc123", 1399811149, current_price, volume_h6=volume_h6, volume_h24=volume_h24)
+    close_record = shadow_ledger.mark("abc123", 1399811149, current_price=current_price, volume_h24=10000)
     
     assert close_record is not None
     assert close_record["action"] == "close"
-    assert "volume_ratio" in close_record["reason"]
-    assert close_record["realized_pnl_pct"] == pytest.approx(-20.0, rel=0.01)
-    assert close_record["realized_pnl_usd"] == pytest.approx(-10.0, rel=0.01)
+    assert "stop_loss" in close_record["reason"]
+    assert close_record["realized_pnl_pct"] == pytest.approx(-40.0, rel=0.01)
+    assert close_record["realized_pnl_usd"] == pytest.approx(-20.0, rel=0.01)
     
     # Position closed
     opens = shadow_ledger.open_positions()
@@ -149,8 +152,8 @@ def test_shadow_ledger_exit_on_volume_ratio():
     assert closes[0]["ticker"] == "TEST"
 
 
-def test_shadow_ledger_exit_on_missing_volume():
-    """Test exit when volume data is missing (RISK's rule)."""
+def test_shadow_ledger_exit_on_take_profit():
+    """Test exit when take-profit threshold hit."""
     order = {
         "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
         "size_factor": 1.0,
@@ -158,12 +161,15 @@ def test_shadow_ledger_exit_on_missing_volume():
     }
     shadow_ledger.entry(order, {"price": 0.0001})
     
-    # Mark with missing volume (should close)
-    close_record = shadow_ledger.mark("abc123", 1399811149, 0.00012, volume_h6=None, volume_h24=1000)
+    # Mark at much higher price (triggers take-profit at +100%)
+    current_price = 0.00025  # 150% gain (take-profit is 100%)
+    
+    close_record = shadow_ledger.mark("abc123", 1399811149, current_price=current_price, volume_h24=50000)
     
     assert close_record is not None
     assert close_record["action"] == "close"
-    assert close_record["reason"] == "volume_missing"
+    assert "take_profit" in close_record["reason"]
+    assert close_record["realized_pnl_pct"] == pytest.approx(150.0, rel=0.01)
     
     # Position closed
     opens = shadow_ledger.open_positions()
@@ -188,8 +194,8 @@ def test_shadow_ledger_manual_close():
     assert close_record["realized_pnl_usd"] == 25.0
 
 
-def test_shadow_ledger_close_with_stale_price():
-    """Test closing with stale price marks PnL as unmeasured."""
+def test_shadow_ledger_stale_stays_open():
+    """Test that stale price keeps position open, doesn't close it."""
     order = {
         "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
         "size_factor": 1.0,
@@ -197,13 +203,20 @@ def test_shadow_ledger_close_with_stale_price():
     }
     shadow_ledger.entry(order, {"price": 0.0001})
     
-    # Close with None price
-    close_record = shadow_ledger.close("abc123", 1399811149, current_price=None, reason="stale_price")
+    # Mark with None price (stale)
+    mark_record = shadow_ledger.mark("abc123", 1399811149, current_price=None)
     
-    assert close_record is not None
-    assert close_record["realized_pnl_usd"] is None
-    assert close_record["realized_pnl_pct"] is None
-    assert close_record["exit_price_usd"] is None
+    assert mark_record is not None
+    assert mark_record["action"] == "mark"
+    assert mark_record.get("stale") is True
+    assert "last_price_usd" in mark_record
+    
+    # Position stays open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 1
+    
+    closes = shadow_ledger.closed_positions()
+    assert len(closes) == 0
 
 
 def test_shadow_ledger_summary():
@@ -460,3 +473,259 @@ def test_fomo_error_tracking_in_state(monkeypatch):
     
     assert state["cycle"]["fomo_error"] == "bearer expired"
     assert state["cycle"]["outcome"] == "ERROR"
+
+
+def test_shadow_mark_all_open_positions():
+    """Test marking all open positions via mark_all_open_positions."""
+    # Create two open positions
+    order1 = {
+        "token": {"ticker": "TEST1", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    order2 = {
+        "token": {"ticker": "TEST2", "address": "def456", "network_id": 1399811149, "chain": "solana"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order1, {"price": 0.0001})
+    shadow_ledger.entry(order2, {"price": 0.0002})
+    
+    # Mock FOMO client
+    # With the heuristic vol_h6 = vol24 * 0.15, ratio = 0.15 / 0.25 = 0.6 (healthy, stays open)
+    # To trigger closure, we need very low vol24 or simulate it
+    class MockFomo:
+        def tokens(self, tids):
+            return {
+                "abc123:1399811149": {"price": 0.00012, "vol24": 50000},  # Healthy volume, stays open
+                "def456:1399811149": {"price": 0.00015, "vol24": 100}     # Very low volume, stays open with 0.6 ratio
+            }
+    
+    fomo = MockFomo()
+    result = shadow_ledger.mark_all_open_positions(fomo)
+    
+    # Both should be marked (ratio is 0.6 > 0.20, so healthy)
+    assert result["marked"] == 2
+    assert result["closed"] == 0
+    
+    # Both positions should still be open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 2
+
+
+def test_shadow_mark_with_stale_price():
+    """Test marking when FOMO returns no price (stale data) - position stays open."""
+    order = {
+        "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order, {"price": 0.0001})
+    
+    # Mock FOMO with missing price
+    class MockFomo:
+        def tokens(self, tids):
+            return {"abc123:1399811149": {"vol24": 50000}}  # No price
+    
+    fomo = MockFomo()
+    result = shadow_ledger.mark_all_open_positions(fomo)
+    
+    assert result["stale"] == 1
+    assert result["closed"] == 0
+    
+    # Position should stay open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 1
+    
+    closes = shadow_ledger.closed_positions()
+    assert len(closes) == 0
+
+
+def test_shadow_ledger_time_stop():
+    """Test exit on time stop (max hold exceeded)."""
+    import time as time_mod
+    
+    order = {
+        "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    
+    # Create entry with old timestamp (mock it by modifying ledger)
+    shadow_ledger.entry(order, {"price": 0.0001})
+    
+    # Manually update entry timestamp to 7 hours ago
+    import pathlib
+    ledger_path = pathlib.Path(shadow_ledger.LEDGER_PATH)
+    lines = ledger_path.read_text().split('\n')
+    if lines and lines[0]:
+        entry = json.loads(lines[0])
+        old_ts = time_mod.time() - 7 * 3600  # 7 hours ago
+        entry["ts"] = time_mod.strftime("%Y-%m-%dT%H:%M:%SZ", time_mod.gmtime(old_ts))
+        lines[0] = json.dumps(entry)
+        ledger_path.write_text('\n'.join(lines))
+    
+    # Mark at current price (should trigger time stop)
+    close_record = shadow_ledger.mark("abc123", 1399811149, current_price=0.00012, volume_h24=50000)
+    
+    assert close_record is not None
+    assert close_record["action"] == "close"
+    assert "time_stop" in close_record["reason"]
+    
+    # Position closed
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 0
+
+
+def test_chain_preserved_in_close_record():
+    """Test that chain is preserved from entry to close for proper links."""
+    order = {
+        "token": {"ticker": "TEST", "address": "abc123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order, {"price": 0.0001})
+    shadow_ledger.close("abc123", 56, current_price=0.00015, reason="test")
+    
+    closes = shadow_ledger.closed_positions()
+    assert len(closes) == 1
+    assert closes[0]["chain"] == "bsc"
+
+
+def test_volume_surge_does_not_close():
+    """Test that volume surges do NOT trigger an exit (volume exit removed)."""
+    order = {
+        "token": {"ticker": "SURGE", "address": "surge123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order, {"price": 0.0001, "vol24": 100_000})
+    
+    # Mark with volume surge (100k -> 1M)
+    result = shadow_ledger.mark("surge123", 56, current_price=0.00012, volume_h24=1_000_000)
+    
+    # Should stay open (no volume exit)
+    assert result["action"] == "mark"
+    assert not result.get("stale")
+    
+    # Position still open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 1
+
+
+def test_volume_collapse_does_not_close():
+    """Test that volume collapses do NOT trigger an exit (volume exit removed)."""
+    order = {
+        "token": {"ticker": "COLLAPSE", "address": "collapse123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order, {"price": 0.0001, "vol24": 1_000_000})
+    
+    # Mark with volume collapse (1M -> 100k)
+    result = shadow_ledger.mark("collapse123", 56, current_price=0.00012, volume_h24=100_000)
+    
+    # Should stay open (no volume exit)
+    assert result["action"] == "mark"
+    assert not result.get("stale")
+    
+    # Position still open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 1
+
+
+def test_stale_position_time_stop_with_last_mark():
+    """Test that stale position hits time stop at last good mark."""
+    order = {
+        "token": {"ticker": "STALE", "address": "stale123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    
+    # Entry at T=0
+    with mock.patch("time.time", return_value=1000.0):
+        shadow_ledger.entry(order, {"price": 0.0001})
+    
+    # Mark with good price at T=1h
+    with mock.patch("time.time", return_value=1000.0 + 3600):
+        result = shadow_ledger.mark("stale123", 56, current_price=0.00012, volume_h24=500_000)
+        assert result["action"] == "mark"
+        assert result["current_price_usd"] == 0.00012
+    
+    # Mark with stale price at T=3h (stays open)
+    with mock.patch("time.time", return_value=1000.0 + 3 * 3600):
+        result = shadow_ledger.mark("stale123", 56, current_price=None)
+        assert result["action"] == "mark"
+        assert result.get("stale") is True
+        assert result["last_price_usd"] == 0.00012  # Preserved from last mark
+    
+    # Mark with stale price at T=6.1h (time stop fires)
+    with mock.patch("time.time", return_value=1000.0 + 6.1 * 3600):
+        result = shadow_ledger.mark("stale123", 56, current_price=None)
+        assert result["action"] == "close"
+        assert "time_stop_6.1h_stale_mark" in result["reason"]
+        assert result["exit_price_usd"] == 0.00012  # Closed at last good mark
+        assert result.get("unmeasured") is False  # Had a good mark
+    
+    # Position closed
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 0
+
+
+def test_never_marked_position_excluded_from_totals():
+    """Test that never-marked position closed by time stop is excluded from PnL totals."""
+    order = {
+        "token": {"ticker": "NEVER", "address": "never123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    
+    # Entry at T=0, never mark with good price
+    with mock.patch("time.time", return_value=2000.0):
+        shadow_ledger.entry(order, {"price": 0.0001})
+    
+    # Stale mark at T=3h
+    with mock.patch("time.time", return_value=2000.0 + 3 * 3600):
+        result = shadow_ledger.mark("never123", 56, current_price=None)
+        assert result["action"] == "mark"
+        assert result.get("stale") is True
+    
+    # Time stop at T=6.1h (never had good mark)
+    with mock.patch("time.time", return_value=2000.0 + 6.1 * 3600):
+        result = shadow_ledger.mark("never123", 56, current_price=None)
+        assert result["action"] == "close"
+        assert "time_stop" in result["reason"]
+        assert result.get("unmeasured") is True
+        assert result["realized_pnl_usd"] is None
+    
+    # Summary should exclude this from totals
+    summary = shadow_ledger.summary()
+    assert summary["closed_trades_count"] == 1
+    assert summary["measured_trades_count"] == 0
+    assert summary["unmeasured_trades"] == 1
+    assert summary["total_realized_pnl_usd"] == 0  # Excluded
+    assert summary["winning_trades"] == 0
+    assert summary["losing_trades"] == 0
+
+
+def test_csrf_protection_on_fomo_activate(monkeypatch):
+    """Test that /api/fomo_activate rejects requests without custom header."""
+    # Set required env vars before importing server
+    monkeypatch.setenv("DESK_SECRET", "test-secret-for-csrf-test")
+    monkeypatch.setenv("JUDGE_MOCK", "1")  # Use mock judge to avoid needing TYPESAFE_API_KEY
+    
+    from fastapi.testclient import TestClient
+    
+    # Reimport server and judge to pick up env vars
+    import importlib
+    import judge as judge_module
+    import server as server_module
+    importlib.reload(judge_module)
+    importlib.reload(server_module)
+    
+    client = TestClient(server_module.app)
+    
+    # Request without header should fail
+    response = client.post("/api/fomo_activate")
+    assert response.status_code == 403
+    assert "X-Ops-Action" in response.json()["detail"]
+    
+    # Request with wrong header value should fail
+    response = client.post("/api/fomo_activate", headers={"X-Ops-Action": "wrong"})
+    assert response.status_code == 403
+    
+    # Request with correct header should succeed (but CDP may not be reachable)
+    response = client.post("/api/fomo_activate", headers={"X-Ops-Action": "activate-fomo"})
+    # May be 500 if CDP not reachable, but shouldn't be 403
+    assert response.status_code in (200, 500)

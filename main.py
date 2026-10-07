@@ -27,6 +27,7 @@ from collect import universe, shortlist, trade_counts, dossier, social_state, GT
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from fomo_api import FomoAuthError
 from pick import pick, size_factor_for
+import shadow_ledger
 from thresholds import HARD, SOFT
 
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
@@ -49,6 +50,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     mode_str = "SHADOW" if shadow else "LIVE"
     judge_str = "MOCK" if os.environ.get("JUDGE_MOCK") == "1" else "LIVE"
     log.info("cycle start: mode=%s judge=%s", mode_str, judge_str)
+    
+    # Mark all open shadow positions to market (uses FOMO, not GT)
+    if shadow:
+        try:
+            shadow_ledger.mark_all_open_positions(fomo)
+        except Exception as e:
+            log.warning("shadow mark failed: %s", e)
     
     if (h := book.held()):                       # RISK owns the desk right now
         log.info("holding %s for %.0f min, no scan this cycle",

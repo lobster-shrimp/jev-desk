@@ -1402,7 +1402,7 @@ function renderShadowLedger(ledger) {
       const pnlStr = c.realized_pnl_usd !== null ? `$${c.realized_pnl_usd.toFixed(2)}` : 'unmeasured';
       const pnlPctStr = c.realized_pnl_pct !== null ? `${c.realized_pnl_pct > 0 ? '+' : ''}${c.realized_pnl_pct.toFixed(1)}%` : '—';
       const tid = `${c.address}:${c.network_id}`;
-      const links = makeTokenLinks(tid, c.ticker, 'solana'); // Assume solana for now, ideally store chain
+      const links = makeTokenLinks(tid, c.ticker, c.chain || 'solana');
       html += `<tr>
         <td>${c.ticker}${links}</td>
         <td>$${c.entry_price_usd.toFixed(6)}</td>
@@ -1581,7 +1581,12 @@ document.getElementById('fomo-fix-button').addEventListener('click', async funct
   button.textContent = 'Activating...';
   
   try {
-    const resp = await fetch('/api/fomo_activate', { method: 'POST' });
+    const resp = await fetch('/api/fomo_activate', { 
+      method: 'POST',
+      headers: {
+        'X-Ops-Action': 'activate-fomo'  // CSRF protection
+      }
+    });
     const result = await resp.json();
     
     message.textContent = result.message;
