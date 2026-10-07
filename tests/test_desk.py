@@ -4227,6 +4227,91 @@ def test_universe_returns_gt_txns_cache():
         requests.get = original_get
 
 
+def test_dex_chain_id_robinhood():
+    """DEX_CHAIN_ID should map Robinhood (4663) to 'robinhood' chainId."""
+    assert collect.DEX_CHAIN_ID[4663] == "robinhood"
+    
+    # Test that trade_counts uses correct chainId for Robinhood
+    original_get = requests.get
+    
+    try:
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [{
+            "liquidity": {"usd": 50000},
+            "txns": {
+                "h1": {"buys": 10, "sells": 8},
+                "h6": {"buys": 50, "sells": 45},
+                "h24": {"buys": 200, "sells": 180}
+            }
+        }]
+        requests.get = Mock(return_value=mock_resp)
+        
+        token = {"addr": "test", "ticker": "TEST", "net": 4663}
+        data, status = collect.trade_counts(token)
+        
+        # Verify it called with robinhood chainId
+        requests.get.assert_called_once()
+        call_args = requests.get.call_args
+        assert "robinhood" in call_args[0][0]  # URL should contain 'robinhood'
+        
+    finally:
+        requests.get = original_get
+
+
+def test_gt_cache_prefers_higher_reserve_in_usd():
+    """GT cache should prefer pool with higher reserve_in_usd when multiple pools exist for same token."""
+    original_get = requests.get
+    
+    try:
+        # Return two pools for same token with different reserve_in_usd
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "data": [
+                {
+                    "relationships": {
+                        "base_token": {"data": {"id": "solana_TokenA"}}
+                    },
+                    "attributes": {
+                        "reserve_in_usd": "50000.50",  # Lower liquidity
+                        "transactions": {
+                            "h1": {"buys": 10, "sells": 5},
+                            "h6": {"buys": 50, "sells": 25},
+                            "h24": {"buys": 100, "sells": 50}
+                        }
+                    }
+                },
+                {
+                    "relationships": {
+                        "base_token": {"data": {"id": "solana_TokenA"}}
+                    },
+                    "attributes": {
+                        "reserve_in_usd": "150000.75",  # Higher liquidity
+                        "transactions": {
+                            "h1": {"buys": 20, "sells": 10},
+                            "h6": {"buys": 100, "sells": 50},
+                            "h24": {"buys": 300, "sells": 150}
+                        }
+                    }
+                }
+            ]
+        }
+        requests.get = Mock(return_value=mock_resp)
+        
+        limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=lambda: 1000.0)
+        ids, gt_cache = collect.universe(nets=("solana",), pages=1, include_trending=False, limiter=limiter)
+        
+        # Should use the pool with higher reserve_in_usd (150000.75)
+        assert "TokenA:1399811149" in gt_cache
+        assert gt_cache["TokenA:1399811149"]["h24"]["buys"] == 300  # From higher liquidity pool
+        assert gt_cache["TokenA:1399811149"]["h1"]["buys"] == 20
+        assert gt_cache["TokenA:1399811149"]["_liq_usd"] == 150000.75
+        
+    finally:
+        requests.get = original_get
+
+
 def test_filter_trade_kill_gt_fallback_treated_as_ok():
     """trade_kill should treat gt_fallback status like ok (has data), not error."""
     # GT fallback with good data should pass

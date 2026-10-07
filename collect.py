@@ -159,7 +159,7 @@ GT_NET   = {1399811149: "solana", 4663: "robinhood", 56: "bsc", 8453: "base"}
 FOMO_NET = {v: k for k, v in GT_NET.items()}
 
 # Map network IDs to DexScreener chain IDs
-DEX_CHAIN_ID = {1399811149: "solana", 56: "bsc", 8453: "base", 4663: "eth"}  # robinhood uses eth
+DEX_CHAIN_ID = {1399811149: "solana", 56: "bsc", 8453: "base", 4663: "robinhood"}
 
 # Special marker for dossier failures that should trigger retry
 class DossierRetryNeeded(Exception):
@@ -287,7 +287,12 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 attrs = pool.get("attributes", {})
                 txns = attrs.get("transactions", {})
                 if txns:
-                    liq_usd = (attrs.get("liquidity") or {}).get("usd") or 0
+                    # GT API returns reserve_in_usd as a string
+                    reserve_str = attrs.get("reserve_in_usd")
+                    try:
+                        liq_usd = float(reserve_str) if reserve_str else 0.0
+                    except (ValueError, TypeError):
+                        liq_usd = 0.0
                     # Only cache if no existing data OR this pool has higher liquidity
                     existing = gt_txns_cache.get(tid)
                     if not existing or liq_usd > existing.get("_liq_usd", 0):
@@ -332,7 +337,12 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 attrs = pool.get("attributes", {})
                 txns = attrs.get("transactions", {})
                 if txns:
-                    liq_usd = (attrs.get("liquidity") or {}).get("usd") or 0
+                    # GT API returns reserve_in_usd as a string
+                    reserve_str = attrs.get("reserve_in_usd")
+                    try:
+                        liq_usd = float(reserve_str) if reserve_str else 0.0
+                    except (ValueError, TypeError):
+                        liq_usd = 0.0
                     # Only cache if no existing data OR this pool has higher liquidity
                     existing = gt_txns_cache.get(tid)
                     if not existing or liq_usd > existing.get("_liq_usd", 0):
