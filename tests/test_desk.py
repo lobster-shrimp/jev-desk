@@ -1646,7 +1646,7 @@ def test_run_once_requeues_on_dossier_retry(monkeypatch, caplog):
 
 
 def test_requeued_token_retried_next_cycle(monkeypatch):
-    """Token requeued due to dossier failure should be retried next cycle."""
+    """Young token requeued after in-cycle 429 retry should be retried next cycle."""
     book.release()
     book.DB.execute("DELETE FROM defer")
     book.DB.execute("DELETE FROM bench")
@@ -1654,7 +1654,7 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
     
     tid = f"RetryAddr2:{1399811149}"
     
-    # Cycle 1: dossier fails, token requeued
+    # Cycle 1: young token hits 429 twice (initial + in-cycle retry), then requeued
     def fake_shortlist_cycle1(fomo, id_list):
         return [tok(0, tid=tid, addr="RetryAddr2", age_minutes=20, liquidity_usd=50000,
                     volume_h24=100000, mcap_usd=500000)]
@@ -1675,7 +1675,8 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
     order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
     
     assert stats["requeued"] == 1
-    assert dossier_calls[0] == 1
+    # Young tokens get initial attempt + one in-cycle retry before defer
+    assert dossier_calls[0] == 2, f"Expected 2 dossier calls in cycle 1, got {dossier_calls[0]}"
     
     # Cycle 2: universe returns empty, but defer_due should include our token
     def fake_dossier_cycle2(t, limiter=None):
@@ -1690,8 +1691,8 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
     
     order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
     
-    # Dossier should have been called again (retry succeeded)
-    assert dossier_calls[0] == 2, f"Expected dossier called twice, got {dossier_calls[0]}"
+    # Cycle 2 adds one successful dossier call (2 from cycle 1 + 1)
+    assert dossier_calls[0] == 3, f"Expected dossier called 3 times total, got {dossier_calls[0]}"
     
     # Token should no longer be in defer (either passed or failed for real)
     defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
@@ -2667,3 +2668,225 @@ def test_age_prioritization_preserves_turnover_within_groups(monkeypatch):
     assert dossier_calls[0] == young_high_tid, "Highest turnover young token should be first"
     assert dossier_calls[1] == young_mid_tid, "Mid turnover young token should be second"
     assert dossier_calls[2] == young_low_tid, "Low turnover young token should be third"
+
+
+def test_young_token_429_gets_in_cycle_retry(monkeypatch):
+    """Young token (<60m) that hits GT 429 should wait and retry once in the same cycle."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    young_tid = f"YoungRetry:{1399811149}"
+    
+    def fake_shortlist(fomo, id_list):
+        return [{"tid": young_tid, "addr": "YoungRetry", "net": 1399811149, "ticker": "YRETRY",
+                "age_minutes": 30.0, "liquidity_usd": 50000, "volume_h24": 200000,
+                "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+                "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}}]
+    
+    dossier_call_count = [0]
+    wait_called = [False]
+    
+    def fake_dossier_429_then_success(t, limiter=None):
+        dossier_call_count[0] += 1
+        if dossier_call_count[0] == 1:
+            # First call: raise 429
+            raise collect.DossierRetryNeeded("GT 429 first attempt")
+        # Second call (after wait): succeed
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None}
+    
+    original_wait = collect.GTRateLimiter.wait_if_needed
+    def fake_wait_if_needed(self, priority=False):
+        if priority:
+            wait_called[0] = True
+        return original_wait(self, priority)
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_429_then_success)
+    monkeypatch.setattr(collect.GTRateLimiter, "wait_if_needed", fake_wait_if_needed)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=2)
+    
+    # Verify that dossier was called twice (initial + in-cycle retry)
+    assert dossier_call_count[0] == 2, f"Expected 2 dossier calls (initial + retry), got {dossier_call_count[0]}"
+    
+    # Verify that wait_if_needed was called with priority=True
+    assert wait_called[0], "wait_if_needed should be called for in-cycle retry"
+    
+    # Verify the token was not deferred (successful retry)
+    deferred = book.defer_due()
+    assert young_tid not in deferred, f"Token should not be deferred after successful retry"
+    
+    # Verify token was judged (successful dossier on retry)
+    assert stats.get("judged", 0) >= 1, "Token should be judged after successful retry"
+
+
+def test_young_token_429_twice_defers_to_next_cycle(monkeypatch):
+    """Young token that hits GT 429 twice (initial + retry) should defer to next cycle."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    young_tid = f"YoungRetryFail:{1399811149}"
+    
+    def fake_shortlist(fomo, id_list):
+        return [{"tid": young_tid, "addr": "YoungRetryFail", "net": 1399811149, "ticker": "YFAIL",
+                "age_minutes": 35.0, "liquidity_usd": 50000, "volume_h24": 200000,
+                "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+                "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}}]
+    
+    dossier_call_count = [0]
+    
+    def fake_dossier_always_429(t, limiter=None):
+        dossier_call_count[0] += 1
+        raise collect.DossierRetryNeeded("GT 429 persistent")
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_always_429)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=2)
+    
+    # Verify that dossier was called twice (initial + in-cycle retry)
+    assert dossier_call_count[0] == 2, f"Expected 2 dossier calls, got {dossier_call_count[0]}"
+    
+    # Verify the token was deferred (failed on retry)
+    deferred = book.defer_due()
+    assert young_tid in deferred, f"Token should be deferred after failed retry"
+    
+    # Verify token was NOT judged (failed dossier)
+    assert stats.get("judged", 0) == 0, "Token should not be judged after failed dossier"
+    
+    # Verify requeued count
+    assert stats.get("requeued", 0) >= 1, "Token should be marked as requeued"
+
+
+def test_old_token_429_skips_while_young_pending(monkeypatch):
+    """Old token (≥60m) should be deferred if young tokens still need dossiers this cycle."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    young_tid = f"YoungPending:{1399811149}"
+    old_tid = f"OldSkipped:{1399811149}"
+    
+    def fake_shortlist(fomo, id_list):
+        # Young with high turnover comes first, old with lower turnover second
+        return [
+            {"tid": young_tid, "addr": "YoungPending", "net": 1399811149, "ticker": "YPEND",
+             "age_minutes": 30.0, "liquidity_usd": 50000, "volume_h24": 400000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}},
+            {"tid": old_tid, "addr": "OldSkipped", "net": 1399811149, "ticker": "OSKIP",
+             "age_minutes": 75.0, "liquidity_usd": 50000, "volume_h24": 300000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}}
+        ]
+    
+    dossier_calls = []
+    
+    def fake_dossier_young_429(t, limiter=None):
+        dossier_calls.append(t["tid"])
+        if t["tid"] == young_tid:
+            # Young token hits 429
+            raise collect.DossierRetryNeeded("GT 429 for young")
+        # Old token should not reach here if young is still pending
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid, old_tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_young_429)
+    
+    desk = FakeDesk()
+    # Limited budget: young hits 429 twice, old should be deferred
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Verify young token attempted dossier at least twice (initial + retry)
+    young_attempts = [tid for tid in dossier_calls if tid == young_tid]
+    assert len(young_attempts) >= 2, f"Young token should attempt dossier at least twice, got {len(young_attempts)}"
+    
+    # Verify old token was NOT attempted for dossier (deferred while young pending)
+    old_attempts = [tid for tid in dossier_calls if tid == old_tid]
+    assert len(old_attempts) == 0, f"Old token should not attempt dossier while young pending, got {len(old_attempts)}"
+    
+    # Verify old token was deferred
+    deferred = book.defer_due()
+    assert old_tid in deferred, "Old token should be deferred while young token is pending"
+    
+    # Verify requeued count includes both young and old
+    assert stats.get("requeued", 0) >= 2, "Both young (after retry fail) and old should be requeued"
+
+
+def test_old_token_gets_dossier_after_young_clears(monkeypatch):
+    """Old token should get dossier after young token successfully completes."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    young_tid = f"YoungClears:{1399811149}"
+    old_tid = f"OldFollows:{1399811149}"
+    
+    def fake_shortlist(fomo, id_list):
+        # Young first, old second (age-prioritized)
+        return [
+            {"tid": young_tid, "addr": "YoungClears", "net": 1399811149, "ticker": "YCLR",
+             "age_minutes": 30.0, "liquidity_usd": 50000, "volume_h24": 400000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}},
+            {"tid": old_tid, "addr": "OldFollows", "net": 1399811149, "ticker": "OFOL",
+             "age_minutes": 75.0, "liquidity_usd": 50000, "volume_h24": 300000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}}
+        ]
+    
+    dossier_calls = []
+    
+    def fake_dossier_success(t, limiter=None):
+        dossier_calls.append(t["tid"])
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid, old_tid])
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000})
+    monkeypatch.setattr(shift, "dossier", fake_dossier_success)
+    
+    desk = FakeDesk()
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+    
+    # Both tokens should get dossier
+    assert len(dossier_calls) == 2, f"Expected 2 dossier calls, got {len(dossier_calls)}"
+    
+    # Young should be first, old second
+    assert dossier_calls[0] == young_tid, "Young token should get dossier first"
+    assert dossier_calls[1] == old_tid, "Old token should get dossier after young clears"
+    
+    # Neither should be deferred
+    deferred = book.defer_due()
+    assert young_tid not in deferred and old_tid not in deferred, "No tokens should be deferred on success"
