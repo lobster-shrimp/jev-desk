@@ -160,6 +160,120 @@ h1 {
   font-weight: 700;
   color: #fff;
 }
+.funnel {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: #111;
+  padding: 20px;
+}
+.funnel-stage {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  padding: 10px;
+  background: #0a0a0a;
+  border-left: 3px solid #333;
+  transition: all 0.2s ease;
+}
+.funnel-stage:hover {
+  background: #151515;
+  border-left-color: #fb8c00;
+}
+.funnel-stage.stage-seen { border-left-color: #42a5f5; }
+.funnel-stage.stage-free { border-left-color: #64748b; }
+.funnel-stage.stage-defer { border-left-color: #9e9e9e; }
+.funnel-stage.stage-trade { border-left-color: #fb8c00; }
+.funnel-stage.stage-chain { border-left-color: #e91e63; }
+.funnel-stage.stage-soft { border-left-color: #ab47bc; }
+.funnel-stage.stage-judged { border-left-color: #66bb6a; }
+.funnel-stage.stage-pick { border-left-color: #ffc107; }
+.funnel-label {
+  flex: 0 0 120px;
+  font-weight: 600;
+  color: #fff;
+  font-size: 13px;
+}
+.funnel-bar-container {
+  flex: 1;
+  height: 24px;
+  background: #1a1a1a;
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+.funnel-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #fb8c00, #e91e63);
+  transition: width 0.3s ease;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+}
+.funnel-count {
+  font-weight: 700;
+  font-size: 14px;
+  color: #fff;
+  min-width: 40px;
+  text-align: right;
+}
+.age-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+  padding: 15px;
+  background: #111;
+}
+.age-box {
+  padding: 15px;
+  background: #0a0a0a;
+  border-left: 3px solid #333;
+}
+.age-box.young { border-left-color: #66bb6a; }
+.age-box.old { border-left-color: #fb8c00; }
+.age-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 10px;
+}
+.age-stat {
+  display: flex;
+  justify-content: space-between;
+  padding: 5px 0;
+  font-size: 12px;
+  border-bottom: 1px solid #1a1a1a;
+}
+.age-stat:last-child { border-bottom: none; }
+.age-stat-label { color: #888; }
+.age-stat-value { color: #fff; font-weight: 600; }
+.kill-detail {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #1a1a1a;
+}
+.kill-detail-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: #888;
+  margin-bottom: 5px;
+}
+.kill-detail-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.kill-detail-item {
+  font-size: 11px;
+  padding: 3px 8px;
+  background: #1a1a1a;
+  border-radius: 3px;
+  color: #bbb;
+}
 table {
   width: 100%;
   border-collapse: collapse;
@@ -246,6 +360,16 @@ tr:hover td { background: #151515; }
 </div>
 
 <div class="section">
+  <div class="section-title">Funnel</div>
+  <div id="funnel-viz"></div>
+</div>
+
+<div class="section">
+  <div class="section-title">Age Distribution</div>
+  <div id="age-viz"></div>
+</div>
+
+<div class="section">
   <div class="section-title">Cycle Stats</div>
   <div class="stats-grid">
     <div class="stat-box">
@@ -263,6 +387,18 @@ tr:hover td { background: #151515; }
     <div class="stat-box">
       <div class="stat-label">Bench Count</div>
       <div class="stat-value" id="stat-bench">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Requeued</div>
+      <div class="stat-value" id="stat-requeued">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Young (&lt;60m)</div>
+      <div class="stat-value" id="stat-young">—</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Old (≥60m)</div>
+      <div class="stat-value" id="stat-old">—</div>
     </div>
   </div>
 </div>
@@ -288,6 +424,177 @@ tr:hover td { background: #151515; }
 
 <script>
 let lastUpdated = null;
+
+function formatTimestamp(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const now = new Date();
+  const diff = Math.floor((now - d) / 1000);
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return d.toLocaleString();
+}
+
+function renderFunnel(state) {
+  const funnelDiv = document.getElementById('funnel-viz');
+  
+  if (!state.cycle) {
+    funnelDiv.innerHTML = '<div class="empty">No cycle data</div>';
+    return;
+  }
+  
+  const cycle = state.cycle;
+  const killed = cycle.killed || {};
+  const tokens = state.tokens || [];
+  
+  // Calculate funnel stages
+  const seen = cycle.seen || 0;
+  const benched = cycle.benched || 0;
+  const examined = seen - benched;
+  
+  const totalFreeKills = Object.values(killed.free || {}).reduce((a,b) => a+b, 0);
+  const totalTradeKills = Object.values(killed.trade || {}).reduce((a,b) => a+b, 0);
+  const totalChainKills = Object.values(killed.chain || {}).reduce((a,b) => a+b, 0);
+  const totalSoftKills = Object.values(killed.soft || {}).reduce((a,b) => a+b, 0);
+  const judged = cycle.judged || 0;
+  const requeued = cycle.requeued || 0;
+  
+  const afterFree = examined - totalFreeKills;
+  const afterTrade = afterFree - totalTradeKills;
+  const afterChain = afterTrade - totalChainKills - requeued;
+  const afterSoft = afterChain - totalSoftKills;
+  const picked = cycle.outcome === 'SHADOW' || cycle.outcome === 'ORDER' ? 1 : 0;
+  
+  // Funnel stages with colors and counts
+  const stages = [
+    { label: 'Seen', count: seen, color: '#42a5f5', stage: 'seen', width: 100 },
+    { label: 'Examined (−benched)', count: examined, color: '#64748b', stage: 'examined', width: examined / seen * 100 },
+    { label: '↓ Free Kills', count: totalFreeKills, color: '#64748b', stage: 'free', isKill: true },
+    { label: 'After Free', count: afterFree, color: '#9e9e9e', stage: 'after-free', width: afterFree / seen * 100 },
+    { label: '↓ Trade Kills', count: totalTradeKills, color: '#fb8c00', stage: 'trade', isKill: true },
+    { label: 'After Trade', count: afterTrade, color: '#fb8c00', stage: 'after-trade', width: afterTrade / seen * 100 },
+    { label: '↓ Chain Kills', count: totalChainKills, color: '#e91e63', stage: 'chain', isKill: true },
+    { label: '↓ Requeued (429)', count: requeued, color: '#9e9e9e', stage: 'requeue', isKill: true },
+    { label: 'After Chain', count: afterChain, color: '#e91e63', stage: 'after-chain', width: afterChain / seen * 100 },
+    { label: '↓ Soft Kills', count: totalSoftKills, color: '#ab47bc', stage: 'soft', isKill: true },
+    { label: 'Judged (passed all)', count: judged, color: '#66bb6a', stage: 'judged', width: judged / seen * 100 },
+    { label: '→ Picked', count: picked, color: '#ffc107', stage: 'pick', width: picked / seen * 100 },
+  ];
+  
+  const funnelHTML = stages.map(s => {
+    if (s.isKill) {
+      return `
+        <div class="funnel-stage stage-${s.stage}">
+          <div class="funnel-label">${s.label}</div>
+          <div class="funnel-count" style="color: #ef5350;">−${s.count}</div>
+        </div>
+      `;
+    } else {
+      const widthPercent = Math.max(s.width || 0, 2);
+      return `
+        <div class="funnel-stage stage-${s.stage}">
+          <div class="funnel-label">${s.label}</div>
+          <div class="funnel-bar-container">
+            <div class="funnel-bar" style="width: ${widthPercent}%; background: ${s.color};">
+              ${widthPercent > 15 ? s.count : ''}
+            </div>
+          </div>
+          <div class="funnel-count">${s.count}</div>
+        </div>
+      `;
+    }
+  }).join('');
+  
+  funnelDiv.innerHTML = `<div class="funnel">${funnelHTML}</div>`;
+}
+
+function renderAgeDistribution(tokens) {
+  const ageDiv = document.getElementById('age-viz');
+  
+  if (!tokens || tokens.length === 0) {
+    ageDiv.innerHTML = '<div class="empty">No token data</div>';
+    return;
+  }
+  
+  // Separate young (<60m) and old (>=60m) tokens
+  const youngTokens = tokens.filter(t => t.age_minutes != null && t.age_minutes < 60);
+  const oldTokens = tokens.filter(t => t.age_minutes != null && t.age_minutes >= 60);
+  
+  function analyzeTokens(tokens, label) {
+    const total = tokens.length;
+    const killed = tokens.filter(t => t.verdict === 'DROP').length;
+    const passed = tokens.filter(t => t.verdict === 'PASS').length;
+    
+    const killsByStage = {};
+    const killsByReason = {};
+    tokens.filter(t => t.verdict === 'DROP').forEach(t => {
+      killsByStage[t.stage] = (killsByStage[t.stage] || 0) + 1;
+      if (t.reason) {
+        killsByReason[t.reason] = (killsByReason[t.reason] || 0) + 1;
+      }
+    });
+    
+    const ages = tokens.map(t => t.age_minutes).filter(a => a != null);
+    const avgAge = ages.length > 0 ? (ages.reduce((a,b) => a+b, 0) / ages.length) : 0;
+    const minAge = ages.length > 0 ? Math.min(...ages) : 0;
+    const maxAge = ages.length > 0 ? Math.max(...ages) : 0;
+    
+    return { total, killed, passed, killsByStage, killsByReason, avgAge, minAge, maxAge };
+  }
+  
+  const youngAnalysis = analyzeTokens(youngTokens, 'Young');
+  const oldAnalysis = analyzeTokens(oldTokens, 'Old');
+  
+  function renderBox(analysis, label, className) {
+    const topReasons = Object.entries(analysis.killsByReason)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([reason, count]) => `<span class="kill-detail-item">${reason}: ${count}</span>`)
+      .join('');
+    
+    return `
+      <div class="age-box ${className}">
+        <div class="age-title">${label} Tokens (&lt;60m)</div>
+        <div class="age-stat">
+          <span class="age-stat-label">Total</span>
+          <span class="age-stat-value">${analysis.total}</span>
+        </div>
+        <div class="age-stat">
+          <span class="age-stat-label">Killed</span>
+          <span class="age-stat-value">${analysis.killed}</span>
+        </div>
+        <div class="age-stat">
+          <span class="age-stat-label">Passed</span>
+          <span class="age-stat-value">${analysis.passed}</span>
+        </div>
+        <div class="age-stat">
+          <span class="age-stat-label">Avg Age</span>
+          <span class="age-stat-value">${analysis.avgAge.toFixed(1)}m</span>
+        </div>
+        <div class="age-stat">
+          <span class="age-stat-label">Age Range</span>
+          <span class="age-stat-value">${analysis.minAge.toFixed(0)}–${analysis.maxAge.toFixed(0)}m</span>
+        </div>
+        ${topReasons ? `
+          <div class="kill-detail">
+            <div class="kill-detail-title">Top Kill Reasons</div>
+            <div class="kill-detail-list">${topReasons}</div>
+          </div>
+        ` : ''}
+      </div>
+    `;
+  }
+  
+  const html = `
+    <div class="age-grid">
+      ${renderBox(youngAnalysis, 'Young', 'young')}
+      ${renderBox(oldAnalysis, 'Old', 'old')}
+    </div>
+  `;
+  
+  ageDiv.innerHTML = html;
+}
 
 function formatTimestamp(iso) {
   if (!iso) return '—';
@@ -365,6 +672,44 @@ function renderSummary(state) {
     if (totalSoft > 0) killParts.push(`<span class="summary-highlight">${totalSoft}</span> soft`);
     lines.push(`Killed ${killParts.join(', ')}.`);
     
+    // Trade kill details with age visibility
+    if (totalTrade > 0) {
+      const tradeTokens = (state.tokens || []).filter(t => t.stage === 'trade' && t.verdict === 'DROP');
+      if (tradeTokens.length > 0) {
+        const tradeBreakdown = {};
+        tradeTokens.forEach(t => {
+          tradeBreakdown[t.reason] = (tradeBreakdown[t.reason] || []).concat(t);
+        });
+        const tradeDetails = Object.entries(tradeBreakdown).map(([reason, tokens]) => {
+          const ages = tokens.map(t => t.age_minutes).filter(a => a != null);
+          const avgAge = ages.length > 0 ? (ages.reduce((a,b) => a+b, 0) / ages.length).toFixed(1) : '?';
+          const tickers = tokens.slice(0, 3).map(t => t.ticker || '?').join(', ');
+          const more = tokens.length > 3 ? ` +${tokens.length - 3} more` : '';
+          return `${reason} (${tokens.length}, avg ${avgAge}m): ${tickers}${more}`;
+        }).join('; ');
+        lines.push(`<span class="summary-warning">Trade kills:</span> ${tradeDetails}`);
+      }
+    }
+    
+    // Chain kill details with age visibility
+    if (totalChain > 0) {
+      const chainTokens = (state.tokens || []).filter(t => t.stage === 'chain' && t.verdict === 'DROP');
+      if (chainTokens.length > 0) {
+        const chainBreakdown = {};
+        chainTokens.forEach(t => {
+          chainBreakdown[t.reason] = (chainBreakdown[t.reason] || []).concat(t);
+        });
+        const chainDetails = Object.entries(chainBreakdown).map(([reason, tokens]) => {
+          const ages = tokens.map(t => t.age_minutes).filter(a => a != null);
+          const avgAge = ages.length > 0 ? (ages.reduce((a,b) => a+b, 0) / ages.length).toFixed(1) : '?';
+          const tickers = tokens.slice(0, 3).map(t => t.ticker || '?').join(', ');
+          const more = tokens.length > 3 ? ` +${tokens.length - 3} more` : '';
+          return `${reason} (${tokens.length}, avg ${avgAge}m): ${tickers}${more}`;
+        }).join('; ');
+        lines.push(`<span class="summary-warning">Chain kills:</span> ${chainDetails}`);
+      }
+    }
+    
     // Emphasize age kills
     if (freeKills.age > 0) {
       const ageTokens = (state.tokens || []).filter(t => t.reason === 'age' && t.stage === 'free');
@@ -394,6 +739,24 @@ function renderSummary(state) {
         dataParts.push(`<span class="summary-highlight">${thresholdKills} below thresholds</span> (liq: ${freeKills.liquidity || 0}, vol: ${freeKills.volume || 0}, mcap: ${freeKills.mcap || 0})`);
       }
       lines.push(`Data quality: ${dataParts.join(', ')}.`);
+    }
+    
+    // Liquidity drain story - when liquidity kills dominate
+    const liquidityKills = (freeKills.liquidity || 0) + (freeKills.no_liq || 0);
+    if (liquidityKills > examined * 0.3) {
+      const liqTokens = (state.tokens || []).filter(t => 
+        (t.reason === 'liquidity' || t.reason === 'no_liq') && t.stage === 'free'
+      );
+      if (liqTokens.length > 0) {
+        const withLiq = liqTokens.filter(t => t.liquidity_usd != null);
+        if (withLiq.length > 0) {
+          const avgLiq = (withLiq.reduce((sum, t) => sum + (t.liquidity_usd || 0), 0) / withLiq.length);
+          const maxLiq = Math.max(...withLiq.map(t => t.liquidity_usd || 0));
+          lines.push(`<span class="summary-warning">Liquidity drain:</span> ${liquidityKills} tokens killed on liquidity (${Math.round(liquidityKills / examined * 100)}% of examined). Avg liq $${Math.round(avgLiq).toLocaleString()}, max $${Math.round(maxLiq).toLocaleString()}.`);
+        } else {
+          lines.push(`<span class="summary-warning">Liquidity drain:</span> ${liquidityKills} tokens killed on liquidity (${Math.round(liquidityKills / examined * 100)}% of examined), all missing data.`);
+        }
+      }
     }
   }
   
@@ -588,6 +951,14 @@ async function refresh() {
       document.getElementById('stat-seen').textContent = state.cycle.seen || 0;
       document.getElementById('stat-benched').textContent = state.cycle.benched || 0;
       document.getElementById('stat-judged').textContent = state.cycle.judged || 0;
+      document.getElementById('stat-requeued').textContent = state.cycle.requeued || 0;
+      
+      // Young vs old counts
+      const tokens = state.tokens || [];
+      const youngCount = tokens.filter(t => t.age_minutes != null && t.age_minutes < 60).length;
+      const oldCount = tokens.filter(t => t.age_minutes != null && t.age_minutes >= 60).length;
+      document.getElementById('stat-young').textContent = youngCount;
+      document.getElementById('stat-old').textContent = oldCount;
       
       if (state.cycle.killed) {
         renderHistograms(state.cycle.killed);
@@ -595,6 +966,7 @@ async function refresh() {
       
       renderSummary(state);
       renderJudgeHealth(state);
+      renderFunnel(state);
     } else {
       document.getElementById('summary-box').style.display = 'none';
     }
@@ -603,6 +975,7 @@ async function refresh() {
     
     renderHeld(state.held);
     renderTokens(state.tokens);
+    renderAgeDistribution(state.tokens);
     
     lastUpdated = state.updated_at;
   } catch (err) {
