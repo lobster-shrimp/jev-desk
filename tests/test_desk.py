@@ -1678,7 +1678,7 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
         dossier_calls[0] += 1
         raise collect.DossierRetryNeeded(f"GT 429 for {t['ticker']}")
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([tid], {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_cycle1)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
@@ -1700,7 +1700,7 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [])  # Empty universe
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([], {}))  # Empty universe
     monkeypatch.setattr(shift, "dossier", fake_dossier_cycle2)
     
     order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
@@ -1812,7 +1812,7 @@ def test_defer_due_token_passed_to_fomo(monkeypatch):
     book.DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, now - 1, now + 3600))
     book.DB.commit()
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([], {}))
     
     fomo_calls = []
     original_shortlist = collect.shortlist
@@ -1899,7 +1899,7 @@ def test_defer_miss_forgotten_and_logged(monkeypatch, caplog):
     book.DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, now - 1, now + 3600))
     book.DB.commit()
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([], {}))
     
     def fake_tokens_miss(self, ids):
         return {}
@@ -2055,7 +2055,7 @@ def test_defer_outcome_logging(monkeypatch, caplog):
     def fake_shortlist_defer(fomo, id_list):
         return [tok(0, tid=tid, addr="OutcomeAddr1", age_minutes=5, liquidity_usd=20000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids1)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids1, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_defer)
     
     desk = FakeDesk()
@@ -2073,7 +2073,7 @@ def test_defer_outcome_logging(monkeypatch, caplog):
         # Now has low liquidity
         return [tok(0, tid=tid, addr="OutcomeAddr1", age_minutes=16, liquidity_usd=5000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_fail_liq)
     
     caplog.clear()
@@ -2553,7 +2553,7 @@ def test_young_tokens_get_dossier_before_old_with_budget_constraint(monkeypatch)
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [old1_tid, old2_tid, young1_tid, young2_tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([old1_tid, old2_tid, young1_tid, young2_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_mixed)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2611,7 +2611,7 @@ def test_old_requeue_does_not_starve_young_first_timer(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_mixed)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2667,7 +2667,7 @@ def test_age_prioritization_preserves_turnover_within_groups(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_high_tid, young_mid_tid, young_low_tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_high_tid, young_mid_tid, young_low_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young_group)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2724,7 +2724,7 @@ def test_young_token_429_gets_in_cycle_retry(monkeypatch):
             wait_called[0] = True
         return original_wait(self, priority)
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2770,7 +2770,7 @@ def test_young_token_429_twice_defers_to_next_cycle(monkeypatch):
         dossier_call_count[0] += 1
         raise collect.DossierRetryNeeded("GT 429 persistent")
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2851,7 +2851,7 @@ def test_young_token_429_backoff_actually_waits(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2923,7 +2923,7 @@ def test_old_token_429_skips_while_young_pending(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid, old_tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid, old_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2982,7 +2982,7 @@ def test_old_token_gets_dossier_after_young_clears(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [young_tid, old_tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid, old_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -3142,7 +3142,7 @@ def test_end_to_end_young_momentum_pass(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a young token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -3199,7 +3199,7 @@ def test_end_to_end_old_momentum_kill(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "an old token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: [tid])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_old)
     monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
