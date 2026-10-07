@@ -460,3 +460,110 @@ def test_fomo_error_tracking_in_state(monkeypatch):
     
     assert state["cycle"]["fomo_error"] == "bearer expired"
     assert state["cycle"]["outcome"] == "ERROR"
+
+
+def test_shadow_mark_all_open_positions():
+    """Test marking all open positions via mark_all_open_positions."""
+    # Create two open positions
+    order1 = {
+        "token": {"ticker": "TEST1", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    order2 = {
+        "token": {"ticker": "TEST2", "address": "def456", "network_id": 1399811149, "chain": "solana"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order1, {"price": 0.0001})
+    shadow_ledger.entry(order2, {"price": 0.0002})
+    
+    # Mock FOMO client
+    # With the heuristic vol_h6 = vol24 * 0.15, ratio = 0.15 / 0.25 = 0.6 (healthy, stays open)
+    # To trigger closure, we need very low vol24 or simulate it
+    class MockFomo:
+        def tokens(self, tids):
+            return {
+                "abc123:1399811149": {"price": 0.00012, "vol24": 50000},  # Healthy volume, stays open
+                "def456:1399811149": {"price": 0.00015, "vol24": 100}     # Very low volume, stays open with 0.6 ratio
+            }
+    
+    fomo = MockFomo()
+    result = shadow_ledger.mark_all_open_positions(fomo)
+    
+    # Both should be marked (ratio is 0.6 > 0.20, so healthy)
+    assert result["marked"] == 2
+    assert result["closed"] == 0
+    
+    # Both positions should still be open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 2
+
+
+def test_shadow_mark_with_stale_price():
+    """Test marking when FOMO returns no price (stale data)."""
+    order = {
+        "token": {"ticker": "TEST", "address": "abc123", "network_id": 1399811149, "chain": "solana"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order, {"price": 0.0001})
+    
+    # Mock FOMO with missing price
+    class MockFomo:
+        def tokens(self, tids):
+            return {"abc123:1399811149": {"vol24": 50000}}  # No price
+    
+    fomo = MockFomo()
+    result = shadow_ledger.mark_all_open_positions(fomo)
+    
+    assert result["stale"] == 1
+    
+    # Position should be closed with unmeasured PnL
+    closes = shadow_ledger.closed_positions()
+    assert len(closes) == 1
+    assert closes[0]["realized_pnl_usd"] is None
+    assert closes[0]["reason"] == "stale_price"
+
+
+def test_chain_preserved_in_close_record():
+    """Test that chain is preserved from entry to close for proper links."""
+    order = {
+        "token": {"ticker": "TEST", "address": "abc123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order, {"price": 0.0001})
+    shadow_ledger.close("abc123", 56, current_price=0.00015, reason="test")
+    
+    closes = shadow_ledger.closed_positions()
+    assert len(closes) == 1
+    assert closes[0]["chain"] == "bsc"
+
+
+def test_csrf_protection_on_fomo_activate(monkeypatch):
+    """Test that /api/fomo_activate rejects requests without custom header."""
+    # Set required env vars before importing server
+    monkeypatch.setenv("DESK_SECRET", "test-secret-for-csrf-test")
+    monkeypatch.setenv("JUDGE_MOCK", "1")  # Use mock judge to avoid needing TYPESAFE_API_KEY
+    
+    from fastapi.testclient import TestClient
+    
+    # Reimport server and judge to pick up env vars
+    import importlib
+    import judge as judge_module
+    import server as server_module
+    importlib.reload(judge_module)
+    importlib.reload(server_module)
+    
+    client = TestClient(server_module.app)
+    
+    # Request without header should fail
+    response = client.post("/api/fomo_activate")
+    assert response.status_code == 403
+    assert "X-Ops-Action" in response.json()["detail"]
+    
+    # Request with wrong header value should fail
+    response = client.post("/api/fomo_activate", headers={"X-Ops-Action": "wrong"})
+    assert response.status_code == 403
+    
+    # Request with correct header should succeed (but CDP may not be reachable)
+    response = client.post("/api/fomo_activate", headers={"X-Ops-Action": "activate-fomo"})
+    # May be 500 if CDP not reachable, but shouldn't be 403
+    assert response.status_code in (200, 500)

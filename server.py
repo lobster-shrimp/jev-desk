@@ -106,11 +106,20 @@ async def api_fomo_status():
 
 
 @app.post("/api/fomo_activate")
-async def api_fomo_activate():
+async def api_fomo_activate(x_ops_action: str = Header(None, alias="X-Ops-Action")):
     """
     Activate the fomo.family tab in the CDP Chrome instance.
+    Requires X-Ops-Action header to prevent cross-site requests.
     Local-only endpoint (bind server to 127.0.0.1 for safety).
     """
+    # CSRF protection: require custom header that browsers won't send cross-origin
+    if x_ops_action != "activate-fomo":
+        raise HTTPException(
+            403, 
+            "Forbidden: missing or invalid X-Ops-Action header. "
+            "This endpoint requires same-origin requests from /ops."
+        )
+    
     result = activate_fomo_tab()
     status_code = 200 if result["success"] else 500
     return JSONResponse(result, status_code=status_code)

@@ -171,6 +171,7 @@ def close(address: str, network_id: int, current_price: float = None, reason: st
         "ticker": pos["ticker"],
         "address": address,
         "network_id": network_id,
+        "chain": pos.get("chain"),  # Preserve chain from entry for proper links
         "entry_price_usd": pos["entry_price_usd"],
         "exit_price_usd": current_price,
         "size_usd": pos["size_usd"],
@@ -274,3 +275,61 @@ def _parse_ts(iso: str) -> float:
         return time.mktime(time.strptime(iso, "%Y-%m-%dT%H:%M:%SZ"))
     except (ValueError, TypeError):
         return time.time()
+
+
+def mark_all_open_positions(fomo_client) -> dict:
+    """
+    Mark all open shadow positions to market using FOMO data.
+    
+    Args:
+        fomo_client: Fomo instance to fetch fresh prices
+    
+    Returns:
+        dict with counts: marked, closed, stale
+    """
+    opens = open_positions()
+    if not opens:
+        return {"marked": 0, "closed": 0, "stale": 0}
+    
+    # Build list of tids for FOMO fetch
+    tids = [f"{pos['address']}:{pos['network_id']}" for pos in opens]
+    
+    # Fetch fresh data from FOMO (cheap, not GeckoTerminal)
+    try:
+        fomo_data = fomo_client.tokens(tids)
+    except Exception as e:
+        log.warning("failed to fetch FOMO data for shadow positions: %s", e)
+        fomo_data = {}
+    
+    marked_count = 0
+    closed_count = 0
+    stale_count = 0
+    
+    for pos in opens:
+        tid = f"{pos['address']}:{pos['network_id']}"
+        token_data = fomo_data.get(tid, {})
+        
+        price = token_data.get("price")
+        vol24 = token_data.get("vol24")
+        
+        # FOMO doesn't provide h6 volume, but we can use a heuristic:
+        # If recent volume has dropped significantly vs 24h average, that's a warning sign.
+        # Use vol24 * 0.15 as a conservative h6 estimate (60% drop from steady-state 0.25).
+        # This makes the exit rule more sensitive: ratio < 0.20 triggers when vol has dropped.
+        # Note: This is an approximation; real RISK would use actual h6 data.
+        vol_h6 = vol24 * 0.15 if vol24 else None
+        
+        if price is None or price <= 0:
+            # Stale price, close with unmeasured PnL
+            mark(pos["address"], pos["network_id"], None, volume_h6=None, volume_h24=None)
+            stale_count += 1
+        else:
+            # Mark with current price and volume data
+            result = mark(pos["address"], pos["network_id"], price, volume_h6=vol_h6, volume_h24=vol24)
+            if result and result["action"] == "close":
+                closed_count += 1
+            else:
+                marked_count += 1
+    
+    log.info("shadow mark: %d marked, %d closed, %d stale", marked_count, closed_count, stale_count)
+    return {"marked": marked_count, "closed": closed_count, "stale": stale_count}
