@@ -1646,7 +1646,7 @@ def test_run_once_requeues_on_dossier_retry(monkeypatch, caplog):
 
 
 def test_requeued_token_retried_next_cycle(monkeypatch):
-    """Token requeued due to dossier failure should be retried next cycle."""
+    """Young token requeued after in-cycle 429 retry should be retried next cycle."""
     book.release()
     book.DB.execute("DELETE FROM defer")
     book.DB.execute("DELETE FROM bench")
@@ -1654,7 +1654,7 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
     
     tid = f"RetryAddr2:{1399811149}"
     
-    # Cycle 1: dossier fails, token requeued
+    # Cycle 1: young token hits 429 twice (initial + in-cycle retry), then requeued
     def fake_shortlist_cycle1(fomo, id_list):
         return [tok(0, tid=tid, addr="RetryAddr2", age_minutes=20, liquidity_usd=50000,
                     volume_h24=100000, mcap_usd=500000)]
@@ -1675,7 +1675,8 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
     order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
     
     assert stats["requeued"] == 1
-    assert dossier_calls[0] == 1
+    # Young tokens get initial attempt + one in-cycle retry before defer
+    assert dossier_calls[0] == 2, f"Expected 2 dossier calls in cycle 1, got {dossier_calls[0]}"
     
     # Cycle 2: universe returns empty, but defer_due should include our token
     def fake_dossier_cycle2(t, limiter=None):
@@ -1690,8 +1691,8 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
     
     order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
     
-    # Dossier should have been called again (retry succeeded)
-    assert dossier_calls[0] == 2, f"Expected dossier called twice, got {dossier_calls[0]}"
+    # Cycle 2 adds one successful dossier call (2 from cycle 1 + 1)
+    assert dossier_calls[0] == 3, f"Expected dossier called 3 times total, got {dossier_calls[0]}"
     
     # Token should no longer be in defer (either passed or failed for real)
     defer_rows = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchall()
