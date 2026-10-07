@@ -99,6 +99,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     old_tokens = [t for t in shortlist_result if t.get("age_minutes", 0) >= 60]
     age_prioritized = young_tokens + old_tokens
     
+    # Track young tokens that still need dossiers this cycle (for in-cycle retry logic)
+    young_pending_dossier = []
+    
     for t in age_prioritized:                    # pass one: free, no per-token requests
         stats["seen"] += 1
         t.setdefault("chain", CHAIN_SET.get(t["net"]))
@@ -159,24 +162,82 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             record(t, "trade", k)
             continue
 
-        try:
-            d = dossier(t, limiter=gt_limiter)   # pass three: one GeckoTerminal slot (budget-aware)
-        except DossierRetryNeeded as e:
-            log.info("dossier retry needed for %s, requeuing: %s", t["ticker"], e)
-            # Requeue for immediate retry next cycle (ready=now, drop after max_age)
+        # Passed free & trade checks; track young tokens for in-cycle retry priority
+        is_young = t.get("age_minutes", 0) < 60
+        if is_young:
+            young_pending_dossier.append(t)
+        
+        # If this is an old token and young tokens still need dossiers, defer to next cycle
+        if not is_young and young_pending_dossier:
+            log.info("defer old token %s (age %.1fm) while young tokens pending dossier", 
+                     t["ticker"], t.get("age_minutes", 0))
             now = time.time()
             drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
             book.defer(t["tid"], now, drop_at)
             stats["requeued"] += 1
-            record(t, "chain", "requeued")
+            record(t, "chain", "deferred_for_young")
             continue
+
+        d = None
+        try:
+            d = dossier(t, limiter=gt_limiter)   # pass three: one GeckoTerminal slot (budget-aware)
+            # Success: remove from young pending if applicable
+            if is_young and t in young_pending_dossier:
+                young_pending_dossier.remove(t)
+        except DossierRetryNeeded as e:
+            log.info("dossier retry needed for %s (age %.1fm): %s", 
+                     t["ticker"], t.get("age_minutes", 0), e)
+            
+            # Young tokens get one in-cycle retry after waiting for rate limit recovery
+            if is_young:
+                log.info("young token %s waiting for rate limit recovery before in-cycle retry", 
+                         t["ticker"])
+                gt_limiter.wait_if_needed(priority=True)
+                try:
+                    d = dossier(t, limiter=gt_limiter)
+                    # Success on retry: remove from young pending
+                    if t in young_pending_dossier:
+                        young_pending_dossier.remove(t)
+                    log.info("young token %s dossier succeeded on in-cycle retry", t["ticker"])
+                except DossierRetryNeeded as retry_e:
+                    log.info("young token %s dossier failed on in-cycle retry, deferring: %s", 
+                             t["ticker"], retry_e)
+                    # Still failed after in-cycle retry: defer to next cycle
+                    # Keep in young_pending so old tokens don't get slots this cycle
+                    now = time.time()
+                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                    book.defer(t["tid"], now, drop_at)
+                    stats["requeued"] += 1
+                    record(t, "chain", "requeued_after_retry")
+                    continue
+                except Exception as retry_e:
+                    log.warning("young token %s dossier retry failed: %s", t["ticker"], retry_e)
+                    # Keep in young_pending so old tokens don't get slots this cycle
+                    book.sit(t["tid"], "dossier_failed")
+                    log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
+                    book.forget_defer(t["tid"])
+                    record(t, "chain", "dossier_failed")
+                    continue
+            else:
+                # Old token: defer without in-cycle retry
+                now = time.time()
+                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                book.defer(t["tid"], now, drop_at)
+                stats["requeued"] += 1
+                record(t, "chain", "requeued")
+                continue
         except Exception as e:
             log.warning("dossier failed %s: %s", t["ticker"], e)
+            # Keep young tokens in pending list so old tokens don't get slots
             book.sit(t["tid"], "dossier_failed")
             log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
             book.forget_defer(t["tid"])
             record(t, "chain", "dossier_failed")
             continue                             # missing is missing, not a pass
+        
+        # If we get here without a dossier, it was a non-retry exception path
+        if d is None:
+            continue
 
         if (k := chain_kill(d)):
             book.sit(t["tid"], k)                # facts bench longest
