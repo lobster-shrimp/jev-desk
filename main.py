@@ -282,8 +282,10 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                     if v is not None:
                         soft_scores[name] = v
             # Log detailed soft kill with noul and age
-            log.info("soft tid=%s ticker=%s reason=%s noul=%s age_minutes=%s soft_scores=%s",
+            log.info("soft tid=%s ticker=%s reason=%s noul=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s developer_holding_percentage=%s holder_count=%s rpc_ok=%s soft_scores=%s",
                      d.get("tid"), d.get("ticker"), reason, noul, d.get("age_minutes"),
+                     d.get("top_10_percent"), d.get("top_wallet_percent"), d.get("developer_holding_percentage"),
+                     d.get("holder_count"), d.get("rpc_ok"),
                      {k: round(v, 3) for k, v in soft_scores.items()})
             book.sit(t["tid"], reason)
             log.info("defer outcome tid=%s reason=%s", t["tid"], reason)

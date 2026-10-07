@@ -419,10 +419,17 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     # Solana only: exact top wallet share, free, off the public RPC
     if t["net"] == 1399811149:
         try:
-            d["top_wallet_percent"] = sol_top_wallet(t["addr"])
+            top_wallet, rpc_ok, rpc_error = sol_top_wallet(t["addr"])
+            d["top_wallet_percent"] = top_wallet
+            d["rpc_ok"] = rpc_ok
+            d["rpc_error"] = rpc_error
+            if rpc_error:
+                log.warning("solana rpc failed for %s: %s", t["ticker"], rpc_error)
         except Exception as e:
             log.warning("solana rpc failed for %s: %s", t["ticker"], e)
-            d["top_wallet_percent"] = None       # missing is missing
+            d["top_wallet_percent"] = None
+            d["rpc_ok"] = False
+            d["rpc_error"] = str(e)
 
     return d
 
@@ -436,13 +443,80 @@ def clean_handle(h):
     return h if h and h.replace("_", "").isalnum() and len(h) <= 15 else None
 
 
-def sol_top_wallet(mint: str):
-    def q(m, p):
-        return requests.post(SOL_RPC, json={"jsonrpc": "2.0", "id": 1, "method": m, "params": p},
-                             timeout=20).json()["result"]
-    supply = float(q("getTokenSupply", [mint])["value"]["amount"])
-    top = q("getTokenLargestAccounts", [mint])["value"]
-    return float(top[0]["amount"]) / supply if supply and top else None
+def sol_top_wallet(mint: str) -> tuple[float | None, bool, str | None]:
+    """Query Solana RPC for top wallet concentration.
+    
+    Returns (top_wallet_percent, rpc_ok, rpc_error):
+      - top_wallet_percent: float or None
+      - rpc_ok: True on success, False on failure
+      - rpc_error: error description or None
+    """
+    rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+    
+    def q(m, p, retry_on_429=False):
+        """Make one RPC call. Returns (result, error_description)."""
+        try:
+            resp = requests.post(
+                rpc_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": m, "params": p},
+                timeout=20
+            )
+            data = resp.json()
+            
+            if "error" in data:
+                error_msg = data["error"]
+                if isinstance(error_msg, dict):
+                    code = error_msg.get("code")
+                    message = error_msg.get("message", "unknown error")
+                    error_desc = f"{message} (code {code})" if code else message
+                else:
+                    error_desc = str(error_msg)
+                
+                if resp.status_code == 429 and retry_on_429:
+                    log.info("Solana RPC 429 on %s for %s, retrying once", m, mint)
+                    time.sleep(2)
+                    resp_retry = requests.post(
+                        rpc_url,
+                        json={"jsonrpc": "2.0", "id": 1, "method": m, "params": p},
+                        timeout=20
+                    )
+                    data_retry = resp_retry.json()
+                    if "error" in data_retry:
+                        return None, error_desc
+                    if "result" not in data_retry:
+                        return None, "missing result field"
+                    return data_retry["result"], None
+                
+                return None, error_desc
+            
+            if "result" not in data:
+                return None, "missing result field"
+            
+            return data["result"], None
+            
+        except Exception as e:
+            return None, str(e)
+    
+    supply_result, supply_error = q("getTokenSupply", [mint])
+    if supply_error:
+        return None, False, f"getTokenSupply: {supply_error}"
+    
+    try:
+        supply = float(supply_result["value"]["amount"])
+    except (TypeError, KeyError, ValueError) as e:
+        return None, False, f"getTokenSupply parse: {e}"
+    
+    top_result, top_error = q("getTokenLargestAccounts", [mint], retry_on_429=True)
+    if top_error:
+        return None, False, f"getTokenLargestAccounts: {top_error}"
+    
+    try:
+        top = top_result["value"]
+        if not supply or not top:
+            return None, True, None
+        return float(top[0]["amount"]) / supply, True, None
+    except (TypeError, KeyError, ValueError, IndexError) as e:
+        return None, False, f"getTokenLargestAccounts parse: {e}"
 
 
 def social_state(d: dict) -> dict:

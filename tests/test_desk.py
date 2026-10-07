@@ -3473,3 +3473,209 @@ def test_dossier_429_calls_record_429_on_limiter(monkeypatch):
     finally:
         requests.get = original_get
 
+
+def test_sol_top_wallet_success(monkeypatch):
+    """sol_top_wallet should return concentration on success."""
+    calls = []
+    
+    def fake_post(url, json=None, timeout=None):
+        calls.append((url, json["method"]))
+        method = json["method"]
+        
+        if method == "getTokenSupply":
+            return Mock(json=lambda: {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"value": {"amount": "1000000"}}
+            })
+        elif method == "getTokenLargestAccounts":
+            return Mock(json=lambda: {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"value": [{"amount": "100000"}]}
+            })
+    
+    monkeypatch.setattr(requests, "post", fake_post)
+    
+    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    
+    assert percent == 0.1
+    assert rpc_ok is True
+    assert error is None
+    assert len(calls) == 2
+    assert calls[0][1] == "getTokenSupply"
+    assert calls[1][1] == "getTokenLargestAccounts"
+
+
+def test_sol_top_wallet_json_rpc_error(monkeypatch):
+    """sol_top_wallet should handle JSON-RPC error responses."""
+    def fake_post(url, json=None, timeout=None):
+        return Mock(json=lambda: {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32600, "message": "Invalid request"}
+        })
+    
+    monkeypatch.setattr(requests, "post", fake_post)
+    
+    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    
+    assert percent is None
+    assert rpc_ok is False
+    assert "Invalid request" in error
+    assert "code -32600" in error
+
+
+def test_sol_top_wallet_429_retry_success(monkeypatch):
+    """sol_top_wallet should retry once on 429 and succeed."""
+    call_count = [0]
+    
+    def fake_post(url, json=None, timeout=None):
+        method = json["method"]
+        
+        if method == "getTokenSupply":
+            return Mock(json=lambda: {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"value": {"amount": "1000000"}}
+            })
+        elif method == "getTokenLargestAccounts":
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return Mock(
+                    status_code=429,
+                    json=lambda: {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {"code": 429, "message": "Too Many Requests"}
+                    }
+                )
+            else:
+                return Mock(json=lambda: {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"value": [{"amount": "100000"}]}
+                })
+    
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(time, "sleep", lambda x: None)
+    
+    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    
+    assert percent == 0.1
+    assert rpc_ok is True
+    assert error is None
+    assert call_count[0] == 2
+
+
+def test_sol_top_wallet_429_retry_failure(monkeypatch):
+    """sol_top_wallet should return error after 429 retry fails."""
+    def fake_post(url, json=None, timeout=None):
+        method = json["method"]
+        
+        if method == "getTokenSupply":
+            return Mock(json=lambda: {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"value": {"amount": "1000000"}}
+            })
+        elif method == "getTokenLargestAccounts":
+            return Mock(
+                status_code=429,
+                json=lambda: {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": {"code": 429, "message": "Too Many Requests"}
+                }
+            )
+    
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(time, "sleep", lambda x: None)
+    
+    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    
+    assert percent is None
+    assert rpc_ok is False
+    assert "Too Many Requests" in error
+
+
+def test_sol_top_wallet_missing_result_field(monkeypatch):
+    """sol_top_wallet should handle missing result field."""
+    def fake_post(url, json=None, timeout=None):
+        return Mock(json=lambda: {
+            "jsonrpc": "2.0",
+            "id": 1
+        })
+    
+    monkeypatch.setattr(requests, "post", fake_post)
+    
+    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    
+    assert percent is None
+    assert rpc_ok is False
+    assert "missing result field" in error
+
+
+def test_sol_top_wallet_uses_env_var(monkeypatch):
+    """sol_top_wallet should read RPC URL from SOLANA_RPC_URL env var."""
+    test_url = "https://custom-rpc.example.com"
+    monkeypatch.setenv("SOLANA_RPC_URL", test_url)
+    
+    calls = []
+    
+    def fake_post(url, json=None, timeout=None):
+        calls.append(url)
+        return Mock(json=lambda: {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"value": {"amount": "1000000"}} if json["method"] == "getTokenSupply" else {"value": [{"amount": "100000"}]}
+        })
+    
+    monkeypatch.setattr(requests, "post", fake_post)
+    
+    collect.sol_top_wallet("test_mint")
+    
+    assert all(url == test_url for url in calls)
+
+
+def test_dossier_captures_rpc_status(monkeypatch):
+    """dossier should capture rpc_ok and rpc_error for Solana tokens."""
+    def fake_sol_top_wallet(mint):
+        return None, False, "getTokenLargestAccounts: Too Many Requests (code 429)"
+    
+    def fake_get(url, headers=None, timeout=None):
+        return Mock(
+            status_code=200,
+            json=lambda: {
+                "data": {
+                    "attributes": {
+                        "holders": {"count": 100, "distribution_percentage": {"top_10": 30}},
+                        "developer_holding_percentage": 5.0,
+                        "gt_score_details": {},
+                        "is_honeypot": False,
+                        "mint_authority": None,
+                        "freeze_authority": None,
+                        "description": "Test token",
+                        "twitter_handle": "test"
+                    }
+                }
+            }
+        )
+    
+    monkeypatch.setattr(collect, "sol_top_wallet", fake_sol_top_wallet)
+    monkeypatch.setattr(requests, "get", fake_get)
+    
+    token = {
+        "tid": "test:1399811149",
+        "ticker": "TEST",
+        "addr": "testaddr",
+        "net": 1399811149,
+        "holder_count": 100
+    }
+    
+    result = collect.dossier(token)
+    
+    assert result["top_wallet_percent"] is None
+    assert result["rpc_ok"] is False
+    assert "Too Many Requests" in result["rpc_error"]
+
