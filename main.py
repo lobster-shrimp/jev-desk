@@ -67,6 +67,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
              "chain": {}, "soft": {}, "judged": 0, "tokens": [], "requeued": 0}
     survivors = []
     dex_slots = DEX_BUDGET
+    dex_degraded = False  # track DexScreener health
+    free_passers = []  # tokens that passed free checks (for circuit breaker)
     
     # Use shared GT rate limiter (default to global singleton)
     if gt_limiter is None:
@@ -88,7 +90,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             row["soft_scores"] = soft_scores
         stats["tokens"].append(row)
 
-    ids = universe(limiter=gt_limiter)           # fresh + trending pools, budget-aware
+    ids, gt_txns_cache = universe(limiter=gt_limiter)           # fresh + trending pools, budget-aware
     book.expire_defer()                          # drop rows past max age
     due = book.defer_due()                       # ids ready for rescoring
     seen_ids = set()
@@ -161,20 +163,45 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                  t.get("mcap_usd"))
         book.forget_defer(t["tid"])
         log.info("defer outcome tid=%s reason=pass", t["tid"])
+        
+        # Track free passers for circuit breaker
+        free_passers.append(t)
 
         if dex_slots <= 0 or gt_limiter.available() <= 0:
             break                                # out of budget, not out of ideas
 
-        t |= trade_counts(t)                     # pass two: one DexScreener call
+        # Call trade_counts with new signature and GT fallback cache
+        trade_data, dex_status = trade_counts(t, gt_txns_cache=gt_txns_cache)
+        t.update(trade_data)
+        t["dex_status"] = dex_status
+        t["trades_source"] = "dex" if dex_status == "ok" else ("gt" if dex_status == "gt_fallback" else "none")
         dex_slots -= 1
+        
         if (k := trade_kill(t)):
-            # Log trade kill with ticker, age, and tid for visibility
-            log.info("trade tid=%s ticker=%s reason=%s age_minutes=%s",
-                     t["tid"], t.get("ticker", "?"), k, t.get("age_minutes"))
+            # Special handling for dex_error: requeue instead of bench
+            if k == "dex_error":
+                log.warning("trade tid=%s ticker=%s reason=%s age_minutes=%s trades_source=%s (DexScreener error, requeueing)",
+                            t["tid"], t.get("ticker", "?"), k, t.get("age_minutes"), t.get("trades_source", "none"))
+                now = time.time()
+                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                book.defer(t["tid"], now + 60, drop_at)  # requeue after 1 min, no bench
+                stats["requeued"] += 1
+                log.info("defer outcome tid=%s reason=%s", t["tid"], k)
+                book.forget_defer(t["tid"])
+                record(t, "trade", k)
+                continue
+            
+            # Log trade kill with ticker, age, and source
+            log.info("trade tid=%s ticker=%s reason=%s age_minutes=%s dex_status=%s trades_source=%s",
+                     t["tid"], t.get("ticker", "?"), k, t.get("age_minutes"), dex_status, t.get("trades_source", "none"))
             book.sit(t["tid"], k)
             log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])
             stats["trade"][k] = stats["trade"].get(k, 0) + 1
+            # Track fallback usage in stats
+            if t.get("trades_source") == "gt":
+                stats.setdefault("gt_fallback_count", 0)
+                stats["gt_fallback_count"] += 1
             record(t, "trade", k)
             continue
 
@@ -205,8 +232,20 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                      t["ticker"], t.get("age_minutes", 0), e)
             
             # Young tokens get one in-cycle retry after waiting for rate limit recovery
-            # The wait now happens inside dossier() before spending a slot
+            # Only retry if window is not saturated (429 backoff may not fit this cycle)
             if is_young:
+                # Check if we're in a 429 backoff period that won't fit this cycle
+                now = time.time()
+                if gt_limiter.saturated and gt_limiter.backoff_until > now:
+                    wait_needed = gt_limiter.backoff_until - now
+                    log.info("young token %s (age %.1fm) hit 429, backoff %.1fs too long for in-cycle retry, deferring", 
+                             t["ticker"], t.get("age_minutes", 0), wait_needed)
+                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                    book.defer(t["tid"], now, drop_at)
+                    stats["requeued"] += 1
+                    record(t, "chain", "requeued_429_backoff")
+                    continue
+                
                 log.info("young token %s (age %.1fm) hit 429, will retry in-cycle after backoff", 
                          t["ticker"], t.get("age_minutes", 0))
                 try:
@@ -309,6 +348,31 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
 
         record(d, "judged", None)
         survivors.append((d, ans))
+    
+    # Circuit breaker: check if all free passers got empty DexScreener responses
+    if free_passers:
+        empty_count = sum(1 for t in free_passers if t.get("dex_status") == "empty")
+        
+        # Trigger canary check if all free-passers are empty OR >=3 consecutive empties
+        if empty_count >= len(free_passers) or empty_count >= 3:
+            log.warning("DexScreener circuit breaker triggered: %d/%d free passers got empty responses",
+                        empty_count, len(free_passers))
+            
+            # Make canary call for the most common network in free_passers
+            nets = [t.get("net") for t in free_passers if t.get("net")]
+            canary_net = max(set(nets), key=nets.count) if nets else 1399811149
+            
+            canary_healthy = collect.dex_canary_check(canary_net)
+            
+            if not canary_healthy:
+                dex_degraded = True
+                log.warning("DexScreener DEGRADED: canary failed for net %s, "
+                            "no_pair/empty kills this cycle are suspect", canary_net)
+                stats["dex_degraded"] = True
+            else:
+                log.info("DexScreener canary healthy for net %s, empty responses are genuine", 
+                         canary_net)
+                stats["dex_degraded"] = False
 
     log.info("cycle: %(seen)s seen, %(benched)s benched, free %(free)s, "
              "trade %(trade)s, chain %(chain)s, soft %(soft)s, judged %(judged)s, requeued %(requeued)s", stats)

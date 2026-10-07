@@ -165,6 +165,7 @@ class Desk:
                 "outcome": outcome,
                 "error": error,
                 "fomo_error": stats.get("fomo_error"),  # Track FomoAuthError
+                "dex_degraded": stats.get("dex_degraded", False),  # Track DexScreener health
             },
             "tokens": tokens,
             "held": [book.held()] if book.held() else [],

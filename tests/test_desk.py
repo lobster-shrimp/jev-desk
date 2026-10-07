@@ -707,10 +707,10 @@ class FakeDesk:
 def test_run_once_shadow_never_takes_book(monkeypatch):
     book.release()
     ids = [f"Addr{i}:1399811149" for i in range(12)]
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {
-        "buys_h1": 540, "sells_h1": 0 if t["ticker"] == NO_SELL else 120,
-        "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000})
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: (
+        {"buys_h1": 540, "sells_h1": 0 if t["ticker"] == NO_SELL else 120,
+        "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", lambda t, limiter=None: {
         **t, "chain": "solana", "top_10_percent": 30,
         "top_wallet_percent": 0.2 if t["ticker"] == WHALE else 0.02,
@@ -742,7 +742,7 @@ def test_run_once_shadow_never_takes_book(monkeypatch):
 def test_held_position_means_no_scan(monkeypatch):
     book.take({"token": {"ticker": "HELD", "address": "a", "network_id": 56}})
     called = []
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: called.append(1) or [])
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (called.append(1) or [], {}))
     order, stats = shift.run_once(FakeFomo(), JUDGE, FakeDesk(), 1000.0)
     assert order is None and stats["held"] == "HELD" and not called
     book.release()
@@ -981,15 +981,15 @@ def test_run_once_records_tokens(monkeypatch):
     
     ids = [f"UniqueAddr{i}_{unique_suffix}:1399811149" for i in range(5)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist)
     
     # Monkeypatch book.benched to ensure tokens aren't skipped
     monkeypatch.setattr(book, "benched", lambda tid: False)
     
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {
-        "buys_h1": 540, "sells_h1": 120,
-        "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000})
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: (
+        {"buys_h1": 540, "sells_h1": 120,
+        "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", lambda t, limiter=None: {
         **t, "chain": "solana", "top_10_percent": 30,
         "top_wallet_percent": 0.02, "developer_holding_percentage": 2,
@@ -1300,7 +1300,7 @@ def test_free_kill_logs_fomo_metrics(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="LogTestAddr1", age_minutes=42, liquidity_usd=5000,
                     volume_h24=20000, mcap_usd=100000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_low_liq)
     
     desk = FakeDesk()
@@ -1334,12 +1334,12 @@ def test_free_pass_logs_fomo_metrics(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="PassTestAddr1", age_minutes=42, liquidity_usd=50000,
                     volume_h24=100000, mcap_usd=500000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_pass)
     # Make it fail at trade stage so we can see the free pass log
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 0, "sells_h1": 0, 
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 0, "sells_h1": 0, 
                                                             "buys_h6": 0, "sells_h6": 0, 
-                                                            "trades_h24": 0})
+                                                            "trades_h24": 0}, 'ok'))
     
     desk = FakeDesk()
     caplog.clear()
@@ -1372,7 +1372,7 @@ def test_free_kill_logs_none_values(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="NoneTestAddr1", age_minutes=42, liquidity_usd=None,
                     volume_h24=None, mcap_usd=None)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_none)
     
     desk = FakeDesk()
@@ -1635,11 +1635,11 @@ def test_run_once_requeues_on_dossier_retry(monkeypatch, caplog):
     def fake_dossier_429(t, limiter=None):
         raise collect.DossierRetryNeeded(f"GT 429 for {t['ticker']}")
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_429)
     
     desk = FakeDesk()
@@ -1680,9 +1680,9 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None: [tid])
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_cycle1)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_cycle1)
     
     desk = FakeDesk()
@@ -1754,9 +1754,9 @@ def test_limiter_prioritizes_dossier_over_universe(monkeypatch, caplog):
         return tokens
     
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_prio)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     
     desk = FakeDesk()
     caplog.clear()
@@ -1789,7 +1789,7 @@ def test_defer_young_token_not_benched(monkeypatch):
         t = tok(0, tid=tid, addr="DeferAddr1", age_minutes=2, liquidity_usd=50000)
         return [t]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     
     desk = FakeDesk()
@@ -1848,7 +1848,7 @@ def test_old_token_benched_not_deferred(monkeypatch):
     def fake_shortlist_old(fomo, id_list):
         return [tok(0, tid=tid, addr="OldAddr1", age_minutes=80 * 60)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_old)
     
     desk = FakeDesk()
@@ -1879,7 +1879,7 @@ def test_judge_not_called_for_young_token(monkeypatch):
         judge_calls.append((question_set, state))
         return JUDGE(question_set, state)
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     
     desk = FakeDesk()
@@ -1933,7 +1933,7 @@ def test_defer_cap_200(monkeypatch, caplog):
     def fake_shortlist_cap(fomo, id_list):
         return [tok(0, tid=new_tid, addr=f"CapAddr{book.DEFER_CAP}", age_minutes=5)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_cap)
     
     desk = FakeDesk()
@@ -1961,7 +1961,7 @@ def test_defer_gate_below_threshold(monkeypatch, caplog):
         # $8k liquidity, below the $12k threshold
         return [tok(0, tid=tid, addr="BelowGateAddr1", age_minutes=5, liquidity_usd=8000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_below_gate)
     
     desk = FakeDesk()
@@ -1992,7 +1992,7 @@ def test_defer_gate_at_threshold(monkeypatch, caplog):
         # Exactly $12k liquidity, at the threshold
         return [tok(0, tid=tid, addr="AtGateAddr1", age_minutes=5, liquidity_usd=12000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_at_gate)
     
     desk = FakeDesk()
@@ -2023,7 +2023,7 @@ def test_defer_gate_null_liquidity(monkeypatch, caplog):
         # liquidity_usd is None
         return [tok(0, tid=tid, addr="NullLiqAddr1", age_minutes=5, liquidity_usd=None)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_null_liq)
     
     desk = FakeDesk()
@@ -2262,11 +2262,11 @@ def test_end_to_end_authority_no_strings_pass(monkeypatch):
                 "freeze_authority": freeze_norm, "freeze_authority_raw": freeze_raw,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_no_no)
     
     desk = FakeDesk()
@@ -2315,11 +2315,11 @@ def test_soft_kill_logs_noul_and_records_in_state(monkeypatch, caplog):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None, "net": 1399811149}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier)
     
     desk = FakeDesk()
@@ -2380,11 +2380,11 @@ def test_end_to_end_authority_yes_kills(monkeypatch):
                 "freeze_authority": freeze_norm, "freeze_authority_raw": freeze_raw,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", fake_dossier_yes)
     
     desk = FakeDesk()
@@ -2425,7 +2425,7 @@ def test_fomo_502_after_retries_does_not_crash_cycle(monkeypatch, caplog):
             # This will now return {} instead of raising
             return fomo._filter_tokens(ids)
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     
     desk = FakeDesk()
     caplog.clear()
@@ -2482,12 +2482,12 @@ def test_fomo_partial_502_continues_with_partial_data(monkeypatch):
     monkeypatch.setattr(Fomo, "_filter_tokens", mock_filter_tokens)
     
     ids = [f"Addr{i}:1399811149" for i in range(25)]
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     
     # Make tokens pass through to judging
-    monkeypatch.setattr(shift, "trade_counts", lambda t: {"buys_h1": 540, "sells_h1": 120,
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
-                                                            "trades_h24": 4000})
+                                                            "trades_h24": 4000}, 'ok'))
     monkeypatch.setattr(shift, "dossier", lambda t, limiter=None: {
         **t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
         "developer_holding_percentage": 2, "gt_score_details": None, 
@@ -3235,10 +3235,10 @@ def test_trade_kill_logs_ticker_and_age(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="TradeKillAddr1", ticker="LOWTR", age_minutes=35,
                     liquidity_usd=50000, volume_h24=100000, mcap_usd=500000)]
     
-    def fake_trade_counts(t):
-        return {"buys_h1": 10, "sells_h1": 2, "buys_h6": 20, "sells_h6": 5, "trades_h24": 50}
+    def fake_trade_counts(t, gt_txns_cache=None):
+        return {"buys_h1": 10, "sells_h1": 2, "buys_h6": 20, "sells_h6": 5, "trades_h24": 50}, 'ok'
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_trade)
     monkeypatch.setattr(shift, "trade_counts", fake_trade_counts)
     
@@ -3275,15 +3275,15 @@ def test_chain_kill_logs_ticker_and_age(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="ChainKillAddr1", ticker="TOPWL", age_minutes=45,
                     liquidity_usd=50000, volume_h24=100000, mcap_usd=500000)]
     
-    def fake_trade_counts(t):
-        return {"buys_h1": 100, "sells_h1": 50, "buys_h6": 500, "sells_h6": 200, "trades_h24": 2000}
+    def fake_trade_counts(t, gt_txns_cache=None):
+        return {"buys_h1": 100, "sells_h1": 50, "buys_h6": 500, "sells_h6": 200, "trades_h24": 2000}, 'ok'
     
     def fake_dossier_top_wallet(t, limiter=None):
         # Token with excessive top wallet concentration
         return {**t, "chain": "solana", "top_wallet_percent": 0.15, "top_10_percent": 40,
                 "holder_count": 200, "mint_authority": False, "freeze_authority": False}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_chain)
     monkeypatch.setattr(shift, "trade_counts", fake_trade_counts)
     monkeypatch.setattr(shift, "dossier", fake_dossier_top_wallet)
@@ -3321,15 +3321,15 @@ def test_chain_kill_logs_young_token_top_10(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="YoungTop10", ticker="CATCRAFT", age_minutes=30,
                     liquidity_usd=50000, volume_h24=100000, mcap_usd=500000)]
     
-    def fake_trade_counts(t):
-        return {"buys_h1": 100, "sells_h1": 50, "buys_h6": 500, "sells_h6": 200, "trades_h24": 2000}
+    def fake_trade_counts(t, gt_txns_cache=None):
+        return {"buys_h1": 100, "sells_h1": 50, "buys_h6": 500, "sells_h6": 200, "trades_h24": 2000}, 'ok'
     
     def fake_dossier_top10(t, limiter=None):
         # Token with excessive top 10 concentration
         return {**t, "chain": "solana", "top_wallet_percent": 0.03, "top_10_percent": 70,
                 "holder_count": 200, "mint_authority": False, "freeze_authority": False}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     monkeypatch.setattr(shift, "trade_counts", fake_trade_counts)
     monkeypatch.setattr(shift, "dossier", fake_dossier_top10)
@@ -3385,8 +3385,8 @@ def test_gt_rate_limiter_record_429_default_backoff():
     # Record 429 without Retry-After
     limiter.record_429(retry_after_sec=None)
     
-    # Should use 5s default
-    assert limiter.backoff_until == 1005.0, f"Expected backoff_until=1005.0, got {limiter.backoff_until}"
+    # Should use floor backoff (25s default)
+    assert limiter.backoff_until == 1025.0, f"Expected backoff_until=1025.0 (floor backoff), got {limiter.backoff_until}"
 
 
 def test_gt_rate_limiter_wait_if_needed_enforces_429_backoff():
@@ -3808,4 +3808,432 @@ def test_dossier_waits_before_spending_on_retry():
     finally:
         time_module.sleep = original_sleep
         requests.get = original_get
+
+
+# ---- BUG 1: GT 429 retry with 0s Retry-After floor backoff -------------------
+def test_gt_429_retry_after_zero_applies_floor_backoff():
+    """GT 429 with Retry-After: 0 should apply floor backoff (25s default), not 0s."""
+    limiter = collect.GTRateLimiter(calls_per_min=8, backoff_floor_sec=25.0, time_fn=lambda: 1000.0)
+    
+    # Record 429 with Retry-After=0
+    limiter.record_429(0.0)
+    
+    # Should apply floor backoff, not 0
+    assert limiter.backoff_until == 1025.0, f"Expected backoff_until=1025.0, got {limiter.backoff_until}"
+    assert limiter.consecutive_429s == 1
+    assert limiter.saturated is True
+
+
+def test_gt_429_missing_retry_after_applies_floor_backoff():
+    """GT 429 with missing Retry-After should apply floor backoff."""
+    limiter = collect.GTRateLimiter(calls_per_min=8, backoff_floor_sec=25.0, time_fn=lambda: 1000.0)
+    
+    # Record 429 with None (missing Retry-After)
+    limiter.record_429(None)
+    
+    # Should apply floor backoff
+    assert limiter.backoff_until == 1025.0
+    assert limiter.consecutive_429s == 1
+    assert limiter.saturated is True
+
+
+def test_gt_429_consecutive_grows_backoff():
+    """Consecutive 429s should grow backoff: floor * (1.5^(n-1)), capped at max."""
+    now = [1000.0]
+    limiter = collect.GTRateLimiter(calls_per_min=8, backoff_floor_sec=20.0, 
+                                    backoff_max_sec=120.0, time_fn=lambda: now[0])
+    
+    # First 429: floor = 20s
+    limiter.record_429(0.0)
+    assert limiter.backoff_until == 1020.0
+    assert limiter.consecutive_429s == 1
+    
+    # Second 429: floor * 1.5 = 30s
+    now[0] = 1020.0
+    limiter.record_429(0.0)
+    assert limiter.backoff_until == 1050.0  # 1020 + 30
+    assert limiter.consecutive_429s == 2
+    
+    # Third 429: floor * 1.5^2 = 45s
+    now[0] = 1050.0
+    limiter.record_429(0.0)
+    assert limiter.backoff_until == 1095.0  # 1050 + 45
+    assert limiter.consecutive_429s == 3
+    
+    # Fourth 429: floor * 1.5^3 = 67.5s
+    now[0] = 1095.0
+    limiter.record_429(0.0)
+    assert limiter.backoff_until == 1162.5  # 1095 + 67.5
+    
+    # Fifth 429: floor * 1.5^4 = 101.25s, within cap
+    now[0] = 1162.5
+    limiter.record_429(0.0)
+    assert limiter.backoff_until == 1263.75  # 1162.5 + 101.25
+    
+    # Sixth 429: floor * 1.5^5 = 151.875s, capped at 120s
+    now[0] = 1263.75
+    limiter.record_429(0.0)
+    assert limiter.backoff_until == 1383.75  # 1263.75 + 120 (capped)
+
+
+def test_gt_429_saturated_cleared_on_success():
+    """Successful GT call should clear saturated flag and reset consecutive_429s."""
+    limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=lambda: 1000.0)
+    
+    # Trigger 429
+    limiter.record_429(0.0)
+    assert limiter.saturated is True
+    assert limiter.consecutive_429s == 1
+    
+    # Success should clear
+    limiter.record_success()
+    assert limiter.saturated is False
+    assert limiter.consecutive_429s == 0
+
+
+def test_gt_wait_before_spend_not_spend_then_wait():
+    """Universe scan should wait-before-spend to avoid post-backoff burst."""
+    now = [1000.0]
+    sleep_calls = []
+    original_sleep = time.sleep
+    time.sleep = lambda x: sleep_calls.append(x)
+    
+    try:
+        limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=lambda: now[0])
+        
+        # Fill budget
+        for i in range(8):
+            limiter.calls.append(now[0])
+        
+        # Try to spend another - should wait for window to expire
+        now[0] = 1030.0  # 30s later, oldest call still in window
+        
+        result = limiter.spend(1, priority=False)
+        
+        # Old behavior: spend would fail silently (return False)
+        # New behavior: wait_if_needed() must be called first by caller
+        # Since we're testing spend alone, it should return False (budget full)
+        assert result is False
+        
+    finally:
+        time.sleep = original_sleep
+
+
+# ---- BUG 2: DexScreener failures as no_pair kills ----------------------------
+def test_trade_counts_distinguishes_error_from_empty():
+    """trade_counts should return 'error' for HTTP errors, 'empty' for no pairs."""
+    original_get = requests.get
+    
+    try:
+        # HTTP 500 error
+        mock_500 = Mock()
+        mock_500.status_code = 500
+        requests.get = Mock(return_value=mock_500)
+        
+        token = {"addr": "test", "ticker": "TEST"}
+        data, status = collect.trade_counts(token)
+        assert status == "error"
+        assert data["trades_h24"] is None
+        
+        # HTTP 200 with empty pairs array
+        mock_200_empty = Mock()
+        mock_200_empty.status_code = 200
+        mock_200_empty.json.return_value = {"pairs": []}
+        requests.get = Mock(return_value=mock_200_empty)
+        
+        data, status = collect.trade_counts(token)
+        assert status == "empty"
+        assert data["trades_h24"] is None
+        
+        # HTTP 200 with null pairs
+        mock_200_null = Mock()
+        mock_200_null.status_code = 200
+        mock_200_null.json.return_value = {"pairs": None}
+        requests.get = Mock(return_value=mock_200_null)
+        
+        data, status = collect.trade_counts(token)
+        assert status == "error"  # null pairs is an error, not empty
+        
+        # Network error
+        requests.get = Mock(side_effect=requests.exceptions.ConnectionError("Network error"))
+        data, status = collect.trade_counts(token)
+        assert status == "error"
+        
+    finally:
+        requests.get = original_get
+
+
+def test_trade_counts_ok_status_with_pairs():
+    """trade_counts should return 'ok' when pairs data is present."""
+    original_get = requests.get
+    
+    try:
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "pairs": [{
+                "liquidity": {"usd": 50000},
+                "txns": {
+                    "h1": {"buys": 10, "sells": 8},
+                    "h6": {"buys": 50, "sells": 45},
+                    "h24": {"buys": 200, "sells": 180}
+                }
+            }]
+        }
+        requests.get = Mock(return_value=mock_resp)
+        
+        token = {"addr": "test", "ticker": "TEST"}
+        data, status = collect.trade_counts(token)
+        
+        assert status == "ok"
+        assert data["trades_h24"] == 380
+        assert data["buys_h1"] == 10
+        assert data["sells_h1"] == 8
+        
+    finally:
+        requests.get = original_get
+
+
+def test_dex_canary_check_healthy():
+    """Canary check should return True when known liquid token has pairs."""
+    original_get = requests.get
+    
+    try:
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "pairs": [{"liquidity": {"usd": 1000000}}]
+        }
+        requests.get = Mock(return_value=mock_resp)
+        
+        healthy = collect.dex_canary_check(1399811149)  # Solana
+        assert healthy is True
+        
+    finally:
+        requests.get = original_get
+
+
+def test_dex_canary_check_degraded():
+    """Canary check should return False when known liquid token has no pairs."""
+    original_get = requests.get
+    
+    try:
+        # Empty pairs array
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"pairs": []}
+        requests.get = Mock(return_value=mock_resp)
+        
+        healthy = collect.dex_canary_check(1399811149)
+        assert healthy is False
+        
+        # HTTP error
+        mock_resp.status_code = 500
+        requests.get = Mock(return_value=mock_resp)
+        
+        healthy = collect.dex_canary_check(1399811149)
+        assert healthy is False
+        
+    finally:
+        requests.get = original_get
+
+
+def test_filter_trade_kill_dex_error_reason():
+    """trade_kill should return 'dex_error' for error status, not 'no_pair'."""
+    # Error status
+    token_error = {
+        "dex_status": "error",
+        "trades_h24": None,
+        "buys_h1": None,
+        "sells_h1": None
+    }
+    assert trade_kill(token_error) == "dex_error"
+    
+    # Empty status (genuine no pair)
+    token_empty = {
+        "dex_status": "empty",
+        "trades_h24": None,
+        "buys_h1": None,
+        "sells_h1": None
+    }
+    assert trade_kill(token_empty) == "no_pair"
+    
+    # OK status with data
+    token_ok = {
+        "dex_status": "ok",
+        "trades_h24": 200,
+        "buys_h1": 10,
+        "sells_h1": 8
+    }
+    assert trade_kill(token_ok) is None  # pass
+
+
+def test_no_pair_bench_time():
+    """no_pair should have short bench time (12 min) in BENCH_MINUTES."""
+    assert book.BENCH_MINUTES.get("no_pair") == 12
+
+
+# ---- GT fallback for DexScreener degradation ----------------------------------
+def test_trade_counts_gt_fallback_on_dex_error():
+    """trade_counts should use GT fallback when DexScreener errors."""
+    original_get = requests.get
+    
+    try:
+        # DexScreener errors
+        mock_500 = Mock()
+        mock_500.status_code = 500
+        requests.get = Mock(return_value=mock_500)
+        
+        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149"}
+        gt_cache = {
+            "test:1399811149": {
+                "h1": {"buys": 10, "sells": 5},
+                "h6": {"buys": 50, "sells": 25},
+                "h24": {"buys": 200, "sells": 100}
+            }
+        }
+        
+        data, status = collect.trade_counts(token, gt_txns_cache=gt_cache)
+        assert status == "gt_fallback"
+        assert data["trades_h24"] == 300
+        assert data["buys_h1"] == 10
+        assert data["sells_h6"] == 25
+        
+    finally:
+        requests.get = original_get
+
+
+def test_trade_counts_gt_fallback_on_dex_null_pairs():
+    """trade_counts should use GT fallback when DexScreener returns null pairs."""
+    original_get = requests.get
+    
+    try:
+        # DexScreener returns null pairs (degradation like BONK case)
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"pairs": None}
+        requests.get = Mock(return_value=mock_resp)
+        
+        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149"}
+        gt_cache = {
+            "test:1399811149": {
+                "h1": {"buys": 15, "sells": 8},
+                "h6": {"buys": 60, "sells": 30},
+                "h24": {"buys": 250, "sells": 120}
+            }
+        }
+        
+        data, status = collect.trade_counts(token, gt_txns_cache=gt_cache)
+        assert status == "gt_fallback"
+        assert data["trades_h24"] == 370
+        
+    finally:
+        requests.get = original_get
+
+
+def test_trade_counts_gt_fallback_on_dex_empty_with_gt_data():
+    """trade_counts should use GT fallback when Dex returns empty pairs but GT has data."""
+    original_get = requests.get
+    
+    try:
+        # DexScreener returns empty pairs
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"pairs": []}
+        requests.get = Mock(return_value=mock_resp)
+        
+        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149"}
+        gt_cache = {
+            "test:1399811149": {
+                "h1": {"buys": 20, "sells": 10},
+                "h6": {"buys": 80, "sells": 40},
+                "h24": {"buys": 300, "sells": 150}
+            }
+        }
+        
+        data, status = collect.trade_counts(token, gt_txns_cache=gt_cache)
+        assert status == "gt_fallback"
+        assert data["trades_h24"] == 450
+        
+    finally:
+        requests.get = original_get
+
+
+def test_trade_counts_empty_when_no_gt_fallback():
+    """trade_counts should return empty when Dex errors and no GT data available."""
+    original_get = requests.get
+    
+    try:
+        mock_500 = Mock()
+        mock_500.status_code = 500
+        requests.get = Mock(return_value=mock_500)
+        
+        token = {"addr": "test", "ticker": "TEST", "tid": "test:1399811149"}
+        # No GT cache
+        data, status = collect.trade_counts(token, gt_txns_cache={})
+        assert status == "error"
+        assert data["trades_h24"] is None
+        
+    finally:
+        requests.get = original_get
+
+
+def test_universe_returns_gt_txns_cache():
+    """universe() should return tuple (ids, gt_txns_cache) with transaction data."""
+    original_get = requests.get
+    
+    try:
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "data": [{
+                "relationships": {
+                    "base_token": {
+                        "data": {"id": "solana_TestAddr1"}
+                    }
+                },
+                "attributes": {
+                    "transactions": {
+                        "h1": {"buys": 10, "sells": 5},
+                        "h6": {"buys": 50, "sells": 25},
+                        "h24": {"buys": 200, "sells": 100}
+                    }
+                }
+            }]
+        }
+        requests.get = Mock(return_value=mock_resp)
+        
+        limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=lambda: 1000.0)
+        ids, gt_cache = collect.universe(nets=("solana",), pages=1, include_trending=False, limiter=limiter)
+        
+        assert len(ids) == 1
+        assert "TestAddr1:1399811149" in ids
+        assert "TestAddr1:1399811149" in gt_cache
+        assert gt_cache["TestAddr1:1399811149"]["h24"]["buys"] == 200
+        assert gt_cache["TestAddr1:1399811149"]["h1"]["sells"] == 5
+        
+    finally:
+        requests.get = original_get
+
+
+def test_filter_trade_kill_gt_fallback_treated_as_ok():
+    """trade_kill should treat gt_fallback status like ok (has data), not error."""
+    # GT fallback with good data should pass
+    token_gt = {
+        "dex_status": "gt_fallback",
+        "trades_h24": 300,
+        "buys_h1": 20,
+        "sells_h1": 10
+    }
+    assert trade_kill(token_gt) is None  # pass
+    
+    # GT fallback with too few trades should kill
+    token_low = {
+        "dex_status": "gt_fallback",
+        "trades_h24": 50,  # below min_trades_h24=150
+        "buys_h1": 5,
+        "sells_h1": 2
+    }
+    assert trade_kill(token_low) == "trades"
+
 
