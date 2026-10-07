@@ -50,11 +50,12 @@ def trade_kill(t) -> str | None:
     if dex_status == "error":
         return "dex_error"
     
-    # GT fallback is treated like ok (has data from GT), not like error
-    # Empty pairs: short bench (suspect if FOMO shows liq/vol but sources are empty)
-    if (dex_status == "empty" or t["trades_h24"] is None) and dex_status != "gt_fallback":
+    # None trades_h24 = no data available, treat as no_pair regardless of status
+    # (handles cases where GT fallback has no data, or other edge cases)
+    if t["trades_h24"] is None:
         return "no_pair"
     
+    # Now we have a real number for trades_h24
     if t["trades_h24"] < HARD["min_trades_h24"]:
         return "trades"
     
