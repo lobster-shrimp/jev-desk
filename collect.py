@@ -27,6 +27,8 @@ class GTRateLimiter:
     fewer than N calls have been made in the last 60s. Prioritizes dossier
     calls over universe pagination via reservation.
     
+    Also tracks 429 responses and enforces backoff based on Retry-After header.
+    
     Shared across the entire process, not per-cycle."""
     
     def __init__(self, calls_per_min: int = 8, window_sec: float = 60.0, time_fn=None):
@@ -35,6 +37,7 @@ class GTRateLimiter:
         self.time_fn = time_fn or time.time
         self.calls = deque()  # timestamps of calls in the window
         self.reserved = 0     # slots reserved for dossiers
+        self.backoff_until = 0.0  # timestamp until which we must wait due to 429
     
     def available(self) -> int:
         """How many GT calls can be made without waiting."""
@@ -48,14 +51,38 @@ class GTRateLimiter:
         while self.calls and self.calls[0] < cutoff:
             self.calls.popleft()
     
+    def record_429(self, retry_after_sec: float | None = None):
+        """Record a 429 response and set backoff period.
+        
+        Args:
+            retry_after_sec: Value from Retry-After header, or None to use default (5s)
+        """
+        now = self.time_fn()
+        backoff_duration = retry_after_sec if retry_after_sec is not None else 5.0
+        self.backoff_until = now + backoff_duration
+        log.info("GT 429 received, backing off for %.1fs until %s", 
+                 backoff_duration, 
+                 time.strftime("%H:%M:%S", time.localtime(self.backoff_until)))
+    
     def wait_if_needed(self, priority: bool = False):
         """Block until a call can be made within rate limits.
         
         If priority=True (dossier), can use reserved slots.
         If priority=False (universe), cannot use reserved slots.
-        Returns immediately if a slot is available."""
-        self._expire_old_calls()
+        
+        Also waits out any 429 backoff period before checking rate limits.
+        Returns immediately if a slot is available and no backoff is active."""
         now = self.time_fn()
+        
+        # First, wait out any 429 backoff period
+        if self.backoff_until > now:
+            wait_sec = self.backoff_until - now
+            log.info("GT 429 backoff: waiting %.1fs before retry", wait_sec)
+            time.sleep(wait_sec)
+            now = self.time_fn()
+        
+        # Then check rolling window rate limits
+        self._expire_old_calls()
         
         # Determine effective limit based on priority
         effective_limit = self.calls_per_min if priority else (self.calls_per_min - self.reserved)
@@ -341,7 +368,7 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     """One GT call per token. Fills what the chain actually has, null where it does not.
     
     If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
-    On GT 429, raises DossierRetryNeeded (caller should requeue for next cycle)."""
+    On GT 429, records the backoff with the limiter and raises DossierRetryNeeded."""
     if limiter:
         if not limiter.spend(1, priority=True):
             log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
@@ -351,6 +378,20 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     net = GT_NET[t["net"]]
     resp = requests.get(f"{GT}/networks/{net}/tokens/{t['addr']}/info", headers=UA, timeout=20)
     if resp.status_code == 429:
+        # Extract Retry-After header if present
+        retry_after_sec = None
+        if hasattr(resp, 'headers') and resp.headers:
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after and isinstance(retry_after, (str, int, float)):
+                try:
+                    retry_after_sec = float(retry_after)
+                except (ValueError, TypeError):
+                    retry_after_sec = None
+        
+        # Record the 429 with the limiter so it enforces backoff
+        if limiter:
+            limiter.record_429(retry_after_sec)
+        
         log.warning("GeckoTerminal 429 on dossier for %s, will retry next cycle", t["ticker"])
         raise DossierRetryNeeded(f"GT 429 for {t['ticker']}")
     
