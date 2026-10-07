@@ -587,6 +587,118 @@ def test_chain_preserved_in_close_record():
     assert closes[0]["chain"] == "bsc"
 
 
+def test_volume_surge_does_not_close():
+    """Test that volume surges do NOT trigger an exit (volume exit removed)."""
+    order = {
+        "token": {"ticker": "SURGE", "address": "surge123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order, {"price": 0.0001, "vol24": 100_000})
+    
+    # Mark with volume surge (100k -> 1M)
+    result = shadow_ledger.mark("surge123", 56, current_price=0.00012, volume_h24=1_000_000)
+    
+    # Should stay open (no volume exit)
+    assert result["action"] == "mark"
+    assert not result.get("stale")
+    
+    # Position still open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 1
+
+
+def test_volume_collapse_does_not_close():
+    """Test that volume collapses do NOT trigger an exit (volume exit removed)."""
+    order = {
+        "token": {"ticker": "COLLAPSE", "address": "collapse123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    shadow_ledger.entry(order, {"price": 0.0001, "vol24": 1_000_000})
+    
+    # Mark with volume collapse (1M -> 100k)
+    result = shadow_ledger.mark("collapse123", 56, current_price=0.00012, volume_h24=100_000)
+    
+    # Should stay open (no volume exit)
+    assert result["action"] == "mark"
+    assert not result.get("stale")
+    
+    # Position still open
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 1
+
+
+def test_stale_position_time_stop_with_last_mark():
+    """Test that stale position hits time stop at last good mark."""
+    order = {
+        "token": {"ticker": "STALE", "address": "stale123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    
+    # Entry at T=0
+    with mock.patch("time.time", return_value=1000.0):
+        shadow_ledger.entry(order, {"price": 0.0001})
+    
+    # Mark with good price at T=1h
+    with mock.patch("time.time", return_value=1000.0 + 3600):
+        result = shadow_ledger.mark("stale123", 56, current_price=0.00012, volume_h24=500_000)
+        assert result["action"] == "mark"
+        assert result["current_price_usd"] == 0.00012
+    
+    # Mark with stale price at T=3h (stays open)
+    with mock.patch("time.time", return_value=1000.0 + 3 * 3600):
+        result = shadow_ledger.mark("stale123", 56, current_price=None)
+        assert result["action"] == "mark"
+        assert result.get("stale") is True
+        assert result["last_price_usd"] == 0.00012  # Preserved from last mark
+    
+    # Mark with stale price at T=6.1h (time stop fires)
+    with mock.patch("time.time", return_value=1000.0 + 6.1 * 3600):
+        result = shadow_ledger.mark("stale123", 56, current_price=None)
+        assert result["action"] == "close"
+        assert "time_stop_6.1h_stale_mark" in result["reason"]
+        assert result["exit_price_usd"] == 0.00012  # Closed at last good mark
+        assert result.get("unmeasured") is False  # Had a good mark
+    
+    # Position closed
+    opens = shadow_ledger.open_positions()
+    assert len(opens) == 0
+
+
+def test_never_marked_position_excluded_from_totals():
+    """Test that never-marked position closed by time stop is excluded from PnL totals."""
+    order = {
+        "token": {"ticker": "NEVER", "address": "never123", "network_id": 56, "chain": "bsc"},
+        "size_factor": 1.0, "model": "jev-1.13.0"
+    }
+    
+    # Entry at T=0, never mark with good price
+    with mock.patch("time.time", return_value=2000.0):
+        shadow_ledger.entry(order, {"price": 0.0001})
+    
+    # Stale mark at T=3h
+    with mock.patch("time.time", return_value=2000.0 + 3 * 3600):
+        result = shadow_ledger.mark("never123", 56, current_price=None)
+        assert result["action"] == "mark"
+        assert result.get("stale") is True
+    
+    # Time stop at T=6.1h (never had good mark)
+    with mock.patch("time.time", return_value=2000.0 + 6.1 * 3600):
+        result = shadow_ledger.mark("never123", 56, current_price=None)
+        assert result["action"] == "close"
+        assert "time_stop" in result["reason"]
+        assert result.get("unmeasured") is True
+        assert result["realized_pnl_usd"] is None
+    
+    # Summary should exclude this from totals
+    summary = shadow_ledger.summary()
+    assert summary["closed_trades_count"] == 1
+    assert summary["measured_trades_count"] == 0
+    assert summary["unmeasured_trades"] == 1
+    assert summary["total_realized_pnl_usd"] == 0  # Excluded
+    assert summary["winning_trades"] == 0
+    assert summary["losing_trades"] == 0
+
+
 def test_csrf_protection_on_fomo_activate(monkeypatch):
     """Test that /api/fomo_activate rejects requests without custom header."""
     # Set required env vars before importing server

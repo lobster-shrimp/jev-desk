@@ -23,8 +23,9 @@ LEDGER_PATH = OUTBOX / "shadow_ledger.jsonl"
 SHADOW_TICKET_USD = 50.0
 
 # Exit rule from prompts/RISK.txt: close when volume.h6 / (volume.h24 / 4) < 0.20
-# FOMO provides vol24 but not vol_h6, so we track volume history to compute actual decay.
-EXIT_VOLUME_RATIO_THRESHOLD = 0.20
+# NOTE: RISK's h6 volume exit is NOT modelled in shadow because real h6 volume
+# isn't available from FOMO (only vol24), and computing it from rolling vol24 snapshots
+# is backwards (closes on surges, not collapses). Shadow uses time/price exits only.
 
 # Shadow ledger fallback exits (NOT trading thresholds, only for shadow tracking):
 # These are conservative defaults to ensure shadow positions eventually close.
@@ -56,7 +57,7 @@ def entry(order: dict, fomo_data: dict) -> dict:
     
     entry_record = {
         "action": "entry",
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time())),
         "ticker": token["ticker"],
         "address": token["address"],
         "network_id": token["network_id"],
@@ -77,17 +78,17 @@ def entry(order: dict, fomo_data: dict) -> dict:
     return entry_record
 
 
-def mark(address: str, network_id: int, current_price: float = None, volume_h24: float = None, 
-         volume_history: list = None) -> dict:
+def mark(address: str, network_id: int, current_price: float = None, volume_h24: float = None) -> dict:
     """
     Mark an open shadow position to market and check exit conditions.
+    Shadow exits: time stop (6h), stop-loss (-30%), take-profit (+100%).
+    RISK's h6 volume exit is NOT modelled (no real h6 data available).
     
     Args:
         address: Token address
         network_id: Network ID
-        current_price: Current price in USD (if None, position flagged as stale, stays open)
-        volume_h24: 24-hour volume (optional, for tracking volume history)
-        volume_history: List of recent volume snapshots for computing decay
+        current_price: Current price in USD (if None, position flagged as stale)
+        volume_h24: 24-hour volume (for tracking, not used for exits)
     
     Returns:
         Mark record dict, or close record if exit triggered
@@ -101,18 +102,35 @@ def mark(address: str, network_id: int, current_price: float = None, volume_h24:
     entry_price = pos["entry_price_usd"]
     entry_time = _parse_ts(pos["ts"])
     held_hours = (time.time() - entry_time) / 3600
+    last_price = pos.get("last_price_usd", entry_price)
     
-    # If no current price, flag as stale but keep open
+    # Check time stop FIRST (applies even to stale positions)
+    if held_hours >= SHADOW_MAX_HOLD_HOURS:
+        # Close at last good mark (or entry if never marked)
+        close_price = last_price if current_price is None else current_price
+        has_good_mark = pos.get("last_price_usd") is not None and pos.get("last_price_usd") != entry_price
+        
+        if current_price is None:
+            # Closing stale position at last good mark
+            reason = f"time_stop_{held_hours:.1f}h_stale_mark"
+            unmeasured = not has_good_mark  # Flag as unmeasured if never had a good mark
+        else:
+            reason = f"time_stop_{held_hours:.1f}h"
+            unmeasured = False
+        
+        return close(address, network_id, current_price=close_price, reason=reason, unmeasured=unmeasured)
+    
+    # If no current price, flag as stale and keep open (time stop didn't fire yet)
     if current_price is None or current_price <= 0:
         log.warning("shadow position %s has stale price, keeping open with last mark", pos["ticker"])
         mark_record = {
             "action": "mark",
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time())),
             "ticker": pos["ticker"],
             "address": address,
             "network_id": network_id,
             "stale": True,
-            "last_price_usd": pos.get("last_price_usd", entry_price),
+            "last_price_usd": last_price,
             "held_hours": held_hours,
         }
         _append(mark_record)
@@ -124,51 +142,25 @@ def mark(address: str, network_id: int, current_price: float = None, volume_h24:
     unrealized_pnl_usd = current_value_usd - pos["size_usd"]
     unrealized_pnl_pct = (current_price / entry_price - 1) * 100
     
-    # Check exit conditions (in order of priority)
+    # Check price-based exits (stop-loss, take-profit)
+    # Shadow ledger defaults, NOT trading thresholds
     should_exit = False
     exit_reason = None
     
-    # 1. Shadow ledger time stop (NOT a trading threshold)
-    if held_hours >= SHADOW_MAX_HOLD_HOURS:
-        should_exit = True
-        exit_reason = f"time_stop_{held_hours:.1f}h"
-    
-    # 2. Shadow ledger stop-loss (NOT a trading threshold)
-    elif unrealized_pnl_pct <= SHADOW_STOP_LOSS_PCT:
+    if unrealized_pnl_pct <= SHADOW_STOP_LOSS_PCT:
         should_exit = True
         exit_reason = f"stop_loss_{unrealized_pnl_pct:.1f}pct"
-    
-    # 3. Shadow ledger take-profit (NOT a trading threshold)
     elif unrealized_pnl_pct >= SHADOW_TAKE_PROFIT_PCT:
         should_exit = True
         exit_reason = f"take_profit_{unrealized_pnl_pct:.1f}pct"
     
-    # 4. Volume decay exit (RISK's rule, requires history)
-    elif volume_history and len(volume_history) >= 2:
-        # Compute 6-hour volume from recent history
-        now = time.time()
-        six_hours_ago = now - 6 * 3600
-        recent_volumes = [v for v in volume_history if v["ts"] >= six_hours_ago]
-        
-        if recent_volumes and volume_h24:
-            # Approximate h6 volume as sum of recent snapshots
-            # (This is a rough estimate; real RISK would have actual h6 data)
-            vol_h6_estimate = sum(v["vol24"] for v in recent_volumes) / len(recent_volumes) * 0.25
-            avg_h6 = volume_h24 / 4
-            
-            if avg_h6 > 0:
-                ratio = vol_h6_estimate / avg_h6
-                if ratio < EXIT_VOLUME_RATIO_THRESHOLD:
-                    should_exit = True
-                    exit_reason = f"volume_decay_{ratio:.3f}"
-    
     if should_exit:
-        return close(address, network_id, current_price=current_price, reason=exit_reason)
+        return close(address, network_id, current_price=current_price, reason=exit_reason, unmeasured=False)
     
     # Mark to market (stays open)
     mark_record = {
         "action": "mark",
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time())),
         "ticker": pos["ticker"],
         "address": address,
         "network_id": network_id,
@@ -184,15 +176,17 @@ def mark(address: str, network_id: int, current_price: float = None, volume_h24:
     return mark_record
 
 
-def close(address: str, network_id: int, current_price: float = None, reason: str = "exit_rule") -> dict:
+def close(address: str, network_id: int, current_price: float = None, reason: str = "exit_rule", 
+          unmeasured: bool = False) -> dict:
     """
     Close a shadow position and record realized PnL.
     
     Args:
         address: Token address
         network_id: Network ID
-        current_price: Exit price (if None, PnL is marked as stale/unmeasured)
-        reason: Why we're closing (exit_rule, stale_price, etc.)
+        current_price: Exit price (if None, PnL marked unmeasured)
+        reason: Why we're closing (time_stop_Xh, stop_loss_Xpct, etc.)
+        unmeasured: If True, PnL excluded from realized totals (never had good mark)
     
     Returns:
         Close record dict
@@ -204,11 +198,12 @@ def close(address: str, network_id: int, current_price: float = None, reason: st
         log.warning("attempted to close non-existent shadow position %s:%s", address, network_id)
         return None
     
-    if current_price is None or current_price <= 0:
-        # Stale data, mark PnL as unmeasured
+    if current_price is None or current_price <= 0 or unmeasured:
+        # Stale data or never had a good mark, PnL marked as unmeasured
+        size_tokens = pos["size_tokens"]
+        exit_value_usd = size_tokens * current_price if current_price else None
         realized_pnl_usd = None
         realized_pnl_pct = None
-        exit_value_usd = None
     else:
         size_tokens = pos["size_tokens"]
         exit_value_usd = size_tokens * current_price
@@ -217,7 +212,7 @@ def close(address: str, network_id: int, current_price: float = None, reason: st
     
     close_record = {
         "action": "close",
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time())),
         "ticker": pos["ticker"],
         "address": address,
         "network_id": network_id,
@@ -228,6 +223,7 @@ def close(address: str, network_id: int, current_price: float = None, reason: st
         "exit_value_usd": exit_value_usd,
         "realized_pnl_usd": realized_pnl_usd,
         "realized_pnl_pct": realized_pnl_pct,
+        "unmeasured": unmeasured,  # Flag for excluding from totals
         "reason": reason,
         "held_seconds": time.time() - _parse_ts(pos["ts"]),
     }
@@ -308,24 +304,30 @@ def closed_positions(limit: int = 50) -> list[dict]:
 def summary() -> dict:
     """
     Return summary statistics: total realized PnL, open positions count, etc.
+    Excludes closes flagged as unmeasured from PnL totals and win/loss counts.
     """
     opens = open_positions()
     closes = closed_positions(limit=None)  # Get all closes
     
-    total_realized_pnl = sum(c.get("realized_pnl_usd") or 0 for c in closes if c.get("realized_pnl_usd") is not None)
+    # Exclude unmeasured closes from PnL calculations
+    measured_closes = [c for c in closes if not c.get("unmeasured")]
+    
+    total_realized_pnl = sum(c.get("realized_pnl_usd") or 0 for c in measured_closes if c.get("realized_pnl_usd") is not None)
     total_trades = len(closes)
-    winning_trades = sum(1 for c in closes if (c.get("realized_pnl_usd") or 0) > 0)
-    losing_trades = sum(1 for c in closes if (c.get("realized_pnl_usd") or 0) < 0)
-    unmeasured_trades = sum(1 for c in closes if c.get("realized_pnl_usd") is None)
+    measured_trades = len(measured_closes)
+    winning_trades = sum(1 for c in measured_closes if (c.get("realized_pnl_usd") or 0) > 0)
+    losing_trades = sum(1 for c in measured_closes if (c.get("realized_pnl_usd") or 0) < 0)
+    unmeasured_trades = sum(1 for c in closes if c.get("unmeasured") or c.get("realized_pnl_usd") is None)
     
     return {
         "open_positions_count": len(opens),
         "closed_trades_count": total_trades,
+        "measured_trades_count": measured_trades,
         "total_realized_pnl_usd": total_realized_pnl,
         "winning_trades": winning_trades,
         "losing_trades": losing_trades,
         "unmeasured_trades": unmeasured_trades,
-        "win_rate": winning_trades / total_trades if total_trades > 0 else 0,
+        "win_rate": winning_trades / measured_trades if measured_trades > 0 else 0,
     }
 
 
@@ -344,38 +346,15 @@ def _parse_ts(iso: str) -> float:
         return time.time()
 
 
-def _get_volume_history(address: str, network_id: int) -> list:
-    """
-    Get volume history for a position from past mark records.
-    Returns list of {ts: unix_time, vol24: volume} dicts.
-    """
-    if not LEDGER_PATH.exists():
-        return []
-    
-    history = []
-    with LEDGER_PATH.open() as f:
-        for line in f:
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if (record.get("action") == "mark" and 
-                record.get("address") == address and 
-                record.get("network_id") == network_id and
-                record.get("volume_h24") is not None):
-                history.append({
-                    "ts": _parse_ts(record["ts"]),
-                    "vol24": record["volume_h24"]
-                })
-    
-    return history
-
-
 def mark_all_open_positions(fomo_client) -> dict:
     """
     Mark all open shadow positions to market using FOMO data.
-    Tracks volume history per position to compute actual decay for exit rule.
     Uses fallback exits (time stop, stop-loss, take-profit) clearly labeled as
     shadow defaults, not trading thresholds.
+    
+    RISK's h6 volume exit is NOT modelled because real h6 volume isn't available
+    from FOMO, and computing it from rolling vol24 snapshots closes on surges
+    instead of collapses (backwards signal).
     
     Args:
         fomo_client: Fomo instance to fetch fresh prices
@@ -408,12 +387,9 @@ def mark_all_open_positions(fomo_client) -> dict:
         price = token_data.get("price")
         vol24 = token_data.get("vol24")
         
-        # Get volume history for this position
-        volume_history = _get_volume_history(pos["address"], pos["network_id"])
-        
-        # Mark position (will check all exit conditions)
+        # Mark position (checks time stop, stop-loss, take-profit)
         result = mark(pos["address"], pos["network_id"], 
-                     current_price=price, volume_h24=vol24, volume_history=volume_history)
+                     current_price=price, volume_h24=vol24)
         
         if result:
             if result["action"] == "close":
