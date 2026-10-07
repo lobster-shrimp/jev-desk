@@ -3106,3 +3106,136 @@ def test_end_to_end_old_momentum_kill(monkeypatch):
     soft_rows = [t for t in token_rows if t.get("stage") == "soft" and t.get("reason") == "momentum_already_spent"]
     assert len(soft_rows) == 1, f"Expected 1 soft-killed token on momentum, got {len(soft_rows)}"
     assert soft_rows[0].get("soft_noul") == 0.74
+
+
+def test_trade_kill_logs_ticker_and_age(monkeypatch, caplog):
+    """Trade kills should log ticker, age_minutes, and tid for visibility."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"TradeKillAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_trade(fomo, id_list):
+        # Token that passes free_kill but fails trade_kill
+        return [tok(0, tid=tid, addr="TradeKillAddr1", ticker="LOWTR", age_minutes=35,
+                    liquidity_usd=50000, volume_h24=100000, mcap_usd=500000)]
+    
+    def fake_trade_counts(t):
+        return {"buys_h1": 10, "sells_h1": 2, "buys_h6": 20, "sells_h6": 5, "trades_h24": 50}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_trade)
+    monkeypatch.setattr(shift, "trade_counts", fake_trade_counts)
+    
+    desk = FakeDesk()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
+    
+    # Find the trade kill log line
+    trade_logs = [r for r in caplog.records if "trade tid=" in r.message and "reason=trades" in r.message]
+    assert len(trade_logs) >= 1, f"Expected trade kill log, got: {[r.message for r in caplog.records if 'trade' in r.message]}"
+    
+    log_msg = trade_logs[0].message
+    assert "ticker=LOWTR" in log_msg, f"Expected ticker=LOWTR in log, got: {log_msg}"
+    assert "age_minutes=35" in log_msg or "age_minutes=35.0" in log_msg, f"Expected age_minutes=35 in log, got: {log_msg}"
+    assert tid in log_msg, f"Expected tid {tid} in log, got: {log_msg}"
+    
+    # Verify stats tracked the kill
+    assert stats.get("trade", {}).get("trades", 0) == 1
+
+
+def test_chain_kill_logs_ticker_and_age(monkeypatch, caplog):
+    """Chain kills should log ticker, age_minutes, and tid for visibility."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"ChainKillAddr1:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_chain(fomo, id_list):
+        # Token that passes free_kill and trade_kill
+        return [tok(0, tid=tid, addr="ChainKillAddr1", ticker="TOPWL", age_minutes=45,
+                    liquidity_usd=50000, volume_h24=100000, mcap_usd=500000)]
+    
+    def fake_trade_counts(t):
+        return {"buys_h1": 100, "sells_h1": 50, "buys_h6": 500, "sells_h6": 200, "trades_h24": 2000}
+    
+    def fake_dossier_top_wallet(t, limiter=None):
+        # Token with excessive top wallet concentration
+        return {**t, "chain": "solana", "top_wallet_percent": 0.15, "top_10_percent": 40,
+                "holder_count": 200, "mint_authority": False, "freeze_authority": False}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_chain)
+    monkeypatch.setattr(shift, "trade_counts", fake_trade_counts)
+    monkeypatch.setattr(shift, "dossier", fake_dossier_top_wallet)
+    
+    desk = FakeDesk()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
+    
+    # Find the chain kill log line
+    chain_logs = [r for r in caplog.records if "chain tid=" in r.message and "reason=top_wallet" in r.message]
+    assert len(chain_logs) >= 1, f"Expected chain kill log, got: {[r.message for r in caplog.records if 'chain' in r.message]}"
+    
+    log_msg = chain_logs[0].message
+    assert "ticker=TOPWL" in log_msg, f"Expected ticker=TOPWL in log, got: {log_msg}"
+    assert "age_minutes=45" in log_msg or "age_minutes=45.0" in log_msg, f"Expected age_minutes=45 in log, got: {log_msg}"
+    assert tid in log_msg, f"Expected tid {tid} in log, got: {log_msg}"
+    
+    # Verify stats tracked the kill
+    assert stats.get("chain", {}).get("top_wallet", 0) == 1
+
+
+def test_chain_kill_logs_young_token_top_10(monkeypatch, caplog):
+    """Chain kills on young tokens should show age clearly in logs (historical CATCRAFT case)."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    tid = f"YoungTop10:{1399811149}"
+    ids = [tid]
+    
+    def fake_shortlist_young(fomo, id_list):
+        # Young token (30 minutes old)
+        return [tok(0, tid=tid, addr="YoungTop10", ticker="CATCRAFT", age_minutes=30,
+                    liquidity_usd=50000, volume_h24=100000, mcap_usd=500000)]
+    
+    def fake_trade_counts(t):
+        return {"buys_h1": 100, "sells_h1": 50, "buys_h6": 500, "sells_h6": 200, "trades_h24": 2000}
+    
+    def fake_dossier_top10(t, limiter=None):
+        # Token with excessive top 10 concentration
+        return {**t, "chain": "solana", "top_wallet_percent": 0.03, "top_10_percent": 70,
+                "holder_count": 200, "mint_authority": False, "freeze_authority": False}
+    
+    monkeypatch.setattr(shift, "universe", lambda limiter=None: ids)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
+    monkeypatch.setattr(shift, "trade_counts", fake_trade_counts)
+    monkeypatch.setattr(shift, "dossier", fake_dossier_top10)
+    
+    desk = FakeDesk()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
+    
+    # Find the chain kill log line
+    chain_logs = [r for r in caplog.records if "chain tid=" in r.message and "reason=top_10" in r.message]
+    assert len(chain_logs) >= 1, f"Expected chain kill log for young CATCRAFT, got: {[r.message for r in caplog.records if 'chain' in r.message]}"
+    
+    log_msg = chain_logs[0].message
+    assert "ticker=CATCRAFT" in log_msg, f"Expected ticker=CATCRAFT in log, got: {log_msg}"
+    # Young token, age should be clearly visible as ~30m (wall before soft)
+    assert "age_minutes=30" in log_msg or "age_minutes=30.0" in log_msg, f"Expected age_minutes=30 in log (wall before soft), got: {log_msg}"
+    assert tid in log_msg, f"Expected tid {tid} in log, got: {log_msg}"
+    
+    # Verify stats tracked the kill
+    assert stats.get("chain", {}).get("top_10", 0) == 1

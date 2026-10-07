@@ -155,6 +155,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         t |= trade_counts(t)                     # pass two: one DexScreener call
         dex_slots -= 1
         if (k := trade_kill(t)):
+            # Log trade kill with ticker, age, and tid for visibility
+            log.info("trade tid=%s ticker=%s reason=%s age_minutes=%s",
+                     t["tid"], t.get("ticker", "?"), k, t.get("age_minutes"))
             book.sit(t["tid"], k)
             log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])
@@ -240,6 +243,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             continue
 
         if (k := chain_kill(d)):
+            # Log chain kill with ticker, age, and tid for visibility
+            log.info("chain tid=%s ticker=%s reason=%s age_minutes=%s",
+                     d.get("tid"), d.get("ticker", "?"), k, d.get("age_minutes"))
             book.sit(t["tid"], k)                # facts bench longest
             log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])

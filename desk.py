@@ -137,6 +137,7 @@ class Desk:
                 "seen": stats.get("seen", 0),
                 "benched": stats.get("benched", 0),
                 "judged": stats.get("judged", 0),
+                "requeued": stats.get("requeued", 0),
                 "killed": kill_histograms,
                 "outcome": outcome,
                 "error": error
