@@ -113,10 +113,14 @@ def chain_kill(d) -> str | None:
     return None
 
 
-def soft_kill(ans) -> tuple[str, float] | None:
+def soft_kill(ans, age_minutes=None) -> tuple[str, float] | None:
     """Jev's answers against SOFT. First failure wins.
     
     Returns (reason, noul_value) on kill, None on pass.
+    
+    Age-aware for momentum_already_spent: young tokens (<60m) naturally show
+    higher momentum during healthy launches. Compare against age-appropriate
+    threshold rather than treating all ages the same.
     """
     for name, (direction, limit) in SOFT.items():
         a = ans.get(name)
@@ -125,8 +129,16 @@ def soft_kill(ans) -> tuple[str, float] | None:
         v = a.get("noul", a.get("score"))
         if v is None:
             continue
-        if direction == "max" and v > limit: return (name, v)
-        if direction == "min" and v < limit: return (name, v)
+        
+        # Age-aware momentum threshold for young tokens
+        effective_limit = limit
+        if name == "momentum_already_spent" and age_minutes is not None and age_minutes < 60:
+            # Young tokens (<60m): use higher threshold (0.85) to allow healthy early launches
+            # Old tokens (>=60m): keep existing strict threshold (0.60)
+            effective_limit = 0.85
+        
+        if direction == "max" and v > effective_limit: return (name, v)
+        if direction == "min" and v < effective_limit: return (name, v)
 
     shape = ans.get("shape")
     if shape:
