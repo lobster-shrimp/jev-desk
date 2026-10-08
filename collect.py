@@ -904,9 +904,14 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
         import book
         
         # Get pair addresses from DexScreener pairAddress (passed through trade stage)
+        # Bug #11: Also include GT pool address if available
         pair_addrs = []
         if "pair_address" in t:
             pair_addrs = [t["pair_address"]]
+        
+        # Add GT pool address if we have it (from GT fallback path)
+        if "gt_pool_address" in t and t["gt_pool_address"]:
+            pair_addrs.append(t["gt_pool_address"])
         
         result = evm_holders.evm_holder_concentration(
             chain_id=t["net"],
@@ -922,22 +927,39 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
             d["top_10_percent"] = result.top_10  # 0-100 percent
             d["evm_holder_source"] = result.source
             d["evm_holder_excluded"] = result.excluded
+            d["evm_holder_raw_top_wallet"] = result.raw_top_wallet
+            d["evm_holder_raw_top_10"] = result.raw_top_10
             
-            # Log kills with values
+            # Bug #8: Log kills with raw values, post-exclusion values, and exclusion reasons
             if result.top_wallet is not None and result.top_wallet > 0.05:
-                log.info("EVM top_wallet %.1f%% for %s (source: %s, excluded %d pools/lockers)",
-                        result.top_wallet * 100, t["ticker"], result.source, len(result.excluded))
+                exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
+                log.info("EVM top_wallet KILL for %s: raw %.1f%%, post-exclusion %.1f%% (source: %s, excluded: %s)",
+                        t["ticker"], 
+                        (result.raw_top_wallet * 100) if result.raw_top_wallet else 0,
+                        result.top_wallet * 100, 
+                        result.source, 
+                        exclusion_reasons or "none")
             if result.top_10 is not None and result.top_10 > 60:
-                log.info("EVM top_10 %.1f%% for %s (source: %s, excluded %d pools/lockers)",
-                        result.top_10, t["ticker"], result.source, len(result.excluded))
+                exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
+                log.info("EVM top_10 KILL for %s: raw %.1f%%, post-exclusion %.1f%% (source: %s, excluded: %s)",
+                        t["ticker"],
+                        result.raw_top_10 if result.raw_top_10 else 0,
+                        result.top_10,
+                        result.source,
+                        exclusion_reasons or "none")
         else:
-            # Fail closed: no top_wallet_percent -> top_wallet_unverified in filter
+            # Fail closed: no top_wallet_percent -> top_wallet_unverified or holders_pending in filter
             d["top_wallet_percent"] = None
             d["top_10_percent"] = None
             d["evm_holder_source"] = result.source
             d["evm_holder_error"] = result.error
-            log.info("EVM holder check unavailable for %s: %s (source: %s)",
-                    t["ticker"], result.error, result.source)
+            
+            # Bug #12: Determine if transient (holders_pending) or definitive (top_wallet_unverified)
+            is_transient = result.error and result.error.startswith("transient:")
+            d["evm_holder_transient"] = is_transient
+            
+            log.info("EVM holder check unavailable for %s: %s (source: %s, transient: %s)",
+                    t["ticker"], result.error, result.source, is_transient)
 
     return d
 

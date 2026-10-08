@@ -82,6 +82,8 @@ BENCH_MINUTES = {
     "honeypot": 100_000, "authority_open": 100_000,
     "top_wallet": 1440, "sell_side": 100_000,  # top_wallet: 1 day (can change if whale dumps)
     "top_wallet_unverified": 360,  # EVM tokens without on-chain verification: 6h bench
+    # transient failures need shorter bench for retry
+    "holders_pending": 15,  # transient EVM holder check failures (rate_limited, timeout, etc)
     # slow to change
     "recycled_account": 360, "account_is_the_project": 360,
     # can change as the float moves

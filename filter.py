@@ -68,12 +68,16 @@ def trade_kill(t) -> str | None:
 
 def chain_kill(d) -> str | None:
     """After the dossier, still free. Facts, not judgements."""
-    # EVM chains: fail closed without top_wallet verification (Rob's decision)
-    # Solana has RPC-verified top_wallet; EVM does not yet have on-chain holder verification
+    # EVM chains: fail closed without top_wallet verification
+    # Bug #12: Use holders_pending for transient failures, top_wallet_unverified for definitive
     chain = d.get("chain")
     if chain and chain != "solana":
         if d.get("top_wallet_percent") is None:
-            return "top_wallet_unverified"
+            # Check if transient failure
+            if d.get("evm_holder_transient"):
+                return "holders_pending"  # 15 min bench for retry
+            else:
+                return "top_wallet_unverified"  # 6h bench for definitive failure
     
     if d.get("top_wallet_percent") is not None and \
        d["top_wallet_percent"] > HARD["max_top_wallet"]:
