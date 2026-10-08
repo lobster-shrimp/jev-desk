@@ -827,36 +827,24 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
     """Test denominator = supply - burns only (lockers NOT subtracted).
     
     Guards against re-adding permanent lock subtraction.
-    RobinFunFi locker 200/1000 + whale 45 -> tw=0.045, no kill, locker excluded.
+    RobinFunFi locker (PERMANENT_LOCKERS) 200/1000 + whale 49 -> tw=0.049, no kill, locker excluded as permanent_locker.
+    If lock WAS subtracted: tw = 49/(1000-200) = 0.06125 (6.125%, would kill).
     """
     import book
     import evm_holders
     from filter import chain_kill
     from unittest.mock import Mock, patch
-    from datetime import datetime, timezone, timedelta
     
-    robinfunfi_locker = "0x267444d099b10fb5ed7c3cc7b7c767adca574952"
+    robinfunfi_locker = "0x267444d099b10fb5ed7c3cc7b7c767adca574952"  # PERMANENT_LOCKERS
     whale_addr = "0x1234567890123456789012345678901234567890"
     
-    # Mock GoPlus response with lock >7 days away for RobinFunFi
-    future_time = datetime.now(timezone.utc) + timedelta(days=365)
-    iso_time = future_time.isoformat()
-    
-    mock_goplus = {
-        "holders": [
-            {
-                "address": robinfunfi_locker,
-                "is_locked": 1,
-                "locked_detail": [{"end_time": iso_time}]
-            }
-        ],
-        "dex": []
-    }
+    # Note: GoPlus mock is NOT needed - RobinFunFi is in PERMANENT_LOCKERS,
+    # so it's excluded statically without GoPlus check.
     
     # Total: 1000
-    # RobinFunFi locker: 200 (20% raw) - excluded from holder list
+    # RobinFunFi locker: 200 (20% raw) - excluded as permanent_locker
     # Whale: 49 (4.9% raw) - biggest valid holder
-    # 100 small holders with ~7.5 each (751 total)
+    # Other holders: 751 total
     # Denominator: 1000 (no burns)
     # After excluding locker: tw = 49/1000 = 0.049 (4.9%, just below 5% threshold)
     # If lock WAS subtracted from denominator: tw = 49/(1000-200) = 49/800 = 0.06125 (6.125%, would kill)
@@ -888,10 +876,8 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
         def side_effect(url, **kwargs):
             if "honeypot" in url:
                 return Mock(status_code=200, json=lambda: mock_honeypot)
-            elif "gopluslabs" in url:
-                return Mock(status_code=200, json=lambda: {"code": 1, "result": {"0xcccccccccccccccccccccccccccccccccccccccc": mock_goplus}})
             return Mock(status_code=404)
-    
+        
         mock_get.side_effect = side_effect
         
         # Multicall response (top-20 holders x 2 calls each = 40 results, all not pools)
@@ -921,3 +907,197 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
     }
     kill_reason = chain_kill(dossier)
     assert kill_reason is None, f"Expected pass, got kill: {kill_reason}"
+
+
+def test_exclusion_log_percentage_format(isolate_evm_state, caplog):
+    """Test chain-kill log shows exclusion percentages correctly (not 100x)."""
+    import book
+    import evm_holders
+    from filter import chain_kill
+    from unittest.mock import Mock, patch
+    import logging
+    
+    pair_addr = "0x1111111111111111111111111111111111111111"
+    whale_addr = "0x2222222222222222222222222222222222222222"
+    token_addr = "0xcccccccccccccccccccccccccccccccccccccccc"
+    
+    mock_honeypot = {
+        "totalSupply": 1000000,
+        "holders": [
+            {"address": whale_addr, "balance": 700000, "isContract": False},  # 70% whale (will kill)
+            {"address": pair_addr, "balance": 200000, "isContract": True},   # 20% pair
+            {"address": "0x3333333333333333333333333333333333333333", "balance": 100000, "isContract": False},
+        ]
+    }
+    
+    with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
+        def get_side_effect(url, **kwargs):
+            if "honeypot" in url:
+                return Mock(status_code=200, json=lambda: mock_honeypot)
+            return Mock(status_code=404)
+        
+        mock_get.side_effect = get_side_effect
+        
+        # Multicall identifies the pair
+        from eth_abi import encode
+        token_padded = b'\x00' * 12 + bytes.fromhex(token_addr[2:])
+        other_padded = b'\x00' * 12 + bytes.fromhex("3333333333333333333333333333333333333333")
+        multicall_result = encode(['(bool,bytes)[]'], [[
+            (False, b''),  # whale token0() - not a pool
+            (False, b''),  # whale token1()
+            (True, token_padded),  # pair token0() - returns token!
+            (True, other_padded),  # pair token1()
+            (False, b''),  # other token0()
+            (False, b''),  # other token1()
+        ]])
+        mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
+        
+        result = evm_holders.evm_holder_concentration(56, token_addr, [], 30, book.DB)
+        
+        assert result.ok
+        assert len(result.excluded) > 0
+        
+        # Simulate main.py's chain_kill logging
+        from main import run_once
+        import collect
+        
+        # Create a minimal dossier-like dict
+        d = {
+            "tid": "test_tid",
+            "ticker": "TEST",
+            "chain": "bsc",
+            "age_minutes": 30,
+            "top_wallet_percent": result.top_wallet,
+            "top_10_percent": result.top_10,
+            "holder_count": 100,
+            "evm_holder_source": result.source,
+            "evm_holder_excluded": result.excluded,
+            "evm_holder_raw_top_wallet": result.raw_top_wallet,
+            "evm_holder_raw_top_10": result.raw_top_10,
+        }
+        
+        k = chain_kill(d)
+        
+        # Log the same way main.py does
+        with caplog.at_level(logging.INFO):
+            evm_source = d.get("evm_holder_source", "N/A")
+            evm_raw_top1 = d.get("evm_holder_raw_top_wallet")
+            evm_raw_top10 = d.get("evm_holder_raw_top_10")
+            evm_excluded = d.get("evm_holder_excluded", [])
+            
+            raw_str = f"raw_top1={evm_raw_top1*100:.1f}% raw_top10={evm_raw_top10:.1f}%" if evm_raw_top1 and evm_raw_top10 else "raw=N/A"
+            exclusion_str = ", ".join(f"{addr[:6]}...{reason}:{pct:.1f}%" for addr, pct, reason in evm_excluded) if evm_excluded else "none"
+            
+            logging.getLogger("main").info("chain tid=%s ticker=%s reason=%s excluded=%s", 
+                                           d.get("tid"), d.get("ticker", "?"), k, exclusion_str)
+        
+        # Check the log output contains correct percentage (20.0%, not 2000.0%)
+        log_output = caplog.text
+        assert ":20.0%" in log_output, f"Expected ':20.0%' in log, got: {log_output}"
+        assert ":2000.0%" not in log_output, f"Percentage should not be 100x too high"
+
+
+def test_cache_at_head_totalsupply_zero(isolate_evm_state):
+    """Test cache-at-head with totalSupply == 0 returns definitive zero_supply error."""
+    import book
+    import evm_holders
+    from filter import chain_kill
+    import json
+    import time
+    from unittest.mock import Mock, patch
+    
+    db = book.DB
+    
+    # Insert cache at head with sum=1000
+    db.execute("INSERT INTO evm_holder_cache VALUES (?, ?, ?, ?, ?, ?)",
+               (4663, "0xcachedzero", 500, json.dumps({"0xaaaa": 600, "0xbbbb": 400}), "1000", time.time()))
+    db.commit()
+    
+    with patch('evm_holders.requests.post') as mock_post:
+        def rpc(url, **kwargs):
+            json_data = kwargs.get('json', {})
+            method = json_data.get("method")
+            
+            if method == "eth_blockNumber":
+                # Head is at block 480, so cache (block 500) is at head
+                return Mock(status_code=200, json=lambda: {"result": hex(480)})
+            
+            elif method == "eth_call":
+                # totalSupply returns 0
+                return Mock(status_code=200, json=lambda: {"result": "0x0"})
+            
+            return Mock(status_code=404)
+        
+        mock_post.side_effect = rpc
+        
+        result = evm_holders.evm_holder_concentration(4663, "0xcachedzero", [], 30, db)
+        
+        # Should be definitive error, not transient
+        assert not result.ok
+        assert result.error == "zero_supply"
+        assert result.is_transient == False
+        
+        # chain_kill should return top_wallet_unverified (definitive)
+        dossier = {
+            "chain": "robinhood",  # EVM chain
+            "top_wallet_percent": result.top_wallet,
+            "top_10_percent": result.top_10,
+            "evm_holder_source": result.source,
+            "evm_holder_error": result.error,
+            "evm_holder_transient": result.is_transient,
+        }
+        kill_reason = chain_kill(dossier)
+        assert kill_reason == "top_wallet_unverified"
+
+
+def test_pools_found_reuse_one_aggregate3_call(isolate_evm_state):
+    """Test pools_found is reused: 5% unknown contract -> exactly 1 aggregate3 and 1 GoPlus call."""
+    import book
+    import evm_holders
+    from unittest.mock import Mock, patch
+    
+    unknown_contract = "0x1111111111111111111111111111111111111111"
+    whale_addr = "0x2222222222222222222222222222222222222222"
+    token_addr = "0xcccccccccccccccccccccccccccccccccccccccc"
+    
+    mock_honeypot = {
+        "totalSupply": 1000000,
+        "holders": [
+            {"address": whale_addr, "balance": 950000, "isContract": False},
+            {"address": unknown_contract, "balance": 50000, "isContract": True},  # 5% unknown contract
+        ]
+    }
+    
+    goplus_called = [0]
+    aggregate3_called = [0]
+    
+    with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
+        def get_side_effect(url, **kwargs):
+            if "honeypot" in url:
+                return Mock(status_code=200, json=lambda: mock_honeypot)
+            elif "gopluslabs" in url:
+                goplus_called[0] += 1
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {token_addr: {"holders": [], "dex": []}}})
+            return Mock(status_code=404)
+        
+        def post_side_effect(url, **kwargs):
+            json_data = kwargs.get('json', {})
+            if json_data.get('method') == 'eth_call':
+                call_data = json_data.get('params', [{}])[0].get('data', '')
+                if call_data.startswith('0x82ad56cb'):
+                    aggregate3_called[0] += 1
+                    # Multicall says unknown contract is not a pool
+                    from eth_abi import encode
+                    multicall_result = encode(['(bool,bytes)[]'], [[(False, b''), (False, b''), (False, b''), (False, b'')]])
+                    return Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
+            return Mock(status_code=404)
+        
+        mock_get.side_effect = get_side_effect
+        mock_post.side_effect = post_side_effect
+        
+        result = evm_holders.evm_holder_concentration(56, token_addr, [], 120, book.DB)  # age >= 120
+        
+        # Should have exactly 1 aggregate3 call (first classify) and 1 GoPlus call
+        # pools_found is reused, so NO second aggregate3 call on re-classify
+        assert aggregate3_called[0] == 1, f"Expected 1 aggregate3 call, got {aggregate3_called[0]}"
+        assert goplus_called[0] == 1, f"Expected 1 GoPlus call, got {goplus_called[0]}"
