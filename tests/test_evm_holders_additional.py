@@ -855,18 +855,23 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
     
     # Total: 1000
     # RobinFunFi locker: 200 (20% raw) - excluded from holder list
-    # Whale: 45 (4.5% raw)
-    # Other: 755
+    # Whale: 45 (4.5% raw) - biggest valid holder
+    # Other: 755 smaller holders summing to 755
     # Denominator: 1000 (no burns)
-    # After excluding locker: tw = 45/1000 = 0.045 (4.5%)
+    # After excluding locker: tw = 45/1000 = 0.045 (4.5%, below 5% threshold)
+    # This tests that denominator is NOT reduced by the locker amount
     EXPECTED_TOP_WALLET = 45 / 1000  # 0.045
     
     mock_honeypot = {
         "totalSupply": 1000,
         "holders": [
             {"address": robinfunfi_locker, "balance": 200, "isContract": True},
-            {"address": whale_addr, "balance": 45, "isContract": False},
-            {"address": "0x2222222222222222222222222222222222222222", "balance": 755, "isContract": False},
+            {"address": whale_addr, "balance": 45, "isContract": False},  # Biggest valid holder
+            # Simulate many smaller holders
+            {"address": "0x2222222222222222222222222222222222222222", "balance": 40, "isContract": False},
+            {"address": "0x3333333333333333333333333333333333333333", "balance": 35, "isContract": False},
+            {"address": "0x4444444444444444444444444444444444444444", "balance": 30, "isContract": False},
+            {"address": "0x5555555555555555555555555555555555555555", "balance": 650, "isContract": False},  # Rest
         ]
     }
     
@@ -880,9 +885,9 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
     
         mock_get.side_effect = side_effect
         
-        # Multicall response (both not pools)
+        # Multicall response (6 holders x 2 calls each = 12 results, all not pools)
         from eth_abi import encode
-        multicall_result = encode(['(bool,bytes)[]'], [[(False, b''), (False, b''), (False, b''), (False, b''), (False, b''), (False, b'')]])
+        multicall_result = encode(['(bool,bytes)[]'], [[(False, b'')] * 12])
         mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
         
         result = evm_holders.evm_holder_concentration(56, "0xcccccccccccccccccccccccccccccccccccccccc", [], 120, book.DB)
