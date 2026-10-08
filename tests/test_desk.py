@@ -1467,7 +1467,7 @@ def test_rolling_window_no_more_than_n_calls_per_minute():
 
 
 def test_rate_limiter_trending_before_new_pools():
-    """universe should prioritize solana new_pools p1-2, then solana trending, then other networks' trending."""
+    """universe should prioritize solana new_pools p1-2, then solana trending p1-2, then other networks' trending."""
     import requests
     
     original_get = requests.get
@@ -1478,7 +1478,8 @@ def test_rate_limiter_trending_before_new_pools():
             page = kwargs.get("params", {}).get("page", 1)
             call_order.append(f"solana_new_p{page}")
         elif "solana" in url and "trending_pools" in url:
-            call_order.append("solana_trending")
+            page = kwargs.get("params", {}).get("page", 1)
+            call_order.append(f"solana_trending_p{page}")
         elif "bsc" in url and "trending_pools" in url:
             call_order.append("bsc_trending")
         elif "bsc" in url and "new_pools" in url:
@@ -1494,12 +1495,13 @@ def test_rate_limiter_trending_before_new_pools():
         limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
         collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True, limiter=limiter)
         
-        # Order should be: sol_new p1, sol_new p2, sol_trending, bsc_trending, bsc_new...
+        # Order: sol_new p1, sol_new p2, sol_trending p1, sol_trending p2, bsc_trending, bsc_new...
         assert call_order[0] == "solana_new_p1", f"Expected solana_new_p1 first, got {call_order}"
         assert call_order[1] == "solana_new_p2", f"Expected solana_new_p2 second, got {call_order}"
-        assert call_order[2] == "solana_trending", f"Expected solana_trending third, got {call_order}"
-        assert call_order[3] == "bsc_trending", f"Expected bsc_trending fourth, got {call_order}"
-        assert "bsc_new" in call_order[4:], f"Expected bsc_new after trending, got {call_order}"
+        assert call_order[2] == "solana_trending_p1", f"Expected solana_trending_p1 third, got {call_order}"
+        assert call_order[3] == "solana_trending_p2", f"Expected solana_trending_p2 fourth, got {call_order}"
+        assert call_order[4] == "bsc_trending", f"Expected bsc_trending fifth, got {call_order}"
+        assert "bsc_new" in call_order[5:], f"Expected bsc_new after trending, got {call_order}"
     finally:
         requests.get = original_get
 
@@ -1536,7 +1538,7 @@ def test_rate_limiter_429_retry_with_backoff():
 
 
 def test_universe_budget_5_three_networks(caplog):
-    """With budget=5 and 3 networks, should fetch exactly sol_new p1, sol_new p2, sol_trending, bsc_trending, rh_trending."""
+    """With budget=5 and 3 networks, should fetch exactly sol_new p1, sol_new p2, sol_trending p1, rh_trending, sol_trending p2."""
     import requests
     import logging
     
@@ -1550,7 +1552,8 @@ def test_universe_budget_5_three_networks(caplog):
             page = kwargs.get("params", {}).get("page", 1)
             call_order.append(f"solana_new_p{page}")
         elif "solana" in url and "trending_pools" in url:
-            call_order.append("solana_trending")
+            page = kwargs.get("params", {}).get("page", 1)
+            call_order.append(f"solana_trending_p{page}")
         elif "bsc" in url and "trending_pools" in url:
             call_order.append("bsc_trending")
         elif "robinhood" in url and "trending_pools" in url:
@@ -1573,13 +1576,14 @@ def test_universe_budget_5_three_networks(caplog):
         # Should have stopped at exactly 5 calls
         assert len(call_order) == 5, f"Expected exactly 5 calls with budget=5, got {len(call_order)}: {call_order}"
         
-        # Verify exact order: sol_new p1, sol_new p2, sol_trending, bsc_trending, rh_trending
+        # Verify exact order per spec: sol_new p1, sol_new p2, sol_trending p1, robinhood_trending, sol_trending p2
+        # BSC trending drops at budget=5 (comes after sol_trending p2 which exhausts budget)
         assert call_order == [
             "solana_new_p1",
-            "solana_new_p2", 
-            "solana_trending",
-            "bsc_trending",
-            "robinhood_trending"
+            "solana_new_p2",
+            "solana_trending_p1",
+            "robinhood_trending",
+            "solana_trending_p2"
         ], f"Expected exact sequence, got {call_order}"
         
         # Verify budget exhaustion log appeared
@@ -1794,8 +1798,8 @@ def test_limiter_prioritizes_dossier_over_universe(monkeypatch, caplog):
     gt_calls = []
     
     original_universe = collect.universe
-    def spy_universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, limiter=None):
-        result = original_universe(nets=nets, pages=pages, include_trending=include_trending, limiter=limiter)
+    def spy_universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, limiter=None, fomo=None):
+        result = original_universe(nets=nets, pages=pages, include_trending=include_trending, limiter=limiter, fomo=fomo)
         if limiter:
             gt_calls.append(("universe", limiter.available()))
         return result
@@ -2230,15 +2234,18 @@ def test_chain_kill_authority_open_only_on_true():
 
 
 def test_chain_kill_preserves_old_behavior_for_other_chains():
-    """chain_kill should not change behavior for bsc/base/robinhood."""
+    """chain_kill should not change behavior for bsc/base/robinhood (but now requires top_wallet_percent)."""
     from filter import chain_kill
     
-    # BSC honeypot still kills
-    assert chain_kill({"chain": "bsc", "is_honeypot": True}) == "honeypot"
-    assert chain_kill({"chain": "base", "is_honeypot": True}) == "honeypot"
+    # BSC honeypot still kills (but needs top_wallet_percent to pass unverified check first)
+    assert chain_kill({"chain": "bsc", "top_wallet_percent": 0.03, "is_honeypot": True}) == "honeypot"
+    assert chain_kill({"chain": "base", "top_wallet_percent": 0.03, "is_honeypot": True}) == "honeypot"
     
     # Top wallet still kills
     assert chain_kill({"chain": "bsc", "top_wallet_percent": 0.2, "holder_count": 300}) == "top_wallet"
+    
+    # EVM without top_wallet_percent fails closed
+    assert chain_kill({"chain": "bsc", "top_wallet_percent": None, "holder_count": 300}) == "top_wallet_unverified"
 
 
 def test_dossier_normalizes_authority_fields(monkeypatch):
@@ -3204,6 +3211,13 @@ def test_end_to_end_young_momentum_pass(monkeypatch):
             }, "usage": {}}
         elif question_set == "solana":
             return {"model": "test", "answers": {}, "usage": {}}
+        elif question_set == "pick":
+            # Single survivor now goes through pick gates
+            return {"model": "test", "answers": {
+                "best": {"type": "choice", "choice": "YMTM", "confidence": 0.85, 
+                        "probabilities": {"YMTM": 0.85}},
+                "worth_trading_at_all": {"type": "noul", "noul": 0.75}
+            }, "usage": {}}
         return {"model": "test", "answers": {}, "usage": {}}
     
     def fake_dossier_young(t, limiter=None):
