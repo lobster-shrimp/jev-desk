@@ -835,13 +835,17 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
                             for detail in locked_details:
                                 end_time_str = detail.get("end_time")
                                 if end_time_str:
-                                    try:
-                                        # Parse ISO timestamp
-                                        dt = datetime.fromisoformat(end_time_str.replace("+00:00", "+00:00"))
-                                        unlock_timestamp = dt.timestamp()
-                                        goplus_locked[holder_addr] = (unlock_timestamp, False)
-                                    except Exception:
-                                        pass
+                                    # Check for "permanent" string
+                                    if end_time_str.lower() == "permanent":
+                                        goplus_locked[holder_addr] = (None, True)
+                                    else:
+                                        try:
+                                            # Parse ISO timestamp
+                                            dt = datetime.fromisoformat(end_time_str.replace("+00:00", "+00:00"))
+                                            unlock_timestamp = dt.timestamp()
+                                            goplus_locked[holder_addr] = (unlock_timestamp, False)
+                                        except Exception:
+                                            pass
     
     # Item #5: Collect unidentified contracts >= 3% for GoPlus lock check
     unidentified_contracts = []
@@ -1056,9 +1060,13 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
             # Classify and exclude
             valid_holders, excluded = _classify(holders, total_supply, pair_addrs, chain_id, token, goplus_data, deadline)
             
-            # Subtract burns from supply
+            # Subtract burns AND permanent locks from supply
             burn_amount = sum(balance for addr, balance, _ in holders if addr.lower() in BURN_ADDRESSES)
-            adjusted_supply = total_supply - burn_amount
+            permanent_lock_amount = sum(balance for addr, balance, _ in holders 
+                                       if any(addr.lower() == ex_addr.lower() and 
+                                             reason in ("locker_permanent", "permanent_locker", "goplus_locker_permanent") 
+                                             for ex_addr, _, reason in excluded))
+            adjusted_supply = total_supply - burn_amount - permanent_lock_amount
             
             if adjusted_supply <= 0:
                 primary_result = HolderResult(None, None, "unavailable", [], False, "zero_supply_after_burns", False)
@@ -1120,9 +1128,13 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                 # Classify
                 valid_holders, excluded = _classify(holders, supply, pair_addrs, chain_id, token, goplus_data, deadline)
                 
-                # Subtract burns
-                burn_amount = sum(balance for addr, balance in balances.items() if addr in BURN_ADDRESSES)
-                adjusted_supply = supply - burn_amount
+                # Subtract burns AND permanent locks from supply
+                burn_amount = sum(balance for addr, balance in balances.items() if addr.lower() in BURN_ADDRESSES)
+                permanent_lock_amount = sum(balance for addr, balance in balances.items()
+                                           if any(addr.lower() == ex_addr.lower() and 
+                                                 reason in ("locker_permanent", "permanent_locker", "goplus_locker_permanent") 
+                                                 for ex_addr, _, reason in excluded))
+                adjusted_supply = supply - burn_amount - permanent_lock_amount
                 
                 if adjusted_supply <= 0:
                     primary_result = HolderResult(None, None, "unavailable", [], False, "zero_supply_after_burns", False)

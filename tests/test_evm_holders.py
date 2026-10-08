@@ -338,78 +338,76 @@ def test_flap_portal_excluded():
 
 def test_pinklock_permanent_excluded():
     """PinkLock with permanent lock excluded."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        db_path = tmp.name
+    # Use fixture DB from conftest
+    import book
+    db = book.DB
     
-    try:
-        db = sqlite3.connect(db_path)
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS evm_holder_cache(
-          chain_id INTEGER NOT NULL,
-          token TEXT NOT NULL,
-          last_block INTEGER NOT NULL,
-          balances_json TEXT NOT NULL,
-          supply TEXT NOT NULL,
-          updated_at REAL NOT NULL,
-          PRIMARY KEY (chain_id, token)
-        );
-        """)
+    # Mock GoPlus response with permanent lock (using REAL schema)
+    mock_goplus = {
+        "holders": [
+            {
+                "address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe",
+                "is_locked": "1",
+                "locked_detail": [
+                    {
+                        "end_time": "permanent"
+                    }
+                ]
+            }
+        ],
+        "dex": []
+    }
+    
+    # Fixture values for exact calculation:
+    # Total supply: 1,000,000,000
+    # PinkLock: 400,000,000 (40% raw)
+    # Whale: 50,000,000 (5% raw)
+    # After excluding PinkLock:
+    #   Remaining supply: 600,000,000
+    #   Whale percentage: 50,000,000 / 600,000,000 = 0.08333...
+    EXPECTED_TOP_WALLET = 50000000 / 600000000  # Exact: 0.08333...
+    
+    mock_honeypot = {
+        "totalSupply": 1000000000,
+        "holders": [
+            {"address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe", "balance": 400000000, "isContract": True},  # PinkLock02
+            {"address": "0x1234567890123456789012345678901234567890", "balance": 50000000, "isContract": False},  # Whale
+        ]
+    }
+    
+    with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
+        def side_effect(url, **kwargs):
+            if "honeypot" in url:
+                return Mock(status_code=200, json=lambda: mock_honeypot)
+            elif "gopluslabs" in url:
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {"0xtoken": mock_goplus}})
+            return Mock(status_code=404)
         
-        # Mock GoPlus response with permanent lock (using REAL schema)
-        mock_goplus = {
-            "holders": [
-                {
-                    "address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe",
-                    "is_locked": "1",
-                    "locked_detail": [
-                        {
-                            "end_time": "permanent"
-                        }
-                    ]
-                }
-            ],
-            "dex": []
-        }
+        mock_get.side_effect = side_effect
         
-        mock_honeypot = {
-            "totalSupply": 1000000000,
-            "holders": [
-                {"address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe", "balance": 400000000, "isContract": True},  # PinkLock02
-                {"address": "0xWHALE", "balance": 50000000, "isContract": False},  # 5%
-            ]
-        }
+        # Mock Multicall3 response (both addresses not pools)
+        from eth_abi import encode
+        multicall_result = encode(['(bool,bytes)[]'], [[(False, b''), (False, b'')]])
+        mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
         
-        with patch('evm_holders.requests.get') as mock_get:
-            def side_effect(url, **kwargs):
-                if "honeypot" in url:
-                    return Mock(status_code=200, json=lambda: mock_honeypot)
-                elif "gopluslabs" in url:
-                    return Mock(status_code=200, json=lambda: {"code": 1, "result": {"0xtoken": mock_goplus}})
-                return Mock(status_code=404)
-            
-            mock_get.side_effect = side_effect
-            
-            result = evm_holders.evm_holder_concentration(
-                chain_id=56,
-                token="0xTOKEN",
-                pair_addrs=[],
-                age_min=120,  # >= 120m to enable GoPlus
-                db=db
-            )
-        
-        assert result.ok
-        # PinkLock should be excluded
-        assert result.top_wallet is not None
-        # PinkLock 40% is excluded, leaving whale 5%
-        assert abs(result.top_wallet - 0.083) < 0.02  # 5% / (100%-40% burn) ≈ 8.3%
-        
-        # Check exclusions (both conditional_lockers match and goplus permanent lock)
-        exclusions = {addr.lower(): reason for addr, _, reason in result.excluded}
-        assert "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe" in exclusions
-        
-    finally:
-        db.close()
-        os.unlink(db_path)
+        result = evm_holders.evm_holder_concentration(
+            chain_id=56,
+            token="0xTOKEN",
+            pair_addrs=[],
+            age_min=120,  # >= 120m to enable GoPlus
+            db=db
+        )
+    
+    assert result.ok, f"Result failed: {result.error}"
+    assert result.top_wallet is not None
+    
+    # Exact expected value with tight tolerance
+    assert abs(result.top_wallet - EXPECTED_TOP_WALLET) < 0.001, \
+        f"Expected {EXPECTED_TOP_WALLET:.6f}, got {result.top_wallet:.6f}"
+    
+    # Check exclusions
+    exclusions = {addr.lower(): reason for addr, _, reason in result.excluded}
+    assert "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe" in exclusions
 
 
 def test_locker_unlocking_under_7d_counted():
