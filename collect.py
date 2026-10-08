@@ -851,12 +851,14 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
         # Solana: pool-aware top wallet and top_10, free, off the public RPC
         try:
             holder_data, rpc_ok, rpc_error = sol_top_wallet(t["addr"])
+            # top_wallet_percent: RPC returns fraction (0-1), store as-is
             d["top_wallet_percent"] = holder_data.get("top_wallet")
             d["pools_excluded"] = holder_data.get("pools_excluded", False)
-            # Use RPC's top_10 for Solana (excludes pools), fall back to GT if RPC failed
+            # top_10_percent: RPC returns fraction (0-1), multiply by 100 to get percent
+            # filter.py expects whole number percent (0-100)
             rpc_top_10 = holder_data.get("top_10")
             if rpc_top_10 is not None:
-                d["top_10_percent"] = rpc_top_10
+                d["top_10_percent"] = rpc_top_10 * 100  # Convert fraction to percent
             d["rpc_ok"] = rpc_ok
             d["rpc_error"] = rpc_error
             if rpc_error:
@@ -871,12 +873,10 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     else:
         # EVM chains: use FOMO's top10HoldersPercent (doesn't count LP/burn like GT does)
         # top_wallet is unavailable on EVM (will be checked in chain_kill)
+        # FOMO returns percent (0-100), store as-is (filter.py expects 0-100)
         fomo_top10 = t.get("fomo_top10_holders_percent")
         if fomo_top10 is not None:
-            # Convert from percent (0-100) to decimal (0-1) if needed
-            if fomo_top10 > 1:
-                fomo_top10 = fomo_top10 / 100.0
-            d["top_10_percent"] = fomo_top10
+            d["top_10_percent"] = fomo_top10  # Already a percent (0-100)
 
     return d
 
@@ -1045,7 +1045,8 @@ def sol_top_wallet(mint: str) -> tuple[dict, bool, str | None]:
     
     # Now resolve owner programs for cached owners (batch lookup)
     unique_owners = set(_sol_owner_cache.get(addr) for addr in token_account_addrs if addr in _sol_owner_cache)
-    uncached_owners = [owner for owner in unique_owners if owner not in _sol_owner_cache]
+    # Check if we already cached the owner's program (stored as "program:{owner}")
+    uncached_owners = [owner for owner in unique_owners if f"program:{owner}" not in _sol_owner_cache]
     
     # Bound owner program lookups
     if len(uncached_owners) > 15:
@@ -1097,8 +1098,9 @@ def sol_top_wallet(mint: str) -> tuple[dict, bool, str | None]:
     
     # Compute top_wallet and top_10 from non-pool accounts
     if not non_pool_accounts:
-        # All top accounts were pools - suspicious, return None
-        return {"top_wallet": None, "top_10": None, "pools_excluded": True}, True, None
+        # All top accounts were pools - real holders are all smaller than smallest fetched pool
+        # Return 0.0 to indicate all large holders are pools (passes threshold check)
+        return {"top_wallet": 0.0, "top_10": 0.0, "pools_excluded": True}, True, None
     
     top_wallet = float(non_pool_accounts[0]["amount"]) / supply
     

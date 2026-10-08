@@ -441,7 +441,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         return None, stats
     
     # All survivors (including single survivor) go through pick gates
-    order = pick(judge, survivors)
+    try:
+        order = pick(judge, survivors)
+    except Exception as e:
+        log.warning("pick failed: %s", e)
+        order = None  # Failed pick means no order this cycle
 
     if order is None:
         return None, stats

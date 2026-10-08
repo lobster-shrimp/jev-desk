@@ -10,7 +10,10 @@ NEVER skip worth_trading_at_all. A choice settles which of these. The noul settl
 
 No trade is a result. Log it with the reason, send it to Telegram, and stand down.
 """
+import logging
 from thresholds import PICK_MIN_WORTH, PICK_MIN_CONF, DARK_TICKET_CUT, NO_SOCIAL_CUT
+
+log = logging.getLogger(__name__)
 
 
 def summary(d, ans) -> str:
@@ -49,26 +52,30 @@ def pick(judge, survivors) -> dict | None:
     if not survivors:
         return None
 
-    state = {"candidates": [{"ticker": d["ticker"], "summary": summary(d, a)}
-                            for d, a in survivors]}
-    r = judge("pick", state)
-    best, worth = r["answers"]["best"], r["answers"]["worth_trading_at_all"]
+    try:
+        state = {"candidates": [{"ticker": d["ticker"], "summary": summary(d, a)}
+                                for d, a in survivors]}
+        r = judge("pick", state)
+        best, worth = r["answers"]["best"], r["answers"]["worth_trading_at_all"]
 
-    if worth["noul"] < PICK_MIN_WORTH:
-        return None                      # every candidate is mediocre. Normal outcome.
-    if best["confidence"] < PICK_MIN_CONF:
-        return None                      # flat over ten options means no favourite.
+        if worth["noul"] < PICK_MIN_WORTH:
+            return None                      # every candidate is mediocre. Normal outcome.
+        if best["confidence"] < PICK_MIN_CONF:
+            return None                      # flat over ten options means no favourite.
 
-    d, ans = next((x for x in survivors if x[0]["ticker"] == best["choice"]), (None, None))
-    if d is None:
-        return None                      # the schema guarantees the option is in the
-                                         # list, so log this one and stand down.
+        d, ans = next((x for x in survivors if x[0]["ticker"] == best["choice"]), (None, None))
+        if d is None:
+            return None                      # the schema guarantees the option is in the
+                                             # list, so log this one and stand down.
 
-    return {"model": r["model"],
-            "token": {"ticker": d["ticker"], "address": d["addr"],
-                      "network_id": d["net"], "chain": d["chain"]},
-            "size_factor": size_factor_for(ans),
-            "confidence": best["confidence"],
-            "runner_up": sorted(best["probabilities"].items(),
-                                key=lambda kv: -kv[1])[1:2],
-            "why": {k: v for k, v in ans.items()}}
+        return {"model": r["model"],
+                "token": {"ticker": d["ticker"], "address": d["addr"],
+                          "network_id": d["net"], "chain": d["chain"]},
+                "size_factor": size_factor_for(ans),
+                "confidence": best["confidence"],
+                "runner_up": sorted(best["probabilities"].items(),
+                                    key=lambda kv: -kv[1])[1:2],
+                "why": {k: v for k, v in ans.items()}}
+    except Exception as e:
+        log.warning("pick failed: %s", e)
+        return None                          # judge error means no pick this cycle
