@@ -738,8 +738,16 @@ def evm_holder_concentration(chain_id: int, token: str, pair_addrs: list[str],
     if cache_key in _cache:
         result, timestamp = _cache[cache_key]
         if time.time() - timestamp < CACHE_DURATION:
-            result.source = "cache"
-            return result
+            # Return a copy with source updated to 'cache'
+            cached_result = HolderResult(
+                top_wallet=result.top_wallet,
+                top_10=result.top_10,
+                source="cache",
+                excluded=result.excluded,
+                ok=result.ok,
+                error=result.error
+            )
+            return cached_result
     
     start_time = time.time()
     

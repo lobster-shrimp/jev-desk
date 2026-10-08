@@ -30,6 +30,15 @@ from filter import chain_kill
 from thresholds import HARD
 
 
+# Pytest fixture to clear cache before each test
+@pytest.fixture(autouse=True)
+def clear_evm_cache():
+    """Clear EVM holder cache before each test."""
+    evm_holders._cache.clear()
+    yield
+    evm_holders._cache.clear()
+
+
 # Test fixtures
 
 def test_honeypot_fitcoin_pair_excluded_pass():
@@ -56,9 +65,15 @@ def test_honeypot_fitcoin_pair_excluded_pass():
             "holders": [
                 {"address": "0xPAIR123", "balance": 390000000, "isContract": True},  # 39% pair
                 {"address": "0xWHALE1", "balance": 21500000, "isContract": False},   # 2.15% real top
-                {"address": "0xHOLDER2", "balance": 50000000, "isContract": False},
-                {"address": "0xHOLDER3", "balance": 30000000, "isContract": False},
-                {"address": "0xHOLDER4", "balance": 20000000, "isContract": False},
+                {"address": "0xHOLDER2", "balance": 20000000, "isContract": False},  # 2%
+                {"address": "0xHOLDER3", "balance": 19000000, "isContract": False},
+                {"address": "0xHOLDER4", "balance": 18000000, "isContract": False},
+                {"address": "0xHOLDER5", "balance": 17000000, "isContract": False},
+                {"address": "0xHOLDER6", "balance": 16000000, "isContract": False},
+                {"address": "0xHOLDER7", "balance": 15000000, "isContract": False},
+                {"address": "0xHOLDER8", "balance": 14000000, "isContract": False},
+                {"address": "0xHOLDER9", "balance": 13000000, "isContract": False},
+                {"address": "0xHOLDER10", "balance": 12000000, "isContract": False},
             ]
         }
         
@@ -78,11 +93,11 @@ def test_honeypot_fitcoin_pair_excluded_pass():
         assert result.top_wallet is not None
         assert abs(result.top_wallet - 0.0215) < 0.001  # ~2.15%
         assert result.top_10 is not None
-        # top_10 = (21.5 + 50 + 30 + 20) / 1000 * 100 (excluding pair)
-        assert abs(result.top_10 - 12.15) < 1  # ~12.15%
+        # top_10 = (21.5 + 20 + 19 + 18 + 17 + 16 + 15 + 14 + 13 + 12) / 1000 * 100 (excluding pair)
+        assert abs(result.top_10 - 16.55) < 1  # ~16.55%
         
         # Check exclusions
-        exclusions = {addr: reason for addr, _, reason in result.excluded}
+        exclusions = {addr.lower(): reason for addr, _, reason in result.excluded}
         assert "0xpair123" in exclusions
         assert exclusions["0xpair123"] == "pair_dexscreener"
         
@@ -456,7 +471,7 @@ def test_locker_unlocking_under_7d_counted():
         assert result.ok
         # Locker NOT excluded (unlocks <7d)
         assert result.top_wallet is not None
-        assert result.top_wallet > 0.4  # 40% counted
+        assert result.top_wallet >= 0.4  # 40% counted
         
     finally:
         db.close()
@@ -741,13 +756,14 @@ def test_dossier_integration_bsc_pass():
         "addr": "0xTOKEN",
         "net": 56,
         "age_minutes": 30,
-        "pair_address": "0xPAIR"
+        "pair_address": "0xPAIR",
+        "holder_count": 200
     }
     
     mock_gt_response = {
         "data": {
             "attributes": {
-                "holders": {"count": 200},
+                "holders": None,  # No GT data, will use EVM holder check
                 "developer_holding_percentage": None,
                 "gt_score_details": None,
                 "is_honeypot": False,
@@ -765,16 +781,19 @@ def test_dossier_integration_bsc_pass():
         ]
     }
     
-    with patch('collect.requests.get') as mock_get, \
-         patch('collect.requests.post') as mock_post:
-        
-        mock_get.return_value = Mock(status_code=200, json=lambda: mock_gt_response)
-        
-        # Mock evm_holders to use honeypot mock
-        with patch('evm_holders.requests.get') as mock_evm_get:
-            mock_evm_get.return_value = Mock(status_code=200, json=lambda: mock_honeypot)
+    def get_side_effect(url, **kwargs):
+        """Route requests to correct mocks."""
+        if "geckoterminal" in url:
+            return Mock(status_code=200, json=lambda: mock_gt_response)
+        elif "honeypot" in url:
+            return Mock(status_code=200, json=lambda: mock_honeypot)
+        else:
+            return Mock(status_code=404)
+    
+    with patch('collect.requests.get', side_effect=get_side_effect), \
+         patch('evm_holders.requests.get', side_effect=get_side_effect):
             
-            dossier = collect.dossier(token_dict)
+        dossier = collect.dossier(token_dict)
     
     assert dossier["top_wallet_percent"] is not None
     assert dossier["top_wallet_percent"] < 0.05  # Pass
@@ -791,13 +810,14 @@ def test_dossier_integration_bsc_whale_kill():
         "addr": "0xTOKEN",
         "net": 56,
         "age_minutes": 30,
-        "pair_address": None
+        "pair_address": None,
+        "holder_count": 200
     }
     
     mock_gt_response = {
         "data": {
             "attributes": {
-                "holders": {"count": 200},
+                "holders": None,
                 "developer_holding_percentage": None,
                 "gt_score_details": None,
                 "is_honeypot": False,
@@ -814,13 +834,18 @@ def test_dossier_integration_bsc_whale_kill():
         ]
     }
     
-    with patch('collect.requests.get') as mock_get:
-        mock_get.return_value = Mock(status_code=200, json=lambda: mock_gt_response)
-        
-        with patch('evm_holders.requests.get') as mock_evm_get:
-            mock_evm_get.return_value = Mock(status_code=200, json=lambda: mock_honeypot)
+    def get_side_effect(url, **kwargs):
+        if "geckoterminal" in url:
+            return Mock(status_code=200, json=lambda: mock_gt_response)
+        elif "honeypot" in url:
+            return Mock(status_code=200, json=lambda: mock_honeypot)
+        else:
+            return Mock(status_code=404)
+    
+    with patch('collect.requests.get', side_effect=get_side_effect), \
+         patch('evm_holders.requests.get', side_effect=get_side_effect):
             
-            dossier = collect.dossier(token_dict)
+        dossier = collect.dossier(token_dict)
     
     assert dossier["top_wallet_percent"] is not None
     assert dossier["top_wallet_percent"] > 0.05  # Whale
