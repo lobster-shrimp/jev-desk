@@ -23,10 +23,11 @@ import os
 import time
 
 import book
-from collect import universe, shortlist, trade_counts, dossier, social_state, GTRateLimiter, DossierRetryNeeded, dex_canary_check
+from collect import universe, shortlist, trade_counts, dossier, social_state, GTRateLimiter, DossierRetryNeeded, dex_canary_check, _clear_sol_owner_cache
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from fomo_api import FomoAuthError
 from pick import pick, size_factor_for
+from secret_utils import safe_err
 import shadow_ledger
 import collect  # For fallback access
 from thresholds import HARD, SOFT
@@ -52,6 +53,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     mode_str = "SHADOW" if shadow else "LIVE"
     judge_str = "MOCK" if os.environ.get("JUDGE_MOCK") == "1" else "LIVE"
     log.info("cycle start: mode=%s judge=%s", mode_str, judge_str)
+    
+    # Clear Solana owner cache at start of each cycle
+    _clear_sol_owner_cache()
     
     # Mark all open shadow positions to market (uses FOMO, not GT)
     if shadow:
@@ -97,7 +101,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             row["soft_scores"] = soft_scores
         stats["tokens"].append(row)
 
-    ids, gt_txns_cache = universe(limiter=gt_limiter)           # fresh + trending pools, budget-aware
+    ids, gt_txns_cache = universe(limiter=gt_limiter, fomo=fomo)  # fresh + trending pools + FOMO feeds, budget-aware
     book.expire_defer()                          # drop rows past max age
     due = book.defer_due()                       # ids ready for rescoring
     seen_ids = set()
@@ -235,9 +239,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                 record(t, "trade", "requeued_dex_degraded")
                 continue
             
-            # Log trade kill with ticker, age, and source
-            log.info("trade tid=%s ticker=%s reason=%s age_minutes=%s dex_status=%s trades_source=%s",
-                     t["tid"], t.get("ticker", "?"), k, t.get("age_minutes"), dex_status, t.get("trades_source", "none"))
+            # Log trade kill with ticker, age, trades count, and pair
+            log.info("trade tid=%s ticker=%s reason=%s age_minutes=%s trades_h24=%s buys_h1=%s sells_h1=%s dex_status=%s trades_source=%s",
+                     t["tid"], t.get("ticker", "?"), k, t.get("age_minutes"), 
+                     t.get("trades_h24"), t.get("buys_h1"), t.get("sells_h1"),
+                     dex_status, t.get("trades_source", "none"))
             book.sit(t["tid"], k)
             log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])
@@ -373,9 +379,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             continue
 
         if (k := chain_kill(d)):
-            # Log chain kill with ticker, age, and tid for visibility
-            log.info("chain tid=%s ticker=%s reason=%s age_minutes=%s",
-                     d.get("tid"), d.get("ticker", "?"), k, d.get("age_minutes"))
+            # Log chain kill with holder metrics (top_10, top_wallet, pools_excluded)
+            log.info("chain tid=%s ticker=%s reason=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s pools_excluded=%s holder_count=%s",
+                     d.get("tid"), d.get("ticker", "?"), k, d.get("age_minutes"),
+                     d.get("top_10_percent"), d.get("top_wallet_percent"), 
+                     d.get("pools_excluded", False), d.get("holder_count"))
             book.sit(t["tid"], k)                # facts bench longest
             log.info("defer outcome tid=%s reason=%s", t["tid"], k)
             book.forget_defer(t["tid"])
@@ -417,7 +425,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                      d.get("top_10_percent"), d.get("top_wallet_percent"), d.get("developer_holding_percentage"),
                      d.get("holder_count"), d.get("rpc_ok"),
                      {k: round(v, 3) for k, v in soft_scores.items()})
-            book.sit(t["tid"], reason)
+            book.sit(t["tid"], reason, age_minutes=t.get("age_minutes"))
             log.info("defer outcome tid=%s reason=%s", t["tid"], reason)
             book.forget_defer(t["tid"])
             stats["soft"][reason] = stats["soft"].get(reason, 0) + 1
@@ -432,15 +440,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
 
     if not survivors:
         return None, stats
-    if len(survivors) == 1:                      # a choice over one option proves nothing
-        d, ans = survivors[0]
-        order = {"model": "single-survivor", "size_factor": size_factor_for(ans),
-                 "confidence": None,
-                 "token": {"ticker": d["ticker"], "address": d["addr"],
-                           "network_id": d["net"], "chain": d["chain"]},
-                 "why": ans}
-    else:
-        order = pick(judge, survivors)           # pass five
+    
+    # All survivors (including single survivor) go through pick gates
+    try:
+        order = pick(judge, survivors)
+    except Exception as e:
+        log.warning("pick failed (NO PICK): %s", safe_err(e))
+        order = None  # Failed pick means no order this cycle
 
     if order is None:
         return None, stats

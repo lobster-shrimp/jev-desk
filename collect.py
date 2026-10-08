@@ -274,25 +274,29 @@ def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None,
 
 
 def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, 
-             limiter: GTRateLimiter | None = None) -> tuple[list[str], dict]:
+             limiter: GTRateLimiter | None = None, fomo=None) -> tuple[list[str], dict]:
     """Where the whole thing starts. Fresh pools per chain -> (['<addr>:<netId>', ...], {tid: gt_txns}).
        Costs one GeckoTerminal slot per chain per page, so keep pages small.
        
        robinhood is capped at 1 page to avoid 429 rate limits every cycle.
        Other networks fetch 2 pages from new_pools.
        
-       Fetch order prioritizes Solana (FOMO is Solana-only):
-       1. Solana new_pools (pages 1-2)
-       2. Solana trending_pools (page 1, retry once on 429)
-       3. Other networks' trending_pools (1 page each)
-       4. Other networks' new_pools
+       Fetch order (budget=5 slot allocation):
+       1. Solana new_pools page 1
+       2. Solana new_pools page 2
+       3. Solana trending_pools page 1
+       4. Robinhood trending_pools page 1
+       5. Solana trending_pools page 2 (when budget allows)
+       then: Other networks' trending (BSC drops at budget=5), then new_pools.
        
-       With default GT_UNIVERSE_BUDGET=5: sol_new p1, sol_new p2, sol_trending, 
-       bsc_trending, robinhood_trending. This ensures low budget never drops 
-       Solana's high-quality trending feed that reaches the judge.
+       This ensures Solana's high-quality feeds and Robinhood trending always
+       reach the judge even on tight budgets.
        
        Universe scan respects its own budget (set via limiter.set_universe_budget()).
        When universe budget exhausted, stops paging and uses what it has.
+       
+       FOMO native feeds (trending_tokens, graduated_tokens) are merged into the universe
+       with zero GT budget cost. Fail soft on errors.
        
        Also returns gt_txns_cache: {tid: {"h1": {"buys": N, "sells": N}, "h6": {...}, "h24": {...}}}
        for fallback when DexScreener is degraded."""
@@ -359,10 +363,36 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
             for pool in r.get("data", []):
                 process_pool(pool, "solana")
     
-    # Phase 2: Solana trending_pools (second priority - liquid tokens that reach judge)
+    # Phase 2: Solana trending_pools page 1 (second priority - liquid tokens that reach judge)
+    solana_trending_p2_skip = False  # track if we should skip page 2 later
     if "solana" in nets and include_trending:
         r, should_continue = _gt_call_with_retry(
             f"{GT}/networks/solana/trending_pools",
+            {"page": 1},
+            limiter,
+            priority=False,
+            retry_on_429=True,  # trending feeds retry once on 429
+            is_universe=True
+        )
+        if r is None:
+            if should_continue:
+                # Universe budget exhausted
+                log.info("universe scan budget exhausted after %d pages (during solana trending_pools p1)", 
+                         pages_fetched)
+                return ids, gt_txns_cache
+            else:
+                log.warning("GeckoTerminal 429 on solana trending_pools p1, skipping Solana trending")
+                solana_trending_p2_skip = True  # also skip page 2
+        else:
+            pages_fetched += 1
+            
+            for pool in r.get("data", []):
+                process_pool(pool, "solana")
+    
+    # Phase 3: Robinhood trending_pools (third priority)
+    if include_trending and "robinhood" in nets:
+        r, should_continue = _gt_call_with_retry(
+            f"{GT}/networks/robinhood/trending_pools",
             {"page": 1},
             limiter,
             priority=False,
@@ -372,21 +402,45 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
         if r is None:
             if should_continue:
                 # Universe budget exhausted
-                log.info("universe scan budget exhausted after %d pages (during solana trending_pools)", 
+                log.info("universe scan budget exhausted after %d pages (during robinhood trending_pools)", 
                          pages_fetched)
                 return ids, gt_txns_cache
             else:
-                log.warning("GeckoTerminal 429 on solana trending_pools, skipping Solana trending")
+                log.warning("GeckoTerminal 429 on robinhood trending_pools, skipping Robinhood trending")
+        else:
+            pages_fetched += 1
+            
+            for pool in r.get("data", []):
+                process_pool(pool, "robinhood")
+    
+    # Phase 3.5: Solana trending_pools page 2 (fourth priority, after robinhood)
+    if "solana" in nets and include_trending and not solana_trending_p2_skip:
+        r, should_continue = _gt_call_with_retry(
+            f"{GT}/networks/solana/trending_pools",
+            {"page": 2},
+            limiter,
+            priority=False,
+            retry_on_429=False,  # no retry on page 2
+            is_universe=True
+        )
+        if r is None:
+            if should_continue:
+                # Universe budget exhausted
+                log.info("universe scan budget exhausted after %d pages (during solana trending_pools p2)", 
+                         pages_fetched)
+                return ids, gt_txns_cache
+            else:
+                log.warning("GeckoTerminal 429 on solana trending_pools p2, skipping")
         else:
             pages_fetched += 1
             
             for pool in r.get("data", []):
                 process_pool(pool, "solana")
     
-    # Phase 3: Other networks' trending_pools (third priority)
-    other_nets = [n for n in nets if n != "solana"]
-    if include_trending and other_nets:
-        for net in other_nets:
+    # Phase 4: Other networks' trending_pools (BSC, Base, etc - lower priority, drops when budget=5)
+    other_trending_nets = [n for n in nets if n not in ("solana", "robinhood")]
+    if include_trending and other_trending_nets:
+        for net in other_trending_nets:
             r, should_continue = _gt_call_with_retry(
                 f"{GT}/networks/{net}/trending_pools",
                 {"page": 1},
@@ -410,7 +464,8 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
             for pool in r.get("data", []):
                 process_pool(pool, net)
     
-    # Phase 4: Other networks' new_pools (lowest priority)
+    # Phase 5: Other networks' new_pools (lowest priority - BSC, Robinhood after trending)
+    other_nets = [n for n in nets if n != "solana"]
     for net in other_nets:
         net_pages = 1 if net == "robinhood" else pages
         for page in range(1, net_pages + 1):
@@ -437,7 +492,34 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
             for pool in r.get("data", []):
                 process_pool(pool, net)
     
-    log.info("universe scan completed: fetched %d pages, found %d tokens", pages_fetched, len(ids))
+    gt_count = len(ids)
+    
+    # Merge FOMO native feeds (trending, graduated) - zero GT budget cost
+    fomo_trending_count = 0
+    fomo_graduated_count = 0
+    if fomo:
+        try:
+            trending_ids = fomo.trending_tokens()
+            for tid in trending_ids:
+                if tid not in seen:
+                    seen.add(tid)
+                    ids.append(tid)
+                    fomo_trending_count += 1
+        except Exception as e:
+            log.warning("FOMO trending_tokens failed, continuing with GT ids: %s", safe_err(e))
+        
+        try:
+            graduated_ids = fomo.graduated_tokens()
+            for tid in graduated_ids:
+                if tid not in seen:
+                    seen.add(tid)
+                    ids.append(tid)
+                    fomo_graduated_count += 1
+        except Exception as e:
+            log.warning("FOMO graduated_tokens failed, continuing with GT ids: %s", safe_err(e))
+    
+    log.info("universe scan completed: GT %d tokens (%d pages), FOMO trending +%d, FOMO graduated +%d, total %d",
+             gt_count, pages_fetched, fomo_trending_count, fomo_graduated_count, len(ids))
     return ids, gt_txns_cache
 
 
@@ -454,6 +536,7 @@ def normalise(tid: str, m: dict) -> dict:
             "mcap_usd": m["mcap"], "liquidity_usd": m["liq"],
             "volume_h24": m["vol24"], "price_usd": m["price"],
             "holder_count": m["holders"],
+            "fomo_top10_holders_percent": m.get("top10_holders_percent"),
             "change": {"5m": m["change"].get(300), "1h": m["change"].get(3600),
                        "4h": m["change"].get(14400), "24h": m["change"].get(86400)},
             "age_minutes": age_minutes(m["created"])}
@@ -463,14 +546,24 @@ def shortlist(fomo: Fomo, ids: list[str]) -> list[dict]:
     """Pass one over everything FOMO knows. No network beyond FOMO itself:
        one call per twenty tokens, and not a single request per token."""
     out = []
-    for tid, m in fomo.tokens(ids).items():             # 20 per call
+    dropped = 0
+    fomo_rows = fomo.tokens(ids)
+    for tid, m in fomo_rows.items():             # 20 per call
         try:
             t = normalise(tid, m)
         except (KeyError, TypeError) as e:
             log.debug("skip %s, malformed row: %s", tid, e)
+            dropped += 1
             continue
         if t["net"] in GT_NET:
             out.append(t)
+        else:
+            dropped += 1
+    
+    # Log FOMO shortlist stats
+    log.info("FOMO shortlist: %d ids requested, %d returned by FOMO, %d kept, %d dropped (malformed or unsupported net)",
+             len(ids), len(fomo_rows), len(out), dropped)
+    
     # turnover ranks the queue. It orders work, it does not decide anything.
     # Missing data (None) gets lowest priority (treat as turnover = 0).
     def turnover(t):
@@ -584,14 +677,22 @@ def trade_counts(t: dict, gt_txns_cache: dict = None) -> tuple[dict, str]:
         log.warning("DexScreener unexpected error for %s (%s): %s", t["ticker"], t["addr"], e)
         return _try_gt_fallback(t, gt_txns_cache)
     
-    # Parse the pairs data - pick highest liquidity pair
+    # Parse the pairs data - pick by highest h24 txns (buys+sells), tie-break by liquidity
     try:
         if not data:  # Empty list already handled above, but be defensive
             return _try_gt_fallback(t, gt_txns_cache, genuine_empty=True)
         
-        # Sort by liquidity, pick highest
-        pairs_with_liq = [(p, (p.get("liquidity") or {}).get("usd") or 0) for p in data]
-        best_pair, best_liq = max(pairs_with_liq, key=lambda x: x[1])
+        # Sort by h24 txns (primary), then liquidity (tie-breaker)
+        def pair_score(p):
+            txns = p.get("txns") or {}
+            h24 = txns.get("h24") or {}
+            buys = h24.get("buys") or 0
+            sells = h24.get("sells") or 0
+            total_txns = buys + sells
+            liq = (p.get("liquidity") or {}).get("usd") or 0
+            return (total_txns, liq)  # tuple sorts by first element, then second
+        
+        best_pair = max(data, key=pair_score)
         
         txns = best_pair.get("txns") or {}
         h1 = txns.get("h1") or {}
@@ -745,11 +846,19 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
          "description": a.get("description"),
          "x_handle": clean_handle(a.get("twitter_handle"))}
 
-    # Solana only: exact top wallet share, free, off the public RPC
+    # Chain-specific holder checks
     if t["net"] == 1399811149:
+        # Solana: pool-aware top wallet and top_10, free, off the public RPC
         try:
-            top_wallet, rpc_ok, rpc_error = sol_top_wallet(t["addr"])
-            d["top_wallet_percent"] = top_wallet
+            holder_data, rpc_ok, rpc_error = sol_top_wallet(t["addr"])
+            # top_wallet_percent: RPC returns fraction (0-1), store as-is
+            d["top_wallet_percent"] = holder_data.get("top_wallet")
+            d["pools_excluded"] = holder_data.get("pools_excluded", False)
+            # top_10_percent: RPC returns fraction (0-1), multiply by 100 to get percent
+            # filter.py expects whole number percent (0-100)
+            rpc_top_10 = holder_data.get("top_10")
+            if rpc_top_10 is not None:
+                d["top_10_percent"] = rpc_top_10 * 100  # Convert fraction to percent
             d["rpc_ok"] = rpc_ok
             d["rpc_error"] = rpc_error
             if rpc_error:
@@ -758,8 +867,16 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
             safe_msg = safe_err(e)
             log.warning("solana rpc failed for %s: %s", t["ticker"], safe_msg)
             d["top_wallet_percent"] = None
+            d["pools_excluded"] = False
             d["rpc_ok"] = False
             d["rpc_error"] = safe_msg
+    else:
+        # EVM chains: use FOMO's top10HoldersPercent (doesn't count LP/burn like GT does)
+        # top_wallet is unavailable on EVM (will be checked in chain_kill)
+        # FOMO returns percent (0-100), store as-is (filter.py expects 0-100)
+        fomo_top10 = t.get("fomo_top10_holders_percent")
+        if fomo_top10 is not None:
+            d["top_10_percent"] = fomo_top10  # Already a percent (0-100)
 
     return d
 
@@ -773,13 +890,45 @@ def clean_handle(h):
     return h if h and h.replace("_", "").isalnum() and len(h) <= 15 else None
 
 
-def sol_top_wallet(mint: str) -> tuple[float | None, bool, str | None]:
-    """Query Solana RPC for top wallet concentration.
+# Known AMM/curve programs whose PDAs should be excluded from holder concentration checks
+# These are pool vaults, not real individual holders
+AMM_PROGRAMS = {
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",  # PumpSwap
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # pump.fun
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",  # Meteora DLMM
+    "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",  # Meteora DAMM v1
+    "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",  # Meteora DAMM v2
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM v4
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  # Raydium CPMM
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",  # Raydium CLMM
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  # Orca Whirlpool
+    "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj",  # Raydium LaunchLab
+}
+
+# Solana incinerator/burn address (also excluded)
+INCINERATOR_ADDRESS = "1nc1nerator11111111111111111111111111111111"
+
+# Cache for owner lookups - module-level, persists across calls within same cycle
+_sol_owner_cache = {}
+
+
+def _clear_sol_owner_cache():
+    """Clear the owner cache. Called at the start of each cycle."""
+    global _sol_owner_cache
+    _sol_owner_cache = {}
+
+
+def sol_top_wallet(mint: str) -> tuple[dict, bool, str | None]:
+    """Query Solana RPC for top wallet concentration, excluding AMM pool vaults.
     
-    Returns (top_wallet_percent, rpc_ok, rpc_error):
-      - top_wallet_percent: float or None
+    Returns (holder_data, rpc_ok, rpc_error):
+      - holder_data: {"top_wallet": float|None, "top_10": float|None, "pools_excluded": bool}
       - rpc_ok: True on success, False on failure
       - rpc_error: error description or None
+    
+    Pool-aware: excludes token accounts owned by known AMM programs (PumpSwap, Meteora, 
+    Raydium, Orca, pump.fun) and the incinerator address. Returns top_wallet as the 
+    largest non-pool account / supply, and top_10 as sum of top 10 non-pool accounts / supply.
     """
     rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
     
@@ -827,26 +976,140 @@ def sol_top_wallet(mint: str) -> tuple[float | None, bool, str | None]:
         except Exception as e:
             return None, safe_err(e)
     
+    # Get token supply
     supply_result, supply_error = q("getTokenSupply", [mint])
     if supply_error:
-        return None, False, f"getTokenSupply: {supply_error}"
+        return {"top_wallet": None, "top_10": None, "pools_excluded": False}, False, f"getTokenSupply: {supply_error}"
     
     try:
         supply = float(supply_result["value"]["amount"])
     except (TypeError, KeyError, ValueError) as e:
-        return None, False, f"getTokenSupply parse: {e}"
+        return {"top_wallet": None, "top_10": None, "pools_excluded": False}, False, f"getTokenSupply parse: {e}"
     
+    # Get largest token accounts (top 20 to have buffer after filtering pools)
     top_result, top_error = q("getTokenLargestAccounts", [mint], retry_on_429=True)
     if top_error:
-        return None, False, f"getTokenLargestAccounts: {top_error}"
+        return {"top_wallet": None, "top_10": None, "pools_excluded": False}, False, f"getTokenLargestAccounts: {top_error}"
     
     try:
-        top = top_result["value"]
-        if not supply or not top:
-            return None, True, None
-        return float(top[0]["amount"]) / supply, True, None
-    except (TypeError, KeyError, ValueError, IndexError) as e:
-        return None, False, f"getTokenLargestAccounts parse: {e}"
+        top_accounts = top_result["value"]
+        if not supply or not top_accounts:
+            return {"top_wallet": None, "top_10": None, "pools_excluded": False}, True, None
+    except (TypeError, KeyError, ValueError) as e:
+        return {"top_wallet": None, "top_10": None, "pools_excluded": False}, False, f"getTokenLargestAccounts parse: {e}"
+    
+    # Resolve token account owners to filter out pool vaults
+    # Batch RPC call to get owner info for all token accounts
+    token_account_addrs = [acc["address"] for acc in top_accounts]
+    
+    # Check cache first, collect uncached addresses
+    uncached_addrs = [addr for addr in token_account_addrs if addr not in _sol_owner_cache]
+    
+    # Bound RPC calls: limit to top 15 token accounts (enough to find real top 10 after filtering)
+    if len(uncached_addrs) > 15:
+        uncached_addrs = uncached_addrs[:15]
+    
+    # Fetch uncached owner data
+    if uncached_addrs:
+        # getMultipleAccounts with jsonParsed encoding to get owner field
+        accounts_result, accounts_error = q("getMultipleAccounts", [
+            uncached_addrs,
+            {"encoding": "jsonParsed"}
+        ])
+        
+        if accounts_error:
+            # RPC failure - fall back to current behavior (no filtering)
+            log.warning("Solana RPC getMultipleAccounts failed for %s, using unfiltered top wallet: %s", 
+                        mint, accounts_error)
+            return {"top_wallet": float(top_accounts[0]["amount"]) / supply, 
+                    "top_10": None, 
+                    "pools_excluded": False}, True, None
+        
+        try:
+            accounts_data = accounts_result["value"]
+            for i, acc_data in enumerate(accounts_data):
+                if acc_data is None:
+                    continue
+                token_addr = uncached_addrs[i]
+                parsed = acc_data.get("data", {})
+                if isinstance(parsed, dict) and "parsed" in parsed:
+                    owner = parsed["parsed"].get("info", {}).get("owner")
+                    if owner:
+                        _sol_owner_cache[token_addr] = owner
+        except Exception as e:
+            log.warning("Failed to parse getMultipleAccounts response for %s: %s", mint, safe_err(e))
+            # Fall back to unfiltered
+            return {"top_wallet": float(top_accounts[0]["amount"]) / supply, 
+                    "top_10": None, 
+                    "pools_excluded": False}, True, None
+    
+    # Now resolve owner programs for cached owners (batch lookup)
+    unique_owners = set(_sol_owner_cache.get(addr) for addr in token_account_addrs if addr in _sol_owner_cache)
+    # Check if we already cached the owner's program (stored as "program:{owner}")
+    uncached_owners = [owner for owner in unique_owners if f"program:{owner}" not in _sol_owner_cache]
+    
+    # Bound owner program lookups
+    if len(uncached_owners) > 15:
+        uncached_owners = uncached_owners[:15]
+    
+    # Fetch owner programs
+    if uncached_owners:
+        owner_accounts_result, owner_accounts_error = q("getMultipleAccounts", [uncached_owners])
+        
+        if not owner_accounts_error:
+            try:
+                owner_accounts_data = owner_accounts_result["value"]
+                for i, owner_acc_data in enumerate(owner_accounts_data):
+                    if owner_acc_data is None:
+                        continue
+                    owner_addr = uncached_owners[i]
+                    program_owner = owner_acc_data.get("owner")
+                    if program_owner:
+                        # Cache the owner's program (store with special key)
+                        _sol_owner_cache[f"program:{owner_addr}"] = program_owner
+            except Exception as e:
+                log.warning("Failed to parse owner programs for %s: %s", mint, safe_err(e))
+    
+    # Filter out pool vaults and incinerator
+    non_pool_accounts = []
+    pools_found = False
+    
+    for acc in top_accounts:
+        token_addr = acc["address"]
+        owner = _sol_owner_cache.get(token_addr)
+        
+        if not owner:
+            # Owner not resolved - include it (fail open for RPC issues)
+            non_pool_accounts.append(acc)
+            continue
+        
+        # Check if owner is incinerator
+        if owner == INCINERATOR_ADDRESS:
+            pools_found = True
+            continue
+        
+        # Check if owner's program is a known AMM
+        owner_program = _sol_owner_cache.get(f"program:{owner}")
+        if owner_program and owner_program in AMM_PROGRAMS:
+            pools_found = True
+            continue
+        
+        non_pool_accounts.append(acc)
+    
+    # Compute top_wallet and top_10 from non-pool accounts
+    if not non_pool_accounts:
+        # All top accounts were pools - real holders are all smaller than smallest fetched pool
+        # Return 0.0 to indicate all large holders are pools (passes threshold check)
+        return {"top_wallet": 0.0, "top_10": 0.0, "pools_excluded": True}, True, None
+    
+    top_wallet = float(non_pool_accounts[0]["amount"]) / supply
+    
+    # Compute top_10: sum of top 10 non-pool accounts
+    top_10_accounts = non_pool_accounts[:10]
+    top_10_sum = sum(float(acc["amount"]) for acc in top_10_accounts)
+    top_10 = top_10_sum / supply if supply else None
+    
+    return {"top_wallet": top_wallet, "top_10": top_10, "pools_excluded": pools_found}, True, None
 
 
 def social_state(d: dict) -> dict:

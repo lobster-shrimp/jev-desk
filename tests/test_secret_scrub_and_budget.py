@@ -165,10 +165,10 @@ def test_sol_top_wallet_scrubs_rpc_error(caplog):
             "Max retries exceeded with url: /?api-key=SECRET123 (Caused by ConnectTimeoutError)"
         )
         
-        top_wallet, rpc_ok, rpc_error = sol_top_wallet("SomeMintAddress")
+        holder_data, rpc_ok, rpc_error = sol_top_wallet("SomeMintAddress")
         
         # Verify error is scrubbed in return value
-        assert top_wallet is None
+        assert holder_data["top_wallet"] is None
         assert rpc_ok is False
         assert "SECRET123" not in rpc_error
         assert "ConnectionError" in rpc_error

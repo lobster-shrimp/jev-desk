@@ -539,8 +539,11 @@ def test_chain_kill_facts_before_judgements():
     assert chain_kill({**base, "mint_authority": True}) == "authority_open"
     assert chain_kill({**base, "freeze_authority": True}) == "authority_open"
     assert chain_kill({**base, "mint_authority": False, "freeze_authority": False}) is None
-    assert chain_kill({"chain": "bsc", "is_honeypot": True}) == "honeypot"
-    assert chain_kill({"chain": "robinhood", "holder_count": None}) is None   # dark is not a kill
+    # EVM chains: honeypot check comes after top_wallet verification
+    assert chain_kill({"chain": "bsc", "top_wallet_percent": 0.03, "is_honeypot": True}) == "honeypot"
+    # EVM chains without top_wallet verification fail closed
+    assert chain_kill({"chain": "bsc", "top_wallet_percent": None, "holder_count": 100}) == "top_wallet_unverified"
+    assert chain_kill({"chain": "bsc", "top_wallet_percent": 0.03, "holder_count": 100}) is None  # verified is ok
 
 
 def test_soft_kill_reads_noul_and_score_and_shape():
@@ -707,7 +710,7 @@ class FakeDesk:
 def test_run_once_shadow_never_takes_book(monkeypatch):
     book.release()
     ids = [f"Addr{i}:1399811149" for i in range(12)]
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: (
         {"buys_h1": 540, "sells_h1": 0 if t["ticker"] == NO_SELL else 120,
         "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000}, 'ok'))
@@ -742,7 +745,7 @@ def test_run_once_shadow_never_takes_book(monkeypatch):
 def test_held_position_means_no_scan(monkeypatch):
     book.take({"token": {"ticker": "HELD", "address": "a", "network_id": 56}})
     called = []
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (called.append(1) or [], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (called.append(1) or [], {}))
     order, stats = shift.run_once(FakeFomo(), JUDGE, FakeDesk(), 1000.0)
     assert order is None and stats["held"] == "HELD" and not called
     book.release()
@@ -981,7 +984,7 @@ def test_run_once_records_tokens(monkeypatch):
     
     ids = [f"UniqueAddr{i}_{unique_suffix}:1399811149" for i in range(5)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist)
     
     # Monkeypatch book.benched to ensure tokens aren't skipped
@@ -1155,7 +1158,7 @@ def test_universe_includes_trending_pools():
     """universe should fetch trending_pools in addition to new_pools and dedupe."""
     import requests
     
-    # Mock responses in correct order: sol new p1, sol new p2, sol trending, bsc trending, bsc new p1, bsc new p2
+    # Mock responses in correct order: sol new p1, sol new p2, sol trending p1, sol trending p2, bsc trending, bsc new p1, bsc new p2
     mock_responses = [
         # Solana new_pools page 1 (highest priority)
         Mock(status_code=200, headers={}, json=lambda: {
@@ -1174,6 +1177,10 @@ def test_universe_includes_trending_pools():
                 {"relationships": {"base_token": {"data": {"id": "solana_trend1"}}}},
                 {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}}  # duplicate
             ]
+        }),
+        # Solana trending_pools page 2 (after robinhood trending priority)
+        Mock(status_code=200, headers={}, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "solana_trend2"}}}}]
         }),
         # BSC trending_pools page 1
         Mock(status_code=200, headers={}, json=lambda: {
@@ -1201,14 +1208,15 @@ def test_universe_includes_trending_pools():
     try:
         ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
         
-        # Should have 7 unique IDs (3 solana new + 1 solana trend + 1 bsc trend + 2 bsc new - 1 duplicate)
-        assert len(ids) == 7, f"Expected 7 unique tokens, got {len(ids)}: {ids}"
+        # Should have 8 unique IDs (3 solana new + 2 solana trend + 1 bsc trend + 2 bsc new - 1 duplicate)
+        assert len(ids) == 8, f"Expected 8 unique tokens, got {len(ids)}: {ids}"
         
         # Verify no duplicates
         assert len(ids) == len(set(ids))
         
-        # Verify solana trending IDs are included
+        # Verify solana trending IDs are included (both pages)
         assert "trend1:1399811149" in ids, f"Expected solana trend1 in {ids}"
+        assert "trend2:1399811149" in ids, f"Expected solana trend2 in {ids}"
         assert "trend1:56" in ids, f"Expected bsc trend1 in {ids}"
         
         # Verify we made calls to both new_pools and trending_pools
@@ -1216,10 +1224,10 @@ def test_universe_includes_trending_pools():
         trending_calls = [c for c in call_info if "trending_pools" in c[0]]
         
         assert len(new_pool_calls) == 4, f"Expected 4 new_pools calls, got {len(new_pool_calls)}"  # 2 solana + 2 bsc
-        assert len(trending_calls) == 2, f"Expected 2 trending_pools calls, got {len(trending_calls)}"  # 1 solana + 1 bsc
+        assert len(trending_calls) == 3, f"Expected 3 trending_pools calls, got {len(trending_calls)}"  # 2 solana + 1 bsc
         
-        # Verify total call count: 4 new_pools + 2 trending_pools = 6
-        assert len(call_info) == 6, f"Expected 6 total calls, got {len(call_info)}"
+        # Verify total call count: 4 new_pools + 3 trending_pools = 7
+        assert len(call_info) == 7, f"Expected 7 total calls, got {len(call_info)}"
     finally:
         requests.get = original_get
 
@@ -1300,7 +1308,7 @@ def test_free_kill_logs_fomo_metrics(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="LogTestAddr1", age_minutes=42, liquidity_usd=5000,
                     volume_h24=20000, mcap_usd=100000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_low_liq)
     
     desk = FakeDesk()
@@ -1334,7 +1342,7 @@ def test_free_pass_logs_fomo_metrics(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="PassTestAddr1", age_minutes=42, liquidity_usd=50000,
                     volume_h24=100000, mcap_usd=500000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_pass)
     # Make it fail at trade stage so we can see the free pass log
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 0, "sells_h1": 0, 
@@ -1372,7 +1380,7 @@ def test_free_kill_logs_none_values(monkeypatch, caplog):
         return [tok(0, tid=tid, addr="NoneTestAddr1", age_minutes=42, liquidity_usd=None,
                     volume_h24=None, mcap_usd=None)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_none)
     
     desk = FakeDesk()
@@ -1459,7 +1467,7 @@ def test_rolling_window_no_more_than_n_calls_per_minute():
 
 
 def test_rate_limiter_trending_before_new_pools():
-    """universe should prioritize solana new_pools p1-2, then solana trending, then other networks' trending."""
+    """universe should prioritize solana new_pools p1-2, then solana trending p1-2, then other networks' trending."""
     import requests
     
     original_get = requests.get
@@ -1470,7 +1478,8 @@ def test_rate_limiter_trending_before_new_pools():
             page = kwargs.get("params", {}).get("page", 1)
             call_order.append(f"solana_new_p{page}")
         elif "solana" in url and "trending_pools" in url:
-            call_order.append("solana_trending")
+            page = kwargs.get("params", {}).get("page", 1)
+            call_order.append(f"solana_trending_p{page}")
         elif "bsc" in url and "trending_pools" in url:
             call_order.append("bsc_trending")
         elif "bsc" in url and "new_pools" in url:
@@ -1486,12 +1495,13 @@ def test_rate_limiter_trending_before_new_pools():
         limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
         collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True, limiter=limiter)
         
-        # Order should be: sol_new p1, sol_new p2, sol_trending, bsc_trending, bsc_new...
+        # Order: sol_new p1, sol_new p2, sol_trending p1, sol_trending p2, bsc_trending, bsc_new...
         assert call_order[0] == "solana_new_p1", f"Expected solana_new_p1 first, got {call_order}"
         assert call_order[1] == "solana_new_p2", f"Expected solana_new_p2 second, got {call_order}"
-        assert call_order[2] == "solana_trending", f"Expected solana_trending third, got {call_order}"
-        assert call_order[3] == "bsc_trending", f"Expected bsc_trending fourth, got {call_order}"
-        assert "bsc_new" in call_order[4:], f"Expected bsc_new after trending, got {call_order}"
+        assert call_order[2] == "solana_trending_p1", f"Expected solana_trending_p1 third, got {call_order}"
+        assert call_order[3] == "solana_trending_p2", f"Expected solana_trending_p2 fourth, got {call_order}"
+        assert call_order[4] == "bsc_trending", f"Expected bsc_trending fifth, got {call_order}"
+        assert "bsc_new" in call_order[5:], f"Expected bsc_new after trending, got {call_order}"
     finally:
         requests.get = original_get
 
@@ -1528,7 +1538,7 @@ def test_rate_limiter_429_retry_with_backoff():
 
 
 def test_universe_budget_5_three_networks(caplog):
-    """With budget=5 and 3 networks, should fetch exactly sol_new p1, sol_new p2, sol_trending, bsc_trending, rh_trending."""
+    """With budget=5 and 3 networks, should fetch exactly sol_new p1, sol_new p2, sol_trending p1, rh_trending, sol_trending p2."""
     import requests
     import logging
     
@@ -1542,7 +1552,8 @@ def test_universe_budget_5_three_networks(caplog):
             page = kwargs.get("params", {}).get("page", 1)
             call_order.append(f"solana_new_p{page}")
         elif "solana" in url and "trending_pools" in url:
-            call_order.append("solana_trending")
+            page = kwargs.get("params", {}).get("page", 1)
+            call_order.append(f"solana_trending_p{page}")
         elif "bsc" in url and "trending_pools" in url:
             call_order.append("bsc_trending")
         elif "robinhood" in url and "trending_pools" in url:
@@ -1565,13 +1576,14 @@ def test_universe_budget_5_three_networks(caplog):
         # Should have stopped at exactly 5 calls
         assert len(call_order) == 5, f"Expected exactly 5 calls with budget=5, got {len(call_order)}: {call_order}"
         
-        # Verify exact order: sol_new p1, sol_new p2, sol_trending, bsc_trending, rh_trending
+        # Verify exact order per spec: sol_new p1, sol_new p2, sol_trending p1, robinhood_trending, sol_trending p2
+        # BSC trending drops at budget=5 (comes after sol_trending p2 which exhausts budget)
         assert call_order == [
             "solana_new_p1",
-            "solana_new_p2", 
-            "solana_trending",
-            "bsc_trending",
-            "robinhood_trending"
+            "solana_new_p2",
+            "solana_trending_p1",
+            "robinhood_trending",
+            "solana_trending_p2"
         ], f"Expected exact sequence, got {call_order}"
         
         # Verify budget exhaustion log appeared
@@ -1697,7 +1709,7 @@ def test_run_once_requeues_on_dossier_retry(monkeypatch, caplog):
     def fake_dossier_429(t, limiter=None):
         raise collect.DossierRetryNeeded(f"GT 429 for {t['ticker']}")
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
@@ -1740,7 +1752,7 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
         dossier_calls[0] += 1
         raise collect.DossierRetryNeeded(f"GT 429 for {t['ticker']}")
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([tid], {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_cycle1)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
@@ -1762,7 +1774,7 @@ def test_requeued_token_retried_next_cycle(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([], {}))  # Empty universe
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([], {}))  # Empty universe
     monkeypatch.setattr(shift, "dossier", fake_dossier_cycle2)
     
     order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
@@ -1786,8 +1798,8 @@ def test_limiter_prioritizes_dossier_over_universe(monkeypatch, caplog):
     gt_calls = []
     
     original_universe = collect.universe
-    def spy_universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, limiter=None):
-        result = original_universe(nets=nets, pages=pages, include_trending=include_trending, limiter=limiter)
+    def spy_universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, limiter=None, fomo=None):
+        result = original_universe(nets=nets, pages=pages, include_trending=include_trending, limiter=limiter, fomo=fomo)
         if limiter:
             gt_calls.append(("universe", limiter.available()))
         return result
@@ -1851,7 +1863,7 @@ def test_defer_young_token_not_benched(monkeypatch):
         t = tok(0, tid=tid, addr="DeferAddr1", age_minutes=2, liquidity_usd=50000)
         return [t]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     
     desk = FakeDesk()
@@ -1874,7 +1886,7 @@ def test_defer_due_token_passed_to_fomo(monkeypatch):
     book.DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, now - 1, now + 3600))
     book.DB.commit()
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([], {}))
     
     fomo_calls = []
     original_shortlist = collect.shortlist
@@ -1910,7 +1922,7 @@ def test_old_token_benched_not_deferred(monkeypatch):
     def fake_shortlist_old(fomo, id_list):
         return [tok(0, tid=tid, addr="OldAddr1", age_minutes=80 * 60)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_old)
     
     desk = FakeDesk()
@@ -1941,7 +1953,7 @@ def test_judge_not_called_for_young_token(monkeypatch):
         judge_calls.append((question_set, state))
         return JUDGE(question_set, state)
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     
     desk = FakeDesk()
@@ -1961,7 +1973,7 @@ def test_defer_miss_forgotten_and_logged(monkeypatch, caplog):
     book.DB.execute("INSERT INTO defer VALUES (?,?,?)", (tid, now - 1, now + 3600))
     book.DB.commit()
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([], {}))
     
     def fake_tokens_miss(self, ids):
         return {}
@@ -1995,7 +2007,7 @@ def test_defer_cap_200(monkeypatch, caplog):
     def fake_shortlist_cap(fomo, id_list):
         return [tok(0, tid=new_tid, addr=f"CapAddr{book.DEFER_CAP}", age_minutes=5)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_cap)
     
     desk = FakeDesk()
@@ -2023,7 +2035,7 @@ def test_defer_gate_below_threshold(monkeypatch, caplog):
         # $8k liquidity, below the $12k threshold
         return [tok(0, tid=tid, addr="BelowGateAddr1", age_minutes=5, liquidity_usd=8000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_below_gate)
     
     desk = FakeDesk()
@@ -2054,7 +2066,7 @@ def test_defer_gate_at_threshold(monkeypatch, caplog):
         # Exactly $12k liquidity, at the threshold
         return [tok(0, tid=tid, addr="AtGateAddr1", age_minutes=5, liquidity_usd=12000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_at_gate)
     
     desk = FakeDesk()
@@ -2085,7 +2097,7 @@ def test_defer_gate_null_liquidity(monkeypatch, caplog):
         # liquidity_usd is None
         return [tok(0, tid=tid, addr="NullLiqAddr1", age_minutes=5, liquidity_usd=None)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_null_liq)
     
     desk = FakeDesk()
@@ -2117,7 +2129,7 @@ def test_defer_outcome_logging(monkeypatch, caplog):
     def fake_shortlist_defer(fomo, id_list):
         return [tok(0, tid=tid, addr="OutcomeAddr1", age_minutes=5, liquidity_usd=20000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids1, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids1, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_defer)
     
     desk = FakeDesk()
@@ -2135,7 +2147,7 @@ def test_defer_outcome_logging(monkeypatch, caplog):
         # Now has low liquidity
         return [tok(0, tid=tid, addr="OutcomeAddr1", age_minutes=16, liquidity_usd=5000)]
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_fail_liq)
     
     caplog.clear()
@@ -2222,15 +2234,18 @@ def test_chain_kill_authority_open_only_on_true():
 
 
 def test_chain_kill_preserves_old_behavior_for_other_chains():
-    """chain_kill should not change behavior for bsc/base/robinhood."""
+    """chain_kill should not change behavior for bsc/base/robinhood (but now requires top_wallet_percent)."""
     from filter import chain_kill
     
-    # BSC honeypot still kills
-    assert chain_kill({"chain": "bsc", "is_honeypot": True}) == "honeypot"
-    assert chain_kill({"chain": "base", "is_honeypot": True}) == "honeypot"
+    # BSC honeypot still kills (but needs top_wallet_percent to pass unverified check first)
+    assert chain_kill({"chain": "bsc", "top_wallet_percent": 0.03, "is_honeypot": True}) == "honeypot"
+    assert chain_kill({"chain": "base", "top_wallet_percent": 0.03, "is_honeypot": True}) == "honeypot"
     
     # Top wallet still kills
     assert chain_kill({"chain": "bsc", "top_wallet_percent": 0.2, "holder_count": 300}) == "top_wallet"
+    
+    # EVM without top_wallet_percent fails closed
+    assert chain_kill({"chain": "bsc", "top_wallet_percent": None, "holder_count": 300}) == "top_wallet_unverified"
 
 
 def test_dossier_normalizes_authority_fields(monkeypatch):
@@ -2324,7 +2339,7 @@ def test_end_to_end_authority_no_strings_pass(monkeypatch):
                 "freeze_authority": freeze_norm, "freeze_authority_raw": freeze_raw,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
@@ -2377,7 +2392,7 @@ def test_soft_kill_logs_noul_and_records_in_state(monkeypatch, caplog):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None, "net": 1399811149}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
@@ -2442,7 +2457,7 @@ def test_end_to_end_authority_yes_kills(monkeypatch):
                 "freeze_authority": freeze_norm, "freeze_authority_raw": freeze_raw,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(collect, "shortlist", fake_shortlist_pass)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
@@ -2487,7 +2502,7 @@ def test_fomo_502_after_retries_does_not_crash_cycle(monkeypatch, caplog):
             # This will now return {} instead of raising
             return fomo._filter_tokens(ids)
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     
     desk = FakeDesk()
     caplog.clear()
@@ -2544,7 +2559,7 @@ def test_fomo_partial_502_continues_with_partial_data(monkeypatch):
     monkeypatch.setattr(Fomo, "_filter_tokens", mock_filter_tokens)
     
     ids = [f"Addr{i}:1399811149" for i in range(25)]
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     
     # Make tokens pass through to judging
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
@@ -2615,7 +2630,7 @@ def test_young_tokens_get_dossier_before_old_with_budget_constraint(monkeypatch)
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([old1_tid, old2_tid, young1_tid, young2_tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([old1_tid, old2_tid, young1_tid, young2_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_mixed)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2673,7 +2688,7 @@ def test_old_requeue_does_not_starve_young_first_timer(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_mixed)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2729,7 +2744,7 @@ def test_age_prioritization_preserves_turnover_within_groups(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_high_tid, young_mid_tid, young_low_tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([young_high_tid, young_mid_tid, young_low_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young_group)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2786,7 +2801,7 @@ def test_young_token_429_gets_in_cycle_retry(monkeypatch):
             wait_called[0] = True
         return original_wait(self, priority)
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2832,7 +2847,7 @@ def test_young_token_429_twice_defers_to_next_cycle(monkeypatch):
         dossier_call_count[0] += 1
         raise collect.DossierRetryNeeded("GT 429 persistent")
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2913,7 +2928,7 @@ def test_young_token_429_backoff_actually_waits(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -2985,7 +3000,7 @@ def test_old_token_429_skips_while_young_pending(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid, old_tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([young_tid, old_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -3044,7 +3059,7 @@ def test_old_token_gets_dossier_after_young_clears(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([young_tid, old_tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([young_tid, old_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -3196,6 +3211,13 @@ def test_end_to_end_young_momentum_pass(monkeypatch):
             }, "usage": {}}
         elif question_set == "solana":
             return {"model": "test", "answers": {}, "usage": {}}
+        elif question_set == "pick":
+            # Single survivor now goes through pick gates
+            return {"model": "test", "answers": {
+                "best": {"type": "choice", "choice": "YMTM", "confidence": 0.85, 
+                        "probabilities": {"YMTM": 0.85}},
+                "worth_trading_at_all": {"type": "noul", "noul": 0.75}
+            }, "usage": {}}
         return {"model": "test", "answers": {}, "usage": {}}
     
     def fake_dossier_young(t, limiter=None):
@@ -3204,7 +3226,7 @@ def test_end_to_end_young_momentum_pass(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "a young token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -3261,7 +3283,7 @@ def test_end_to_end_old_momentum_kill(monkeypatch):
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
                 "description": "an old token", "x_handle": None}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: ([tid], {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_old)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400,
@@ -3300,7 +3322,7 @@ def test_trade_kill_logs_ticker_and_age(monkeypatch, caplog):
     def fake_trade_counts(t, gt_txns_cache=None):
         return {"buys_h1": 10, "sells_h1": 2, "buys_h6": 20, "sells_h6": 5, "trades_h24": 50}, 'ok'
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_trade)
     monkeypatch.setattr(shift, "trade_counts", fake_trade_counts)
     
@@ -3345,7 +3367,7 @@ def test_chain_kill_logs_ticker_and_age(monkeypatch, caplog):
         return {**t, "chain": "solana", "top_wallet_percent": 0.15, "top_10_percent": 40,
                 "holder_count": 200, "mint_authority": False, "freeze_authority": False}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_chain)
     monkeypatch.setattr(shift, "trade_counts", fake_trade_counts)
     monkeypatch.setattr(shift, "dossier", fake_dossier_top_wallet)
@@ -3391,7 +3413,7 @@ def test_chain_kill_logs_young_token_top_10(monkeypatch, caplog):
         return {**t, "chain": "solana", "top_wallet_percent": 0.03, "top_10_percent": 70,
                 "holder_count": 200, "mint_authority": False, "freeze_authority": False}
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (ids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist_young)
     monkeypatch.setattr(shift, "trade_counts", fake_trade_counts)
     monkeypatch.setattr(shift, "dossier", fake_dossier_top10)
@@ -3581,19 +3603,31 @@ def test_sol_top_wallet_success(monkeypatch):
             return Mock(json=lambda: {
                 "jsonrpc": "2.0",
                 "id": 1,
-                "result": {"value": [{"amount": "100000"}]}
+                "result": {"value": [{"address": "test_account_1", "amount": "100000"}]}
+            })
+        elif method == "getMultipleAccounts":
+            # Mock owner resolution - return None to simulate uncached/unresolved owners
+            # This will make the code fall back to including the account
+            return Mock(json=lambda: {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"value": [None]}  # Failed to resolve owner
             })
     
     monkeypatch.setattr(requests, "post", fake_post)
     
-    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    holder_data, rpc_ok, error = collect.sol_top_wallet("test_mint")
     
-    assert percent == 0.1
+    assert holder_data["top_wallet"] == 0.1
     assert rpc_ok is True
     assert error is None
-    assert len(calls) == 2
+    # With pool-aware logic: getTokenSupply, getTokenLargestAccounts, getMultipleAccounts (for owner resolution)
+    assert len(calls) >= 2  # At least supply and largest accounts
     assert calls[0][1] == "getTokenSupply"
     assert calls[1][1] == "getTokenLargestAccounts"
+    # May include getMultipleAccounts for owner resolution
+    if len(calls) > 2:
+        assert calls[2][1] == "getMultipleAccounts"
 
 
 def test_sol_top_wallet_json_rpc_error(monkeypatch):
@@ -3607,9 +3641,9 @@ def test_sol_top_wallet_json_rpc_error(monkeypatch):
     
     monkeypatch.setattr(requests, "post", fake_post)
     
-    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    holder_data, rpc_ok, error = collect.sol_top_wallet("test_mint")
     
-    assert percent is None
+    assert holder_data["top_wallet"] is None
     assert rpc_ok is False
     assert "Invalid request" in error
     assert "code -32600" in error
@@ -3643,15 +3677,15 @@ def test_sol_top_wallet_429_retry_success(monkeypatch):
                 return Mock(json=lambda: {
                     "jsonrpc": "2.0",
                     "id": 1,
-                    "result": {"value": [{"amount": "100000"}]}
+                    "result": {"value": [{"address": "test_account_1", "amount": "100000"}]}
                 })
     
     monkeypatch.setattr(requests, "post", fake_post)
     monkeypatch.setattr(time, "sleep", lambda x: None)
     
-    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    holder_data, rpc_ok, error = collect.sol_top_wallet("test_mint")
     
-    assert percent == 0.1
+    assert holder_data["top_wallet"] == 0.1
     assert rpc_ok is True
     assert error is None
     assert call_count[0] == 2
@@ -3681,9 +3715,9 @@ def test_sol_top_wallet_429_retry_failure(monkeypatch):
     monkeypatch.setattr(requests, "post", fake_post)
     monkeypatch.setattr(time, "sleep", lambda x: None)
     
-    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    holder_data, rpc_ok, error = collect.sol_top_wallet("test_mint")
     
-    assert percent is None
+    assert holder_data["top_wallet"] is None
     assert rpc_ok is False
     assert "Too Many Requests" in error
 
@@ -3698,9 +3732,9 @@ def test_sol_top_wallet_missing_result_field(monkeypatch):
     
     monkeypatch.setattr(requests, "post", fake_post)
     
-    percent, rpc_ok, error = collect.sol_top_wallet("test_mint")
+    holder_data, rpc_ok, error = collect.sol_top_wallet("test_mint")
     
-    assert percent is None
+    assert holder_data["top_wallet"] is None
     assert rpc_ok is False
     assert "missing result field" in error
 
@@ -3717,7 +3751,7 @@ def test_sol_top_wallet_uses_env_var(monkeypatch):
         return Mock(json=lambda: {
             "jsonrpc": "2.0",
             "id": 1,
-            "result": {"value": {"amount": "1000000"}} if json["method"] == "getTokenSupply" else {"value": [{"amount": "100000"}]}
+            "result": {"value": {"amount": "1000000"}} if json["method"] == "getTokenSupply" else {"value": [{"address": "test_account_1", "amount": "100000"}]}
         })
     
     monkeypatch.setattr(requests, "post", fake_post)
@@ -3730,7 +3764,7 @@ def test_sol_top_wallet_uses_env_var(monkeypatch):
 def test_dossier_captures_rpc_status(monkeypatch):
     """dossier should capture rpc_ok and rpc_error for Solana tokens."""
     def fake_sol_top_wallet(mint):
-        return None, False, "getTokenLargestAccounts: Too Many Requests (code 429)"
+        return {"top_wallet": None, "top_10": None, "pools_excluded": False}, False, "getTokenLargestAccounts: Too Many Requests (code 429)"
     
     def fake_get(url, headers=None, timeout=None):
         return Mock(
@@ -4488,7 +4522,7 @@ def test_early_canary_check_triggers_on_consecutive_empties(monkeypatch):
     def mock_trade_counts(t, gt_txns_cache=None):
         return {"buys_h1": None, "sells_h1": None, "buys_h6": None, "sells_h6": None, "trades_h24": None}, 'empty'
     
-    monkeypatch.setattr(shift, "universe", lambda limiter=None: (tids, {}))
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (tids, {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
     monkeypatch.setattr(shift, "trade_counts", mock_trade_counts)
     monkeypatch.setattr(shift, "dex_canary_check", mock_canary)
