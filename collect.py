@@ -281,12 +281,15 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
        robinhood is capped at 1 page to avoid 429 rate limits every cycle.
        Other networks fetch 2 pages from new_pools.
        
-       Fetch order prioritizes Solana's main new_pools feed:
+       Fetch order prioritizes Solana (FOMO is Solana-only):
        1. Solana new_pools (pages 1-2)
-       2. Other networks' trending_pools (1 page each)
-       3. Other networks' new_pools
+       2. Solana trending_pools (page 1, retry once on 429)
+       3. Other networks' trending_pools (1 page each)
+       4. Other networks' new_pools
        
-       This ensures a low GT_UNIVERSE_BUDGET never drops the primary Solana feed.
+       With default GT_UNIVERSE_BUDGET=5: sol_new p1, sol_new p2, sol_trending, 
+       bsc_trending, robinhood_trending. This ensures low budget never drops 
+       Solana's high-quality trending feed that reaches the judge.
        
        Universe scan respects its own budget (set via limiter.set_universe_budget()).
        When universe budget exhausted, stops paging and uses what it has.
@@ -356,7 +359,31 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
             for pool in r.get("data", []):
                 process_pool(pool, "solana")
     
-    # Phase 2: Other networks' trending_pools (second priority)
+    # Phase 2: Solana trending_pools (second priority - liquid tokens that reach judge)
+    if "solana" in nets and include_trending:
+        r, should_continue = _gt_call_with_retry(
+            f"{GT}/networks/solana/trending_pools",
+            {"page": 1},
+            limiter,
+            priority=False,
+            retry_on_429=True,  # trending feeds retry once
+            is_universe=True
+        )
+        if r is None:
+            if should_continue:
+                # Universe budget exhausted
+                log.info("universe scan budget exhausted after %d pages (during solana trending_pools)", 
+                         pages_fetched)
+                return ids, gt_txns_cache
+            else:
+                log.warning("GeckoTerminal 429 on solana trending_pools, skipping Solana trending")
+        else:
+            pages_fetched += 1
+            
+            for pool in r.get("data", []):
+                process_pool(pool, "solana")
+    
+    # Phase 3: Other networks' trending_pools (third priority)
     other_nets = [n for n in nets if n != "solana"]
     if include_trending and other_nets:
         for net in other_nets:
@@ -383,7 +410,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
             for pool in r.get("data", []):
                 process_pool(pool, net)
     
-    # Phase 3: Other networks' new_pools (lowest priority)
+    # Phase 4: Other networks' new_pools (lowest priority)
     for net in other_nets:
         net_pages = 1 if net == "robinhood" else pages
         for page in range(1, net_pages + 1):
