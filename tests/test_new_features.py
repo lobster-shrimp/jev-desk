@@ -933,3 +933,44 @@ def test_pick_exception_handled():
     # Should not raise, returns None
     result = pick(fake_judge, [(dossier, answers)])
     assert result is None
+
+
+def test_pick_exception_scrubs_secrets(caplog):
+    """Pick exception handling should scrub secrets from error messages."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    
+    # Mock judge that raises exception with secret in message
+    def fake_judge(question_set, state):
+        if question_set == "pick":
+            raise Exception("Connection failed: https://api.example.com/judge?api-key=SECRET999")
+        return {"model": "test", "answers": {}, "usage": {}}
+    
+    dossier = {
+        "ticker": "TEST",
+        "addr": "test_addr",
+        "net": 1399811149,
+        "chain": "solana",
+        "age_minutes": 30,
+        "mcap_usd": 500000,
+        "liquidity_usd": 50000,
+        "holder_count": 200
+    }
+    
+    answers = {
+        "shape": {"type": "choice", "choice": "crowd", "probabilities": {"crowd": 0.8}},
+        "concentration_is_exit_risk": {"type": "noul", "noul": 0.45}
+    }
+    
+    # Should not raise, returns None
+    result = pick(fake_judge, [(dossier, answers)])
+    assert result is None
+    
+    # Check log was captured
+    assert len(caplog.records) > 0
+    log_messages = " ".join([r.message for r in caplog.records])
+    
+    # Secret should be redacted
+    assert "REDACTED" in log_messages
+    assert "SECRET999" not in log_messages
+    assert "NO PICK" in log_messages

@@ -27,6 +27,7 @@ from collect import universe, shortlist, trade_counts, dossier, social_state, GT
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from fomo_api import FomoAuthError
 from pick import pick, size_factor_for
+from secret_utils import safe_err
 import shadow_ledger
 import collect  # For fallback access
 from thresholds import HARD, SOFT
@@ -444,7 +445,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     try:
         order = pick(judge, survivors)
     except Exception as e:
-        log.warning("pick failed: %s", e)
+        log.warning("pick failed (NO PICK): %s", safe_err(e))
         order = None  # Failed pick means no order this cycle
 
     if order is None:

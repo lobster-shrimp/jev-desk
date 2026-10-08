@@ -11,6 +11,7 @@ NEVER skip worth_trading_at_all. A choice settles which of these. The noul settl
 No trade is a result. Log it with the reason, send it to Telegram, and stand down.
 """
 import logging
+from secret_utils import safe_err
 from thresholds import PICK_MIN_WORTH, PICK_MIN_CONF, DARK_TICKET_CUT, NO_SOCIAL_CUT
 
 log = logging.getLogger(__name__)
@@ -77,5 +78,5 @@ def pick(judge, survivors) -> dict | None:
                                     key=lambda kv: -kv[1])[1:2],
                 "why": {k: v for k, v in ans.items()}}
     except Exception as e:
-        log.warning("pick failed: %s", e)
+        log.warning("pick failed (NO PICK): %s", safe_err(e))
         return None                          # judge error means no pick this cycle
