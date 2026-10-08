@@ -1023,6 +1023,78 @@ def test_run_once_records_tokens(monkeypatch):
             assert t["reason"] is not None
 
 
+def test_run_once_pick_failure_scrubs_secrets_and_no_unbound_error(monkeypatch, caplog):
+    """Pick failure should return (None, stats) without UnboundLocalError and scrub secrets."""
+    import logging
+    
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    # Test both one and two survivors (pick should fail for both)
+    for num_survivors in [1, 2]:
+        caplog.clear()
+        
+        def fake_shortlist(fomo, id_list):
+            tokens = []
+            for i in range(num_survivors):
+                tid = f"SurvivorToken{i}:1399811149"
+                t = tok(i, tid=tid, addr=f"SurvivorToken{i}", age_minutes=45)
+                tokens.append(t)
+            return tokens
+        
+        ids = [f"SurvivorToken{i}:1399811149" for i in range(num_survivors)]
+        
+        monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
+        monkeypatch.setattr(collect, "shortlist", fake_shortlist)
+        monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: (
+            {"buys_h1": 540, "sells_h1": 120,
+            "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000}, 'ok'))
+        monkeypatch.setattr(shift, "dossier", lambda t, limiter=None: {
+            **t, "chain": "solana", "top_10_percent": 30,
+            "top_wallet_percent": 0.02, "developer_holding_percentage": 2,
+            "gt_score_details": None, "is_honeypot": None,
+            "mint_authority": None, "freeze_authority": None,
+            "description": "a token", "x_handle": None})
+        
+        # Monkeypatch pick to raise exception with secret
+        def fake_pick_with_secret(judge, survivors):
+            raise Exception("boom api-key=SECRET999")
+        
+        monkeypatch.setattr(shift, "pick", fake_pick_with_secret)
+        
+        # Use a fake judge that always passes
+        def fake_judge(question_set, state):
+            return {"model": "test", "answers": {
+                "concentration_is_exit_risk": {"type": "noul", "noul": 0.3},
+                "momentum_already_spent": {"type": "noul", "noul": 0.3}
+            }, "usage": {}}
+        
+        desk = FakeDesk()
+        
+        # Should return (None, stats) without raising UnboundLocalError
+        with caplog.at_level(logging.WARNING):
+            order, stats = shift.run_once(FakeFomo(), fake_judge, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
+        
+        assert order is None, f"Expected None order on pick failure, got {order}"
+        assert stats is not None, "Expected stats dict even on pick failure"
+        
+        # Check logs contain NO PICK message
+        pick_failed_logs = [r for r in caplog.records if "NO PICK" in r.message]
+        assert len(pick_failed_logs) > 0, \
+            f"Expected 'NO PICK' in logs for {num_survivors} survivors. All logs: {[r.message for r in caplog.records]}"
+        
+        # Check logs do NOT contain the secret
+        all_log_text = " ".join([r.message for r in caplog.records])
+        assert "SECRET999" not in all_log_text, \
+            f"Secret leaked in logs for {num_survivors} survivors: {all_log_text}"
+        
+        # Check logs contain scrubbed version
+        assert "REDACTED" in all_log_text or "boom" in all_log_text, \
+            f"Expected scrubbed error in logs for {num_survivors} survivors: {all_log_text}"
+
+
 def test_normalise_and_clean_handle():
     m = FakeFomo().tokens(["Addr1:56"])["Addr1:56"]
     t = collect.normalise("Addr1:56", m)

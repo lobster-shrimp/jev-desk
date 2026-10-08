@@ -326,7 +326,6 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         # With the try/finally fix (fe4bdaf), this should never fire since young tokens
         # are removed from pending list on all exit paths. Keep as safety check.
         if not is_young and young_pending_dossier:
-            from secret_utils import safe_err
             log.warning("defer old token %s (age %.1fm) while young tokens pending dossier (should not happen after fe4bdaf fix): %s", 
                         t["ticker"], t.get("age_minutes", 0), 
                         [yt.get("ticker", yt.get("tid")) for yt in young_pending_dossier])
@@ -375,7 +374,6 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                                 record(t, "chain", "requeued_after_retry")
                                 continue
                             except Exception as retry_e:
-                                from secret_utils import safe_err
                                 log.warning("young token %s dossier retry failed: %s", t["ticker"], safe_err(retry_e))
                                 book.sit(t["tid"], "dossier_failed")
                                 log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
@@ -408,7 +406,6 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                             record(t, "chain", "requeued_after_retry")
                             continue
                         except Exception as retry_e:
-                            from secret_utils import safe_err
                             log.warning("young token %s dossier retry failed: %s", t["ticker"], safe_err(retry_e))
                             book.sit(t["tid"], "dossier_failed")
                             log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
@@ -424,7 +421,6 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                     record(t, "chain", "requeued")
                     continue
             except Exception as e:
-                from secret_utils import safe_err
                 log.warning("dossier failed %s: %s", t["ticker"], safe_err(e))
                 book.sit(t["tid"], "dossier_failed")
                 log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
