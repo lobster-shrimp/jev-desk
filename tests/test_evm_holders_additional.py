@@ -855,24 +855,33 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
     
     # Total: 1000
     # RobinFunFi locker: 200 (20% raw) - excluded from holder list
-    # Whale: 45 (4.5% raw) - biggest valid holder
-    # Other: 755 smaller holders summing to 755
+    # Whale: 49 (4.9% raw) - biggest valid holder
+    # 100 small holders with ~7.5 each (751 total)
     # Denominator: 1000 (no burns)
-    # After excluding locker: tw = 45/1000 = 0.045 (4.5%, below 5% threshold)
+    # After excluding locker: tw = 49/1000 = 0.049 (4.9%, just below 5% threshold)
+    # If lock WAS subtracted from denominator: tw = 49/(1000-200) = 49/800 = 0.06125 (6.125%, would kill)
     # This tests that denominator is NOT reduced by the locker amount
-    EXPECTED_TOP_WALLET = 45 / 1000  # 0.045
+    EXPECTED_TOP_WALLET = 49 / 1000  # 0.049
+    
+    # Build holders with whale as largest valid holder
+    holders = [
+        {"address": robinfunfi_locker, "balance": 200, "isContract": True},
+        {"address": whale_addr, "balance": 49, "isContract": False},  # Biggest valid holder
+    ]
+    # Add 18 more holders (top-20 for Multicall) with decreasing balances
+    for i in range(2, 20):
+        holders.append({
+            "address": f"0x{i:040x}",
+            "balance": 48 - (i-2),  # 48, 47, 46, ..., 31
+            "isContract": False
+        })
+    # Add one more holder with the remainder
+    remainder = 1000 - 200 - 49 - sum(range(31, 49))  # Total - locker - whale - (48+47+...+31)
+    holders.append({"address": "0x9999999999999999999999999999999999999999", "balance": remainder, "isContract": False})
     
     mock_honeypot = {
         "totalSupply": 1000,
-        "holders": [
-            {"address": robinfunfi_locker, "balance": 200, "isContract": True},
-            {"address": whale_addr, "balance": 45, "isContract": False},  # Biggest valid holder
-            # Simulate many smaller holders
-            {"address": "0x2222222222222222222222222222222222222222", "balance": 40, "isContract": False},
-            {"address": "0x3333333333333333333333333333333333333333", "balance": 35, "isContract": False},
-            {"address": "0x4444444444444444444444444444444444444444", "balance": 30, "isContract": False},
-            {"address": "0x5555555555555555555555555555555555555555", "balance": 650, "isContract": False},  # Rest
-        ]
+        "holders": holders
     }
     
     with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
@@ -885,9 +894,9 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
     
         mock_get.side_effect = side_effect
         
-        # Multicall response (6 holders x 2 calls each = 12 results, all not pools)
+        # Multicall response (top-20 holders x 2 calls each = 40 results, all not pools)
         from eth_abi import encode
-        multicall_result = encode(['(bool,bytes)[]'], [[(False, b'')] * 12])
+        multicall_result = encode(['(bool,bytes)[]'], [[(False, b'')] * 40])
         mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
         
         result = evm_holders.evm_holder_concentration(56, "0xcccccccccccccccccccccccccccccccccccccccc", [], 120, book.DB)
