@@ -333,40 +333,68 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             record(t, "chain", "deferred_for_young")
             continue
 
-        d = None
+        # Ensure young tokens are removed from pending list on ANY exit path
         try:
-            d = dossier(t, limiter=gt_limiter)   # pass three: one GeckoTerminal slot (budget-aware)
-            # Success: remove from young pending if applicable
-            if is_young and t in young_pending_dossier:
-                young_pending_dossier.remove(t)
-        except DossierRetryNeeded as e:
-            log.info("dossier retry needed for %s (age %.1fm): %s", 
-                     t["ticker"], t.get("age_minutes", 0), e)
-            
-            # Young tokens get one in-cycle retry if backoff fits (<=30s cap)
-            if is_young:
-                # Check if backoff fits in-cycle (30s cap for in-cycle retry)
-                now = time.time()
-                wait_cap_sec = 30.0
+            d = None
+            try:
+                d = dossier(t, limiter=gt_limiter)   # pass three: one GeckoTerminal slot (budget-aware)
+            except DossierRetryNeeded as e:
+                log.info("dossier retry needed for %s (age %.1fm): %s", 
+                         t["ticker"], t.get("age_minutes", 0), e)
                 
-                if gt_limiter.backoff_until > now:
-                    wait_needed = gt_limiter.backoff_until - now
+                # Young tokens get one in-cycle retry if backoff fits (<=30s cap)
+                if is_young:
+                    # Check if backoff fits in-cycle (30s cap for in-cycle retry)
+                    now = time.time()
+                    wait_cap_sec = 30.0
                     
-                    if wait_needed <= wait_cap_sec:
-                        # Backoff fits, wait and retry
-                        log.info("young token %s (age %.1fm) hit 429, waiting %.1fs for in-cycle retry", 
-                                 t["ticker"], t.get("age_minutes", 0), wait_needed)
-                        time.sleep(wait_needed)
+                    if gt_limiter.backoff_until > now:
+                        wait_needed = gt_limiter.backoff_until - now
                         
+                        if wait_needed <= wait_cap_sec:
+                            # Backoff fits, wait and retry
+                            log.info("young token %s (age %.1fm) hit 429, waiting %.1fs for in-cycle retry", 
+                                     t["ticker"], t.get("age_minutes", 0), wait_needed)
+                            time.sleep(wait_needed)
+                            
+                            try:
+                                d = dossier(t, limiter=gt_limiter)
+                                log.info("young token %s dossier succeeded on in-cycle retry after %.1fs wait", 
+                                         t["ticker"], wait_needed)
+                            except DossierRetryNeeded as retry_e:
+                                log.info("young token %s dossier failed on in-cycle retry, deferring: %s", 
+                                         t["ticker"], retry_e)
+                                now = time.time()
+                                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                                book.defer(t["tid"], now, drop_at)
+                                stats["requeued"] += 1
+                                record(t, "chain", "requeued_after_retry")
+                                continue
+                            except Exception as retry_e:
+                                log.warning("young token %s dossier retry failed: %s", t["ticker"], retry_e)
+                                book.sit(t["tid"], "dossier_failed")
+                                log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
+                                book.forget_defer(t["tid"])
+                                record(t, "chain", "dossier_failed")
+                                continue
+                        else:
+                            # Backoff too long, defer
+                            log.info("young token %s (age %.1fm) hit 429, backoff %.1fs > cap %.1fs, deferring", 
+                                     t["ticker"], t.get("age_minutes", 0), wait_needed, wait_cap_sec)
+                            drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                            book.defer(t["tid"], now, drop_at)
+                            stats["requeued"] += 1
+                            record(t, "chain", "requeued_429_backoff")
+                            continue
+                    else:
+                        # No backoff, try immediately
+                        log.info("young token %s (age %.1fm) retrying dossier (no backoff)", 
+                                 t["ticker"], t.get("age_minutes", 0))
                         try:
                             d = dossier(t, limiter=gt_limiter)
-                            # Success on retry: remove from young pending
-                            if t in young_pending_dossier:
-                                young_pending_dossier.remove(t)
-                            log.info("young token %s dossier succeeded on in-cycle retry after %.1fs wait", 
-                                     t["ticker"], wait_needed)
+                            log.info("young token %s dossier succeeded on immediate retry", t["ticker"])
                         except DossierRetryNeeded as retry_e:
-                            log.info("young token %s dossier failed on in-cycle retry, deferring: %s", 
+                            log.info("young token %s dossier failed on immediate retry, deferring: %s", 
                                      t["ticker"], retry_e)
                             now = time.time()
                             drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
@@ -381,117 +409,86 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                             book.forget_defer(t["tid"])
                             record(t, "chain", "dossier_failed")
                             continue
-                    else:
-                        # Backoff too long, defer
-                        log.info("young token %s (age %.1fm) hit 429, backoff %.1fs > cap %.1fs, deferring", 
-                                 t["ticker"], t.get("age_minutes", 0), wait_needed, wait_cap_sec)
-                        drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
-                        book.defer(t["tid"], now, drop_at)
-                        stats["requeued"] += 1
-                        record(t, "chain", "requeued_429_backoff")
-                        continue
                 else:
-                    # No backoff, try immediately
-                    log.info("young token %s (age %.1fm) retrying dossier (no backoff)", 
-                             t["ticker"], t.get("age_minutes", 0))
-                    try:
-                        d = dossier(t, limiter=gt_limiter)
-                        if t in young_pending_dossier:
-                            young_pending_dossier.remove(t)
-                        log.info("young token %s dossier succeeded on immediate retry", t["ticker"])
-                    except DossierRetryNeeded as retry_e:
-                        log.info("young token %s dossier failed on immediate retry, deferring: %s", 
-                                 t["ticker"], retry_e)
-                        now = time.time()
-                        drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
-                        book.defer(t["tid"], now, drop_at)
-                        stats["requeued"] += 1
-                        record(t, "chain", "requeued_after_retry")
-                        continue
-                    except Exception as retry_e:
-                        log.warning("young token %s dossier retry failed: %s", t["ticker"], retry_e)
-                        book.sit(t["tid"], "dossier_failed")
-                        log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
-                        book.forget_defer(t["tid"])
-                        record(t, "chain", "dossier_failed")
-                        continue
-            else:
-                # Old token: defer without in-cycle retry
-                now = time.time()
-                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
-                book.defer(t["tid"], now, drop_at)
-                stats["requeued"] += 1
-                record(t, "chain", "requeued")
+                    # Old token: defer without in-cycle retry
+                    now = time.time()
+                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                    book.defer(t["tid"], now, drop_at)
+                    stats["requeued"] += 1
+                    record(t, "chain", "requeued")
+                    continue
+            except Exception as e:
+                log.warning("dossier failed %s: %s", t["ticker"], e)
+                book.sit(t["tid"], "dossier_failed")
+                log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
+                book.forget_defer(t["tid"])
+                record(t, "chain", "dossier_failed")
+                continue                             # missing is missing, not a pass
+            
+            # If we get here without a dossier, it was a non-retry exception path
+            if d is None:
                 continue
-        except Exception as e:
-            log.warning("dossier failed %s: %s", t["ticker"], e)
-            # Keep young tokens in pending list so old tokens don't get slots
-            book.sit(t["tid"], "dossier_failed")
-            log.info("defer outcome tid=%s reason=dossier_failed", t["tid"])
-            book.forget_defer(t["tid"])
-            record(t, "chain", "dossier_failed")
-            continue                             # missing is missing, not a pass
-        
-        # If we get here without a dossier, it was a non-retry exception path
-        if d is None:
-            continue
 
-        if (k := chain_kill(d)):
-            # Log chain kill with holder metrics (top_10, top_wallet, pools_excluded)
-            log.info("chain tid=%s ticker=%s reason=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s pools_excluded=%s holder_count=%s",
-                     d.get("tid"), d.get("ticker", "?"), k, d.get("age_minutes"),
-                     d.get("top_10_percent"), d.get("top_wallet_percent"), 
-                     d.get("pools_excluded", False), d.get("holder_count"))
-            book.sit(t["tid"], k)                # facts bench longest
-            log.info("defer outcome tid=%s reason=%s", t["tid"], k)
-            book.forget_defer(t["tid"])
-            stats["chain"][k] = stats["chain"].get(k, 0) + 1
-            record(d, "chain", k)
-            continue
+            if (k := chain_kill(d)):
+                # Log chain kill with holder metrics (top_10, top_wallet, pools_excluded)
+                log.info("chain tid=%s ticker=%s reason=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s pools_excluded=%s holder_count=%s",
+                         d.get("tid"), d.get("ticker", "?"), k, d.get("age_minutes"),
+                         d.get("top_10_percent"), d.get("top_wallet_percent"), 
+                         d.get("pools_excluded", False), d.get("holder_count"))
+                book.sit(t["tid"], k)                # facts bench longest
+                log.info("defer outcome tid=%s reason=%s", t["tid"], k)
+                book.forget_defer(t["tid"])
+                stats["chain"][k] = stats["chain"].get(k, 0) + 1
+                record(d, "chain", k)
+                continue
 
-        d["intended_ticket_usd"] = bank * 0.06   # the most SIZE could ever allow
-        d["x_account"] = desk.read_x(d["x_handle"]) if d["x_handle"] else None
+            d["intended_ticket_usd"] = bank * 0.06   # the most SIZE could ever allow
+            d["x_account"] = desk.read_x(d["x_handle"]) if d["x_handle"] else None
 
-        ans = {}
-        try:
-            ans |= judge("market", d)["answers"]                  # pass four
-            ans |= judge(CHAIN_SET[d["net"]], d)["answers"]
-            if d["x_account"]:
-                ans |= judge("social", social_state(d))["answers"]
-            stats["judged"] += 1
-        except RuntimeError as e:                # 422: the question is wrong and stays wrong
-            log.error("malformed question set, stopping cycle: %s", e)
-            raise JudgeDown(str(e))
-        except Exception as e:
-            log.warning("judge failed %s: %s", d["ticker"], e)
-            continue                             # no bench: the token is not at fault
+            ans = {}
+            try:
+                ans |= judge("market", d)["answers"]                  # pass four
+                ans |= judge(CHAIN_SET[d["net"]], d)["answers"]
+                if d["x_account"]:
+                    ans |= judge("social", social_state(d))["answers"]
+                stats["judged"] += 1
+            except RuntimeError as e:                # 422: the question is wrong and stays wrong
+                log.error("malformed question set, stopping cycle: %s", e)
+                raise JudgeDown(str(e))
+            except Exception as e:
+                log.warning("judge failed %s: %s", d["ticker"], e)
+                continue                             # no bench: the token is not at fault
 
-        soft_result = soft_kill(ans, age_minutes=d.get("age_minutes"))
-        if soft_result:
-            reason, noul = soft_result
-            # Collect all SOFT scores that were asked (compact one-line summary)
-            soft_scores = {}
-            for name in SOFT.keys():
-                a = ans.get(name)
-                if a:
-                    v = a.get("noul", a.get("score"))
-                    if v is not None:
-                        soft_scores[name] = v
-            # Log detailed soft kill with noul and age
-            log.info("soft tid=%s ticker=%s reason=%s noul=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s developer_holding_percentage=%s holder_count=%s rpc_ok=%s soft_scores=%s",
-                     d.get("tid"), d.get("ticker"), reason, noul, d.get("age_minutes"),
-                     d.get("top_10_percent"), d.get("top_wallet_percent"), d.get("developer_holding_percentage"),
-                     d.get("holder_count"), d.get("rpc_ok"),
-                     {k: round(v, 3) for k, v in soft_scores.items()})
-            book.sit(t["tid"], reason, age_minutes=t.get("age_minutes"))
-            log.info("defer outcome tid=%s reason=%s", t["tid"], reason)
-            book.forget_defer(t["tid"])
-            stats["soft"][reason] = stats["soft"].get(reason, 0) + 1
-            record(d, "soft", reason, soft_noul=noul, soft_scores=soft_scores)
-            continue
+            soft_result = soft_kill(ans, age_minutes=d.get("age_minutes"))
+            if soft_result:
+                reason, noul = soft_result
+                # Collect all SOFT scores that were asked (compact one-line summary)
+                soft_scores = {}
+                for name in SOFT.keys():
+                    a = ans.get(name)
+                    if a:
+                        v = a.get("noul", a.get("score"))
+                        if v is not None:
+                            soft_scores[name] = v
+                # Log detailed soft kill with noul and age
+                log.info("soft tid=%s ticker=%s reason=%s noul=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s developer_holding_percentage=%s holder_count=%s rpc_ok=%s soft_scores=%s",
+                         d.get("tid"), d.get("ticker"), reason, noul, d.get("age_minutes"),
+                         d.get("top_10_percent"), d.get("top_wallet_percent"), d.get("developer_holding_percentage"),
+                         d.get("holder_count"), d.get("rpc_ok"),
+                         {k: round(v, 3) for k, v in soft_scores.items()})
+                book.sit(t["tid"], reason, age_minutes=t.get("age_minutes"))
+                log.info("defer outcome tid=%s reason=%s", t["tid"], reason)
+                book.forget_defer(t["tid"])
+                stats["soft"][reason] = stats["soft"].get(reason, 0) + 1
+                record(d, "soft", reason, soft_noul=noul, soft_scores=soft_scores)
+                continue
 
-        record(d, "judged", None)
-        survivors.append((d, ans))
+            record(d, "judged", None)
+            survivors.append((d, ans))
+        finally:
+            # Remove from young_pending_dossier on any exit path (success, defer, bench, exception)
+            if is_young and t in young_pending_dossier:
+                young_pending_dossier.remove(t)
 
     # Clear carry for all processed tokens (any outcome: benched, killed, deferred, evaluated)
     book.clear_carry(processed_tids)
