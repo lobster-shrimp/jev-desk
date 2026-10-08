@@ -168,6 +168,16 @@ def _holders_honeypot(chain_id: int, token: str, timeout: float) -> tuple[dict |
         if total_supply == 0 or total_supply is None:
             return None, "zero_supply"
         
+        # Ensure totalSupply is int
+        if isinstance(total_supply, str):
+            try:
+                total_supply = int(total_supply)
+            except (ValueError, TypeError):
+                return None, "invalid_supply"
+        
+        # Update data with parsed supply
+        data["totalSupply"] = total_supply
+        
         holders = data.get("holders", [])
         if not holders:
             return None, "no_holders"
@@ -195,16 +205,18 @@ def _holders_rpc_fold(token: str, timeout: float, db: sqlite3.Connection) -> tup
     
     def rpc_call(method: str, params: list) -> tuple[dict | None, str | None]:
         """Make one RPC call with rate limiting."""
-        if time.time() - start_time > timeout:
+        elapsed = time.time() - start_time
+        if elapsed > timeout:
             return None, "timeout"
         
         limiter.wait()
         
         try:
+            remaining_timeout = max(5, timeout - elapsed)  # At least 5 seconds
             resp = requests.post(
                 rpc_url,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                timeout=min(10, timeout - (time.time() - start_time))
+                timeout=remaining_timeout
             )
             
             if resp.status_code == 429:
@@ -765,7 +777,16 @@ def evm_holder_concentration(chain_id: int, token: str, pair_addrs: list[str],
             holders_raw = data["holders"]
             
             # Convert to (address, balance, is_contract) format
-            holders = [(h["address"], h["balance"], h.get("isContract", False)) for h in holders_raw]
+            # Ensure balances are integers
+            holders = []
+            for h in holders_raw:
+                balance = h["balance"]
+                if isinstance(balance, str):
+                    try:
+                        balance = int(balance)
+                    except (ValueError, TypeError):
+                        balance = 0
+                holders.append((h["address"], balance, h.get("isContract", False)))
             
             # Get GoPlus data for lock checks (only if we have large holders)
             goplus_data = None
