@@ -186,19 +186,27 @@ CARRY_CAP = 60  # Maximum ids to carry forward
 CARRY_MAX_CYCLES = 2  # Drop entries carried more than this many cycles
 
 
-def save_carry(tids: list[str]):
-    """Store unevaluated tids for next cycle, capped at CARRY_CAP. Ages out entries."""
-    # First, increment cycles_carried for existing entries
+def age_carry():
+    """Age all carry entries and prune those carried too long. Call every cycle."""
+    # Increment cycles_carried for all entries
     DB.execute("UPDATE carry SET cycles_carried = cycles_carried + 1")
     
     # Delete entries that have been carried too long
-    DB.execute("DELETE FROM carry WHERE cycles_carried > ?", (CARRY_MAX_CYCLES,))
+    deleted = DB.execute("DELETE FROM carry WHERE cycles_carried > ?", (CARRY_MAX_CYCLES,)).rowcount
     
-    # Get current carry count after cleanup
+    DB.commit()
+    
+    if deleted > 0:
+        log.info("carry aging: pruned %d entries (carried > %d cycles)", deleted, CARRY_MAX_CYCLES)
+
+
+def save_carry(tids: list[str]):
+    """Store unevaluated tids for next cycle, capped at CARRY_CAP. Keeps highest-priority (first in list)."""
+    # Get current carry count (after aging has been done)
     current_count = DB.execute("SELECT COUNT(*) FROM carry").fetchone()[0]
     available_slots = max(0, CARRY_CAP - current_count)
     
-    # Insert new tids (up to available slots)
+    # Keep highest-priority tids (first in list, which are oldest-carried or new high-priority)
     new_tids = tids[:available_slots]
     for tid in new_tids:
         # Insert or ignore if already exists (preserve existing cycles_carried)
@@ -208,7 +216,7 @@ def save_carry(tids: list[str]):
     
     dropped = len(tids) - len(new_tids)
     if dropped > 0:
-        log.info("carry cap reached: stored %d, dropped %d oldest", len(new_tids), dropped)
+        log.info("carry cap reached: stored %d, dropped %d lowest-priority", len(new_tids), dropped)
 
 
 def get_carry() -> list[str]:

@@ -106,30 +106,61 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     due = book.defer_due()                       # ids ready for rescoring
     carry = book.get_carry()                     # unevaluated ids from previous cycle
     
-    if carry:
-        log.info("carrying %d unevaluated ids from previous cycle to front of shortlist", len(carry))
+    # Age carry every cycle (including ids that shortlist drops)
+    book.age_carry()
+    
+    # Cap carry admission per cycle: leave room for due ids
+    # Due ids get highest priority, so reserve budget for them
+    carry_cap_this_cycle = max(0, min(len(carry), DEX_BUDGET * 2) - len(due))
+    carry_admitted = carry[:carry_cap_this_cycle]
+    
+    if carry_admitted:
+        log.info("carrying %d of %d unevaluated ids (cap=%d due to %d due ids)",
+                 len(carry_admitted), len(carry), carry_cap_this_cycle, len(due))
+    
+    # Tag tids with tier for priority preservation: due=0, carry=1, universe=2
+    tid_tier = {}
+    for tid in due:
+        tid_tier[tid] = 0
+    for tid in carry_admitted:
+        tid_tier[tid] = 1
+    for tid in ids:
+        tid_tier[tid] = 2
     
     seen_ids = set()
     combined_ids = []
-    # Priority order: carry (unevaluated from last cycle), due (deferred), then universe (new)
-    for tid in carry + due + ids:
+    # Priority order: due, carry (admitted), GT, FOMO feeds
+    # Cap at 200 ids to limit FOMO batch load
+    for tid in due + carry_admitted + ids:
         if tid not in seen_ids:
             seen_ids.add(tid)
             combined_ids.append(tid)
+            if len(combined_ids) >= 200:
+                log.info("shortlist input capped at 200 ids (due=%d, carry=%d, universe=%d available)",
+                         len(due), len(carry_admitted), len(ids))
+                break
     
     shortlist_result = list(shortlist(fomo, combined_ids))
     shortlist_tids = {t["tid"] for t in shortlist_result}
+    
+    # Tag tokens with their tier for priority sorting
+    for t in shortlist_result:
+        t["_tier"] = tid_tier.get(t["tid"], 2)  # Default to universe tier
+    
     for tid in due:
         if tid not in shortlist_tids:
             log.info("defer outcome tid=%s reason=miss", tid)
             book.forget_defer(tid)
     
-    # Age-prioritize for dossier work: separate young (<60m) vs old (≥60m) tokens.
-    # Within each group, preserve turnover ordering from shortlist.
-    # Process young tokens first to ensure they get dossier budget before old requeues.
-    young_tokens = [t for t in shortlist_result if t.get("age_minutes", 0) < 60]
-    old_tokens = [t for t in shortlist_result if t.get("age_minutes", 0) >= 60]
-    age_prioritized = young_tokens + old_tokens
+    # Sort by: young tokens first (globally), then by tier within each age group
+    # This ensures young tokens don't get starved, and within age groups due/carry/universe priority is preserved
+    def sort_key(t):
+        tier = t.get("_tier", 2)
+        is_young = t.get("age_minutes", 0) < 60
+        # Sort by: (not is_young globally, then tier within age group)
+        return (not is_young, tier)
+    
+    age_prioritized = sorted(shortlist_result, key=sort_key)
     
     # Track young tokens that still need dossiers this cycle (for in-cycle retry logic)
     young_pending_dossier = []
@@ -137,7 +168,6 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     
     evaluated_count = 0  # Track how many tokens we evaluated before budget exhaustion
     for idx, t in enumerate(age_prioritized):    # pass one: free, no per-token requests
-        evaluated_tids.append(t["tid"])  # Track that we saw this token
         stats["seen"] += 1
         t.setdefault("chain", CHAIN_SET.get(t["net"]))
         if book.benched(t["tid"]):               # already judged, still serving its time
@@ -181,22 +211,26 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                  t.get("liquidity_usd"), 
                  t.get("volume_h24"), 
                  t.get("mcap_usd"))
-        book.forget_defer(t["tid"])
         log.info("defer outcome tid=%s reason=pass", t["tid"])
         
         # Track free passers for circuit breaker
         free_passers.append(t)
-        evaluated_count = idx + 1  # Track last evaluated index
 
         if dex_slots <= 0 or gt_limiter.available() <= 0:
-            # Log unevaluated tokens and carry them to next cycle
-            unevaluated = age_prioritized[evaluated_count:]
+            # Log unevaluated tokens (including current) and carry them to next cycle
+            # Current token passed free but hasn't been trade-checked yet
+            unevaluated = age_prioritized[idx:]  # Include current token
             if unevaluated:
                 log.info("unevaluated %d ids (dex_slots=%d, gt_available=%d)",
                          len(unevaluated), dex_slots, gt_limiter.available())
                 # Store for next cycle carry (prepend to shortlist)
                 book.save_carry([t["tid"] for t in unevaluated])
             break                                # out of budget, not out of ideas
+        
+        # Defer row cleared only after we confirm we're processing this token
+        book.forget_defer(t["tid"])
+        # Token is now being fully evaluated (passed free, about to trade check)
+        evaluated_tids.append(t["tid"])
 
         # Call trade_counts with new signature and GT fallback cache
         trade_data, dex_status = trade_counts(t, gt_txns_cache=gt_txns_cache)

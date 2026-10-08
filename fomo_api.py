@@ -143,13 +143,21 @@ class Fomo:
     # ---- data ------------------------------------------------------------------
     def tokens(self, ids: list[str]) -> dict[str, dict]:
         """{'<addr>:<netId>': {symbol, mcap, liq, vol24, price, holders, change{sec:pct}, created}}
-           Twenty per call. Hundreds of candidates cost you a handful of requests."""
+           Twenty per call. Hundreds of candidates cost you a handful of requests.
+           Failed batches are logged and skipped (only that batch is lost)."""
+        from secret_utils import safe_err
         out = {}
         for i in range(0, len(ids), BATCH):
             chunk = ids[i:i + BATCH]
-            rows = self._filter_tokens(chunk)
-            for tid, m in rows.items():
-                out[tid] = self._row(m)
+            try:
+                rows = self._filter_tokens(chunk)
+                for tid, m in rows.items():
+                    out[tid] = self._row(m)
+            except Exception as e:
+                # Log batch failure with safe error scrubbing, continue with remaining batches
+                log.warning("FOMO filterTokens batch %d-%d failed: %s (skipping %d ids)",
+                           i, i + len(chunk), safe_err(e), len(chunk))
+                continue
         return out
 
     def trending_tokens(self) -> list[str]:
