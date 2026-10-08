@@ -12,6 +12,7 @@ comparisons here and not questions in questions.py.
 Log every rejection with the check that fired. Under ten rejections a day and your
 filter is misconfigured, not your market.
 """
+from secret_utils import safe_err
 from thresholds import HARD, SOFT, SHAPE_MIN_CROWD
 
 
@@ -124,7 +125,7 @@ def chain_kill(d) -> str | None:
             except Exception as e:
                 # RPC failure means unknown, don't kill on absence of proof
                 ticker = d.get("ticker", d.get("addr", "unknown"))
-                log.debug("authority_check %s RPC failed: %s, treating as unknown", ticker, e)
+                log.debug("authority_check %s RPC failed: %s, treating as unknown", ticker, safe_err(e))
     
     if d.get("chain") in ("bsc", "base") and d.get("is_honeypot") is True:
         return "honeypot"                # also a fact

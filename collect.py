@@ -16,6 +16,7 @@ from collections import deque
 import requests
 
 from fomo_api import Fomo                      # Privy bearer out of Chrome over CDP
+from secret_utils import safe_err
 
 log = logging.getLogger("collect")
 
@@ -28,6 +29,8 @@ class GTRateLimiter:
     calls over universe pagination via reservation.
     
     Also tracks 429 responses and enforces backoff based on Retry-After header.
+    
+    Supports separate budgets for universe scan vs dossiers to prevent bunching.
     
     Shared across the entire process, not per-cycle."""
     
@@ -43,6 +46,11 @@ class GTRateLimiter:
         self.backoff_max_sec = backoff_max_sec  # cap on backoff duration
         self.consecutive_429s = 0  # track consecutive 429s for adaptive backoff
         self.saturated = False  # window is saturated after a 429
+        
+        # Universe scan budget tracking (separate from dossier budget)
+        # Default to unlimited (999999) so tests without set_universe_budget() don't break
+        self.universe_budget = 999999  # set via set_universe_budget() per cycle
+        self.universe_calls_used = 0  # reset per cycle
     
     def available(self) -> int:
         """How many GT calls can be made without waiting."""
@@ -147,6 +155,30 @@ class GTRateLimiter:
             log.info("GT budget: reserved %d for dossiers, %d remain for universe", 
                      reserved, self.calls_per_min - reserved)
         return reserved
+    
+    def set_universe_budget(self, budget: int):
+        """Set the universe scan budget for this cycle and reset usage counter.
+        
+        Called at cycle start to allocate a fixed number of calls for universe scan.
+        When exhausted, universe scan stops paging instead of waiting."""
+        self.universe_budget = budget
+        self.universe_calls_used = 0
+        log.info("GT universe budget: allocated %d calls for this cycle", budget)
+    
+    def spend_universe(self, cost: int = 1) -> bool:
+        """Try to spend `cost` from the universe budget.
+        
+        Returns True if spent, False if universe budget exhausted.
+        Does NOT block or wait - universe scan should stop when False.
+        Does NOT check rolling window budget - that's checked separately."""
+        if self.universe_calls_used + cost > self.universe_budget:
+            log.info("GT universe budget exhausted: tried to spend %d, used %d/%d", 
+                     cost, self.universe_calls_used, self.universe_budget)
+            return False
+        self.universe_calls_used += cost
+        log.debug("GT universe budget: spent %d, used %d/%d", 
+                  cost, self.universe_calls_used, self.universe_budget)
+        return True
 
 GT  = "https://api.geckoterminal.com/api/v2"
 DEX = "https://api.dexscreener.com/token-pairs/v1"  # New documented endpoint
@@ -178,7 +210,8 @@ def age_minutes(created) -> float:
 
 
 def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None, 
-                        priority: bool = False, retry_on_429: bool = False) -> tuple[dict | None, bool]:
+                        priority: bool = False, retry_on_429: bool = False,
+                        is_universe: bool = False) -> tuple[dict | None, bool]:
     """Make a rate-limited GT API call with optional 429 retry.
     
     Returns (response_json, should_continue):
@@ -186,7 +219,13 @@ def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None,
       - (None, True): budget exhausted, skip but continue other feeds
       - (data, True): success
     
-    If retry_on_429=True (trending feeds), retries once on 429 with backoff."""
+    If retry_on_429=True (trending feeds), retries once on 429 with backoff.
+    If is_universe=True, checks universe budget before spending rolling window budget."""
+    # Check universe budget first if this is a universe call
+    if is_universe and limiter and not limiter.spend_universe(1):
+        # Universe budget exhausted, stop universe scan
+        return None, True
+    
     if limiter:
         # Wait BEFORE spending to avoid burst after backoff
         limiter.wait_if_needed(priority=priority)
@@ -230,7 +269,7 @@ def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None,
             limiter.record_success()  # clear saturated flag on success
         return resp.json(), True
     except Exception as e:
-        log.warning("GT call failed: %s", e)
+        log.warning("GT call failed: %s", safe_err(e))
         return None, False
 
 
@@ -248,10 +287,14 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
        If limiter is provided, paces calls to stay under rate limits. Trending feeds
        retry once on 429 with Retry-After backoff; new_pools pages skip on 429.
        
+       Universe scan respects its own budget (set via limiter.set_universe_budget()).
+       When universe budget exhausted, stops paging and uses what it has.
+       
        Also returns gt_txns_cache: {tid: {"h1": {"buys": N, "sells": N}, "h6": {...}, "h24": {...}}}
        for fallback when DexScreener is degraded."""
     ids, seen = [], set()
     gt_txns_cache = {}  # {tid: transaction data from GT}
+    pages_fetched = 0  # Track total pages for logging
     
     # Phase 1: trending_pools (1 page per network, before new_pools)
     if include_trending:
@@ -261,15 +304,20 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 {"page": 1},
                 limiter,
                 priority=False,
-                retry_on_429=True  # trending feeds retry once
+                retry_on_429=True,  # trending feeds retry once
+                is_universe=True
             )
             if r is None:
                 if should_continue:
-                    log.warning("GT budget exhausted, skipping %s trending_pools", net)
-                    continue
+                    # Universe budget exhausted
+                    log.info("universe scan budget exhausted after %d pages (during %s trending_pools)", 
+                             pages_fetched, net)
+                    return ids, gt_txns_cache
                 else:
                     log.warning("GeckoTerminal 429 on %s trending_pools, skipping trending for this network", net)
                     continue
+            
+            pages_fetched += 1
             
             for pool in r.get("data", []):
                 base = ((pool.get("relationships") or {}).get("base_token") or {})
@@ -312,14 +360,20 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 {"page": page},
                 limiter,
                 priority=False,
-                retry_on_429=False  # new_pools doesn't retry
+                retry_on_429=False,  # new_pools doesn't retry
+                is_universe=True
             )
             if r is None:
                 if should_continue:
-                    log.warning("GT budget exhausted, skipping %s new_pools page %d", net, page)
+                    # Universe budget exhausted
+                    log.info("universe scan budget exhausted after %d pages (during %s new_pools page %d)", 
+                             pages_fetched, net, page)
+                    return ids, gt_txns_cache
                 else:
                     log.warning("GeckoTerminal 429 on %s new_pools page %s, stopping pagination for this network", net, page)
                 break  # stop paging this network
+            
+            pages_fetched += 1
             
             for pool in r.get("data", []):
                 base = ((pool.get("relationships") or {}).get("base_token") or {})
@@ -353,6 +407,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                             "_liq_usd": liq_usd  # track for comparison
                         }
     
+    log.info("universe scan completed: fetched %d pages, found %d tokens", pages_fetched, len(ids))
     return ids, gt_txns_cache
 
 
@@ -670,10 +725,11 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
             if rpc_error:
                 log.warning("solana rpc failed for %s: %s", t["ticker"], rpc_error)
         except Exception as e:
-            log.warning("solana rpc failed for %s: %s", t["ticker"], e)
+            safe_msg = safe_err(e)
+            log.warning("solana rpc failed for %s: %s", t["ticker"], safe_msg)
             d["top_wallet_percent"] = None
             d["rpc_ok"] = False
-            d["rpc_error"] = str(e)
+            d["rpc_error"] = safe_msg
 
     return d
 
@@ -739,7 +795,7 @@ def sol_top_wallet(mint: str) -> tuple[float | None, bool, str | None]:
             return data["result"], None
             
         except Exception as e:
-            return None, str(e)
+            return None, safe_err(e)
     
     supply_result, supply_error = q("getTokenSupply", [mint])
     if supply_error:
