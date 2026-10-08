@@ -38,6 +38,38 @@ def test_safe_err_redacts_api_key_in_url():
     assert "Max retries exceeded" in result
 
 
+def test_safe_err_redacts_bare_path_query():
+    """safe_err() should redact api-key in bare path+query form (real requests format)."""
+    # Real requests.ConnectionError format: only path+query, no host
+    exc = Exception(
+        "HTTPSConnectionPool(host='mainnet.helius-rpc.com', port=443): "
+        "Max retries exceeded with url: /?api-key=SECRETKEY123 (Caused by ...)"
+    )
+    result = safe_err(exc)
+    
+    assert "SECRETKEY123" not in result
+    assert "api-key=REDACTED" in result
+    assert "Max retries exceeded" in result
+
+
+def test_safe_err_handles_real_requests_post():
+    """safe_err() should redact secrets from real requests.post ConnectionError."""
+    # Real-world test: attempt connection to non-routable host
+    try:
+        # 192.0.2.1 is TEST-NET-1, guaranteed non-routable
+        requests.post(
+            "https://192.0.2.1/?api-key=SECRET123",
+            timeout=0.1
+        )
+        pytest.fail("Expected ConnectionError or Timeout")
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        result = safe_err(e)
+        # Verify the secret is redacted
+        assert "SECRET123" not in result
+        # Should contain REDACTED
+        assert "REDACTED" in result or "unprintable" in result.lower()
+
+
 def test_safe_err_redacts_apikey_and_token():
     """safe_err() should redact apikey and token parameters too."""
     exc = Exception("Request to https://api.example.com/?apikey=ABC123&token=XYZ789 failed")
@@ -48,6 +80,17 @@ def test_safe_err_redacts_apikey_and_token():
     assert "REDACTED" in result
 
 
+def test_safe_err_redacts_access_token():
+    """safe_err() should redact access-token and access_token parameters."""
+    exc = Exception("Error: /?access-token=TOKEN123 and /?access_token=TOKEN456")
+    result = safe_err(exc)
+    
+    assert "TOKEN123" not in result
+    assert "TOKEN456" not in result
+    assert "access-token=REDACTED" in result
+    assert "access_token=REDACTED" in result
+
+
 def test_safe_err_redacts_solana_rpc_url():
     """safe_err() should replace the full SOLANA_RPC_URL value if it appears."""
     with patch.dict(os.environ, {"SOLANA_RPC_URL": "https://mainnet.helius-rpc.com/?api-key=SECRET"}):
@@ -56,6 +99,34 @@ def test_safe_err_redacts_solana_rpc_url():
         
         assert "SECRET" not in result
         assert "REDACTED" in result
+
+
+def test_safe_err_redacts_solana_rpc_path_query():
+    """safe_err() should redact SOLANA_RPC_URL's path+query when it appears alone."""
+    with patch.dict(os.environ, {"SOLANA_RPC_URL": "https://mainnet.helius-rpc.com/?api-key=SECRET"}):
+        # Real requests format: host shown separately, only path+query in 'url: ...'
+        exc = Exception(
+            "HTTPSConnectionPool(host='mainnet.helius-rpc.com', port=443): "
+            "Max retries exceeded with url: /?api-key=SECRET (Caused by ...)"
+        )
+        result = safe_err(exc)
+        
+        assert "SECRET" not in result
+        assert "api-key=REDACTED" in result
+
+
+def test_safe_err_handles_unprintable_exception():
+    """safe_err() should handle exceptions with broken __str__ without raising."""
+    class BrokenException(Exception):
+        def __str__(self):
+            raise RuntimeError("Cannot stringify")
+    
+    exc = BrokenException("some error")
+    result = safe_err(exc)
+    
+    # Should not raise, should return safe fallback
+    assert "BrokenException" in result
+    assert "unprintable" in result.lower()
 
 
 def test_safe_err_preserves_exception_type():
@@ -87,10 +158,11 @@ def test_sol_top_wallet_scrubs_rpc_error(caplog):
     """sol_top_wallet() should use safe_err() for exception handling."""
     caplog.set_level(logging.WARNING)
     
-    # Mock requests.post to raise ConnectionError with URL containing api-key
+    # Mock requests.post to raise ConnectionError with real format (path+query only)
     with patch('collect.requests.post') as mock_post:
         mock_post.side_effect = requests.exceptions.ConnectionError(
-            "Max retries exceeded with url: https://mainnet.helius-rpc.com/?api-key=SECRET123"
+            "HTTPSConnectionPool(host='mainnet.helius-rpc.com', port=443): "
+            "Max retries exceeded with url: /?api-key=SECRET123 (Caused by ConnectTimeoutError)"
         )
         
         top_wallet, rpc_ok, rpc_error = sol_top_wallet("SomeMintAddress")
@@ -127,16 +199,17 @@ def test_dossier_scrubs_rpc_error_in_dict():
         }
     }
     
-    # Mock sol_top_wallet to raise exception with secret
+    # Mock sol_top_wallet to raise exception with secret in real format
     with patch('collect.requests.get') as mock_get, \
-         patch('collect.sol_top_wallet') as mock_sol_top:
+         patch('collect.requests.post') as mock_post:
         
         mock_get.return_value.status_code = 200
         mock_get.return_value.json.return_value = gt_response
         
-        # Simulate RPC exception with secret
-        mock_sol_top.side_effect = Exception(
-            "Connection failed to https://mainnet.helius-rpc.com/?api-key=SECRET123"
+        # Simulate RPC exception with secret in real requests format
+        mock_post.side_effect = requests.exceptions.ConnectionError(
+            "HTTPSConnectionPool(host='mainnet.helius-rpc.com', port=443): "
+            "Max retries exceeded with url: /?api-key=SECRET123 (Caused by ConnectTimeoutError)"
         )
         
         result = dossier(token)
@@ -144,7 +217,8 @@ def test_dossier_scrubs_rpc_error_in_dict():
         # Verify rpc_error is scrubbed
         assert "rpc_error" in result
         assert "SECRET123" not in result["rpc_error"]
-        assert "Exception" in result["rpc_error"]
+        assert "ConnectionError" in result["rpc_error"]
+        assert "REDACTED" in result["rpc_error"]
 
 
 def test_judge_payload_never_contains_secret(caplog):
@@ -172,14 +246,17 @@ def test_judge_payload_never_contains_secret(caplog):
     }
     
     with patch('collect.requests.get') as mock_get, \
-         patch('collect.sol_top_wallet') as mock_sol_top, \
+         patch('collect.requests.post') as mock_post, \
          patch.dict(os.environ, {"SOLANA_RPC_URL": "https://mainnet.helius-rpc.com/?api-key=SECRET123"}):
         
         mock_get.return_value.status_code = 200
         mock_get.return_value.json.return_value = gt_response
         
-        # sol_top_wallet returns scrubbed error
-        mock_sol_top.return_value = (None, False, "ConnectionError: Max retries exceeded with url: https://mainnet.helius-rpc.com/?api-key=REDACTED")
+        # Real requests format error
+        mock_post.side_effect = requests.exceptions.ConnectionError(
+            "HTTPSConnectionPool(host='mainnet.helius-rpc.com', port=443): "
+            "Max retries exceeded with url: /?api-key=SECRET123 (Caused by ConnectTimeoutError)"
+        )
         
         result = dossier(token)
         
@@ -323,7 +400,7 @@ def test_universe_scan_logs_pages_fetched(caplog):
     caplog.set_level(logging.INFO)
     
     limiter = GTRateLimiter(calls_per_min=30)
-    limiter.set_universe_budget(2)  # Only 2 pages
+    limiter.set_universe_budget(1)  # Only 1 page to force exhaustion
     
     # Mock GT API to return empty results
     with patch('collect.requests.get') as mock_get:
@@ -331,8 +408,7 @@ def test_universe_scan_logs_pages_fetched(caplog):
         mock_resp.json.return_value = {"data": []}
         mock_get.return_value = mock_resp
         
-        # Call universe with trending enabled (1 page per net) + new_pools (2 pages per net)
-        # With 3 nets, that's 3 trending + 6 new_pools = 9 total, but budget is 2
+        # Call universe with solana (2 pages) - budget will exhaust after page 1
         ids, cache = universe(nets=("solana",), pages=2, include_trending=True, limiter=limiter)
         
         # Should have stopped at budget
@@ -340,8 +416,8 @@ def test_universe_scan_logs_pages_fetched(caplog):
         exhaustion_logs = [r for r in caplog.records if "budget exhausted after" in r.message.lower()]
         assert len(exhaustion_logs) > 0
         
-        # Verify it says "after 2 pages" (the budget)
-        assert "after 2 pages" in exhaustion_logs[0].message.lower()
+        # Verify it says "after 1 page" (the budget)
+        assert "after 1 page" in exhaustion_logs[0].message.lower()
 
 
 if __name__ == "__main__":

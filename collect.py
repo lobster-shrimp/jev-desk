@@ -281,11 +281,12 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
        robinhood is capped at 1 page to avoid 429 rate limits every cycle.
        Other networks fetch 2 pages from new_pools.
        
-       When include_trending=True, fetches 1 page of trending_pools per network BEFORE
-       new_pools pagination. This prioritizes the high-yield trending feed.
+       Fetch order prioritizes Solana's main new_pools feed:
+       1. Solana new_pools (pages 1-2)
+       2. Other networks' trending_pools (1 page each)
+       3. Other networks' new_pools
        
-       If limiter is provided, paces calls to stay under rate limits. Trending feeds
-       retry once on 429 with Retry-After backoff; new_pools pages skip on 429.
+       This ensures a low GT_UNIVERSE_BUDGET never drops the primary Solana feed.
        
        Universe scan respects its own budget (set via limiter.set_universe_budget()).
        When universe budget exhausted, stops paging and uses what it has.
@@ -296,9 +297,69 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
     gt_txns_cache = {}  # {tid: transaction data from GT}
     pages_fetched = 0  # Track total pages for logging
     
-    # Phase 1: trending_pools (1 page per network, before new_pools)
-    if include_trending:
-        for net in nets:
+    # Helper to process pool data
+    def process_pool(pool, net):
+        base = ((pool.get("relationships") or {}).get("base_token") or {})
+        gid  = (base.get("data") or {}).get("id")      # 'solana_<addr>'
+        if not gid or "_" not in gid:
+            return
+        addr = gid.split("_", 1)[1]
+        tid  = f"{addr}:{FOMO_NET[net]}"
+        if tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+        
+        # Cache GT transaction data for DexScreener fallback
+        # Prefer highest liquidity pool if multiple pools for same token
+        attrs = pool.get("attributes", {})
+        txns = attrs.get("transactions", {})
+        if txns:
+            # GT API returns reserve_in_usd as a string
+            reserve_str = attrs.get("reserve_in_usd")
+            try:
+                liq_usd = float(reserve_str) if reserve_str else 0.0
+            except (ValueError, TypeError):
+                liq_usd = 0.0
+            # Only cache if no existing data OR this pool has higher liquidity
+            existing = gt_txns_cache.get(tid)
+            if not existing or liq_usd > existing.get("_liq_usd", 0):
+                gt_txns_cache[tid] = {
+                    "h1": txns.get("h1", {}),
+                    "h6": txns.get("h6", {}),
+                    "h24": txns.get("h24", {}),
+                    "_liq_usd": liq_usd  # track for comparison
+                }
+    
+    # Phase 1: Solana new_pools (highest priority)
+    if "solana" in nets:
+        for page in range(1, pages + 1):
+            r, should_continue = _gt_call_with_retry(
+                f"{GT}/networks/solana/new_pools",
+                {"page": page},
+                limiter,
+                priority=False,
+                retry_on_429=False,
+                is_universe=True
+            )
+            if r is None:
+                if should_continue:
+                    # Universe budget exhausted
+                    log.info("universe scan budget exhausted after %d pages (during solana new_pools page %d)", 
+                             pages_fetched, page)
+                    return ids, gt_txns_cache
+                else:
+                    log.warning("GeckoTerminal 429 on solana new_pools page %s, stopping Solana pagination", page)
+                break  # stop paging Solana
+            
+            pages_fetched += 1
+            
+            for pool in r.get("data", []):
+                process_pool(pool, "solana")
+    
+    # Phase 2: Other networks' trending_pools (second priority)
+    other_nets = [n for n in nets if n != "solana"]
+    if include_trending and other_nets:
+        for net in other_nets:
             r, should_continue = _gt_call_with_retry(
                 f"{GT}/networks/{net}/trending_pools",
                 {"page": 1},
@@ -320,39 +381,10 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
             pages_fetched += 1
             
             for pool in r.get("data", []):
-                base = ((pool.get("relationships") or {}).get("base_token") or {})
-                gid  = (base.get("data") or {}).get("id")      # 'solana_<addr>'
-                if not gid or "_" not in gid:
-                    continue
-                addr = gid.split("_", 1)[1]
-                tid  = f"{addr}:{FOMO_NET[net]}"
-                if tid not in seen:
-                    seen.add(tid)
-                    ids.append(tid)
-                
-                # Cache GT transaction data for DexScreener fallback
-                # Prefer highest liquidity pool if multiple pools for same token
-                attrs = pool.get("attributes", {})
-                txns = attrs.get("transactions", {})
-                if txns:
-                    # GT API returns reserve_in_usd as a string
-                    reserve_str = attrs.get("reserve_in_usd")
-                    try:
-                        liq_usd = float(reserve_str) if reserve_str else 0.0
-                    except (ValueError, TypeError):
-                        liq_usd = 0.0
-                    # Only cache if no existing data OR this pool has higher liquidity
-                    existing = gt_txns_cache.get(tid)
-                    if not existing or liq_usd > existing.get("_liq_usd", 0):
-                        gt_txns_cache[tid] = {
-                            "h1": txns.get("h1", {}),
-                            "h6": txns.get("h6", {}),
-                            "h24": txns.get("h24", {}),
-                            "_liq_usd": liq_usd  # track for comparison
-                        }
+                process_pool(pool, net)
     
-    # Phase 2: new_pools (existing behavior)
-    for net in nets:
+    # Phase 3: Other networks' new_pools (lowest priority)
+    for net in other_nets:
         net_pages = 1 if net == "robinhood" else pages
         for page in range(1, net_pages + 1):
             r, should_continue = _gt_call_with_retry(
@@ -360,7 +392,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 {"page": page},
                 limiter,
                 priority=False,
-                retry_on_429=False,  # new_pools doesn't retry
+                retry_on_429=False,
                 is_universe=True
             )
             if r is None:
@@ -376,36 +408,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
             pages_fetched += 1
             
             for pool in r.get("data", []):
-                base = ((pool.get("relationships") or {}).get("base_token") or {})
-                gid  = (base.get("data") or {}).get("id")      # 'solana_<addr>'
-                if not gid or "_" not in gid:
-                    continue
-                addr = gid.split("_", 1)[1]
-                tid  = f"{addr}:{FOMO_NET[net]}"
-                if tid not in seen:
-                    seen.add(tid)
-                    ids.append(tid)
-                
-                # Cache GT transaction data for DexScreener fallback
-                # Prefer highest liquidity pool if multiple pools for same token
-                attrs = pool.get("attributes", {})
-                txns = attrs.get("transactions", {})
-                if txns:
-                    # GT API returns reserve_in_usd as a string
-                    reserve_str = attrs.get("reserve_in_usd")
-                    try:
-                        liq_usd = float(reserve_str) if reserve_str else 0.0
-                    except (ValueError, TypeError):
-                        liq_usd = 0.0
-                    # Only cache if no existing data OR this pool has higher liquidity
-                    existing = gt_txns_cache.get(tid)
-                    if not existing or liq_usd > existing.get("_liq_usd", 0):
-                        gt_txns_cache[tid] = {
-                            "h1": txns.get("h1", {}),
-                            "h6": txns.get("h6", {}),
-                            "h24": txns.get("h24", {}),
-                            "_liq_usd": liq_usd  # track for comparison
-                        }
+                process_pool(pool, net)
     
     log.info("universe scan completed: fetched %d pages, found %d tokens", pages_fetched, len(ids))
     return ids, gt_txns_cache

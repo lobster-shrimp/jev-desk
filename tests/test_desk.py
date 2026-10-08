@@ -1152,26 +1152,15 @@ def test_universe_robinhood_one_page():
 
 
 def test_universe_includes_trending_pools():
-    """universe should fetch trending_pools in addition to new_pools and dedupe."""
+    """universe should fetch trending_pools for non-solana networks and dedupe."""
     import requests
     
-    # Mock responses: trending_pools FIRST (new order), then new_pools
+    # Mock responses with new order: solana new_pools FIRST, then other networks' trending
     mock_responses = [
-        # Solana trending_pools page 1 (called first now)
+        # Solana new_pools page 1 (highest priority)
         Mock(status_code=200, headers={}, json=lambda: {
             "data": [
-                {"relationships": {"base_token": {"data": {"id": "solana_trend1"}}}},
-                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}}  # will be duplicate later
-            ]
-        }),
-        # BSC trending_pools page 1
-        Mock(status_code=200, headers={}, json=lambda: {
-            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_trend1"}}}}]
-        }),
-        # Solana new_pools page 1
-        Mock(status_code=200, headers={}, json=lambda: {
-            "data": [
-                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}},  # duplicate from trending
+                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}},
                 {"relationships": {"base_token": {"data": {"id": "solana_new2"}}}}
             ]
         }),
@@ -1179,47 +1168,49 @@ def test_universe_includes_trending_pools():
         Mock(status_code=200, headers={}, json=lambda: {
             "data": [{"relationships": {"base_token": {"data": {"id": "solana_new3"}}}}]
         }),
+        # BSC trending_pools page 1 (other networks get trending)
+        Mock(status_code=200, headers={}, json=lambda: {
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "bsc_trend1"}}}},
+                {"relationships": {"base_token": {"data": {"id": "bsc_new1"}}}}  # will be duplicate later
+            ]
+        }),
         # BSC new_pools page 1
         Mock(status_code=200, headers={}, json=lambda: {
-            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_new1"}}}}]
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "bsc_new1"}}}},  # duplicate from trending
+                {"relationships": {"base_token": {"data": {"id": "bsc_new2"}}}}
+            ]
         }),
         # BSC new_pools page 2
         Mock(status_code=200, headers={}, json=lambda: {
-            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_new2"}}}}]
-        })
+            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_new3"}}}}]
+        }),
     ]
     
     original_get = requests.get
-    call_info = []
+    mock_idx = [0]
     
-    def tracked_get(url, **kwargs):
-        call_info.append((url, kwargs.get("params", {})))
-        return mock_responses.pop(0)
+    def mock_get(url, **kwargs):
+        r = mock_responses[mock_idx[0]]
+        mock_idx[0] += 1
+        return r
     
-    requests.get = tracked_get
+    requests.get = mock_get
     
     try:
-        ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
-        
-        # Should have 7 unique IDs (2 solana trend + 3 solana new + 1 bsc trend + 2 bsc new - 1 duplicate)
-        assert len(ids) == 7
-        
-        # Verify no duplicates
-        assert len(ids) == len(set(ids))
-        
-        # Verify trending IDs are included (after split on "_", "solana_trend1" -> "trend1")
-        assert any("trend1:1399811149" in tid for tid in ids)
-        assert any("trend1:56" in tid for tid in ids)
-        
-        # Verify we made calls to both new_pools and trending_pools
-        new_pool_calls = [c for c in call_info if "new_pools" in c[0]]
-        trending_calls = [c for c in call_info if "trending_pools" in c[0]]
-        
-        assert len(new_pool_calls) == 4  # 2 solana + 2 bsc
-        assert len(trending_calls) == 2  # 1 solana + 1 bsc
-        
-        # Verify total call count: 4 new_pools + 2 trending_pools = 6
-        assert len(call_info) == 6
+        ids, _ = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
+        # Should have: 3 solana new + 2 bsc trending (1 unique) + 3 bsc new (2 unique) = 7 unique
+        # Order: solana_new1, solana_new2, solana_new3, bsc_trend1, bsc_new1 (dup), bsc_new2, bsc_new3
+        # After dedup: 7 unique
+        assert len(ids) == 7, f"Expected 7 unique tokens, got {len(ids)}: {ids}"
+        assert "new1:1399811149" in ids  # solana
+        assert "new2:1399811149" in ids  # solana
+        assert "new3:1399811149" in ids  # solana
+        assert "trend1:56" in ids        # bsc trending
+        assert "new1:56" in ids          # bsc (appeared in both trending and new)
+        assert "new2:56" in ids          # bsc
+        assert "new3:56" in ids          # bsc
     finally:
         requests.get = original_get
 
@@ -1459,17 +1450,19 @@ def test_rolling_window_no_more_than_n_calls_per_minute():
 
 
 def test_rate_limiter_trending_before_new_pools():
-    """universe should fetch trending_pools before new_pools."""
+    """universe should prioritize solana new_pools, then other networks' trending."""
     import requests
     
     original_get = requests.get
     call_order = []
     
     def mock_get(url, **kwargs):
-        if "trending_pools" in url:
-            call_order.append("trending")
-        elif "new_pools" in url:
-            call_order.append("new")
+        if "solana" in url and "new_pools" in url:
+            call_order.append("solana_new")
+        elif "bsc" in url and "trending_pools" in url:
+            call_order.append("bsc_trending")
+        elif "bsc" in url and "new_pools" in url:
+            call_order.append("bsc_new")
         return Mock(status_code=200, json=lambda: {
             "data": [{"relationships": {"base_token": {"data": {"id": f"solana_tok1"}}}}]
         })
@@ -1479,12 +1472,15 @@ def test_rate_limiter_trending_before_new_pools():
     try:
         fake_time = [0.0]
         limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
-        collect.universe(nets=("solana",), pages=2, include_trending=True, limiter=limiter)
+        collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True, limiter=limiter)
         
-        # Trending should come before all new_pools
-        assert call_order[0] == "trending", f"Expected trending first, got {call_order}"
-        # Then new_pools pages
-        assert "new" in call_order[1:], f"Expected new_pools after trending, got {call_order}"
+        # Solana new_pools should come first (2 pages)
+        assert call_order[0] == "solana_new", f"Expected solana_new first, got {call_order}"
+        assert call_order[1] == "solana_new", f"Expected solana_new second, got {call_order}"
+        # Then bsc trending
+        assert call_order[2] == "bsc_trending", f"Expected bsc_trending third, got {call_order}"
+        # Then bsc new_pools
+        assert "bsc_new" in call_order[3:], f"Expected bsc_new after trending, got {call_order}"
     finally:
         requests.get = original_get
 
@@ -1498,7 +1494,7 @@ def test_rate_limiter_429_retry_with_backoff():
     
     def mock_get(url, **kwargs):
         call_count[0] += 1
-        if "trending_pools" in url:
+        if "trending_pools" in url and "bsc" in url:
             if call_count[0] == 1:
                 # First call: 429 with Retry-After
                 return Mock(status_code=429, headers={"Retry-After": "0.1"})
@@ -1512,7 +1508,8 @@ def test_rate_limiter_429_retry_with_backoff():
     try:
         fake_time = [0.0]
         limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
-        collect.universe(nets=("solana",), pages=1, include_trending=True, limiter=limiter)
+        # Use bsc (not solana) to test trending retry, since solana doesn't fetch trending
+        collect.universe(nets=("bsc",), pages=1, include_trending=True, limiter=limiter)
         
         # Should have retried (2 calls total for trending: 429 + retry)
         assert call_count[0] >= 2, f"Expected retry, got {call_count[0]} calls"
