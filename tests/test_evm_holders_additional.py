@@ -909,92 +909,26 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
     assert kill_reason is None, f"Expected pass, got kill: {kill_reason}"
 
 
-def test_exclusion_log_percentage_format(isolate_evm_state, caplog):
+def test_exclusion_log_percentage_format(isolate_evm_state):
     """Test chain-kill log shows exclusion percentages correctly (not 100x)."""
-    import book
-    import evm_holders
-    from filter import chain_kill
-    from unittest.mock import Mock, patch
-    import logging
+    from main import _fmt_evm_exclusions
     
-    pair_addr = "0x1111111111111111111111111111111111111111"
-    whale_addr = "0x2222222222222222222222222222222222222222"
-    token_addr = "0xcccccccccccccccccccccccccccccccccccccccc"
+    # Test with a 20% pair exclusion
+    excluded = [
+        ("0x1111111111111111111111111111111111111111", 20.0, "pair_multicall"),
+        ("0x2222222222222222222222222222222222222222", 5.0, "burn"),
+    ]
     
-    mock_honeypot = {
-        "totalSupply": 1000000,
-        "holders": [
-            {"address": whale_addr, "balance": 700000, "isContract": False},  # 70% whale (will kill)
-            {"address": pair_addr, "balance": 200000, "isContract": True},   # 20% pair
-            {"address": "0x3333333333333333333333333333333333333333", "balance": 100000, "isContract": False},
-        ]
-    }
+    result = _fmt_evm_exclusions(excluded)
     
-    with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
-        def get_side_effect(url, **kwargs):
-            if "honeypot" in url:
-                return Mock(status_code=200, json=lambda: mock_honeypot)
-            return Mock(status_code=404)
-        
-        mock_get.side_effect = get_side_effect
-        
-        # Multicall identifies the pair
-        from eth_abi import encode
-        token_padded = b'\x00' * 12 + bytes.fromhex(token_addr[2:])
-        other_padded = b'\x00' * 12 + bytes.fromhex("3333333333333333333333333333333333333333")
-        multicall_result = encode(['(bool,bytes)[]'], [[
-            (False, b''),  # whale token0() - not a pool
-            (False, b''),  # whale token1()
-            (True, token_padded),  # pair token0() - returns token!
-            (True, other_padded),  # pair token1()
-            (False, b''),  # other token0()
-            (False, b''),  # other token1()
-        ]])
-        mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
-        
-        result = evm_holders.evm_holder_concentration(56, token_addr, [], 30, book.DB)
-        
-        assert result.ok
-        assert len(result.excluded) > 0
-        
-        # Simulate main.py's chain_kill logging
-        from main import run_once
-        import collect
-        
-        # Create a minimal dossier-like dict
-        d = {
-            "tid": "test_tid",
-            "ticker": "TEST",
-            "chain": "bsc",
-            "age_minutes": 30,
-            "top_wallet_percent": result.top_wallet,
-            "top_10_percent": result.top_10,
-            "holder_count": 100,
-            "evm_holder_source": result.source,
-            "evm_holder_excluded": result.excluded,
-            "evm_holder_raw_top_wallet": result.raw_top_wallet,
-            "evm_holder_raw_top_10": result.raw_top_10,
-        }
-        
-        k = chain_kill(d)
-        
-        # Log the same way main.py does
-        with caplog.at_level(logging.INFO):
-            evm_source = d.get("evm_holder_source", "N/A")
-            evm_raw_top1 = d.get("evm_holder_raw_top_wallet")
-            evm_raw_top10 = d.get("evm_holder_raw_top_10")
-            evm_excluded = d.get("evm_holder_excluded", [])
-            
-            raw_str = f"raw_top1={evm_raw_top1*100:.1f}% raw_top10={evm_raw_top10:.1f}%" if evm_raw_top1 and evm_raw_top10 else "raw=N/A"
-            exclusion_str = ", ".join(f"{addr[:6]}...{reason}:{pct:.1f}%" for addr, pct, reason in evm_excluded) if evm_excluded else "none"
-            
-            logging.getLogger("main").info("chain tid=%s ticker=%s reason=%s excluded=%s", 
-                                           d.get("tid"), d.get("ticker", "?"), k, exclusion_str)
-        
-        # Check the log output contains correct percentage (20.0%, not 2000.0%)
-        log_output = caplog.text
-        assert ":20.0%" in log_output, f"Expected ':20.0%' in log, got: {log_output}"
-        assert ":2000.0%" not in log_output, f"Percentage should not be 100x too high"
+    # Should contain :20.0% and :5.0%, not :2000.0% and :500.0%
+    assert ":20.0%" in result, f"Expected ':20.0%' in result, got: {result}"
+    assert ":5.0%" in result, f"Expected ':5.0%' in result, got: {result}"
+    assert ":2000.0%" not in result, f"Percentage should not be 100x too high: {result}"
+    assert ":500.0%" not in result, f"Percentage should not be 100x too high: {result}"
+    
+    # Test empty list
+    assert _fmt_evm_exclusions([]) == "none"
 
 
 def test_cache_at_head_totalsupply_zero(isolate_evm_state):

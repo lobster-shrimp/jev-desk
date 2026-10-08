@@ -48,6 +48,20 @@ class JudgeDown(Exception):
     """The judge is unreachable or a question set is malformed. The cycle stands down."""
 
 
+def _fmt_evm_exclusions(excluded: list[tuple[str, float, str]]) -> str:
+    """Format EVM holder exclusions for logging.
+    
+    Args:
+        excluded: List of (address, pct, reason) tuples where pct is 0-100
+    
+    Returns:
+        Formatted string like "0x1234...pair_multicall:20.0%, 0x5678...burn:5.0%"
+    """
+    if not excluded:
+        return "none"
+    return ", ".join(f"{addr[:6]}...{reason}:{pct:.1f}%" for addr, pct, reason in excluded)
+
+
 def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER_RESERVE, 
              gt_limiter=None, gt_universe_budget=GT_UNIVERSE_BUDGET):
     mode_str = "SHADOW" if shadow else "LIVE"
@@ -452,8 +466,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                     # Format raw values
                     raw_str = f"raw_top1={evm_raw_top1*100:.1f}% raw_top10={evm_raw_top10:.1f}%" if evm_raw_top1 and evm_raw_top10 else "raw=N/A"
                     
-                    # Format exclusion reasons (first 3)
-                    exclusion_str = ", ".join(set(reason for _, _, reason in evm_excluded[:3])) if evm_excluded else "none"
+                    # Format exclusion reasons (all of them with percentages)
+                    exclusion_str = _fmt_evm_exclusions(evm_excluded)
                     
                     log.info("chain tid=%s ticker=%s reason=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s holder_count=%s "
                              "evm_source=%s %s excluded=%s",
