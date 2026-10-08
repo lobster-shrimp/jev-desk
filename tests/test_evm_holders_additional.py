@@ -812,6 +812,7 @@ def test_cache_at_head_totalsupply_unavailable(isolate_evm_state):
         
         # chain_kill should return holders_pending
         dossier = {
+            "chain": "bsc",  # EVM chain
             "top_wallet_percent": result.top_wallet,
             "top_10_percent": result.top_10,
             "evm_holder_source": result.source,
@@ -834,7 +835,7 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
     from unittest.mock import Mock, patch
     from datetime import datetime, timezone, timedelta
     
-    robinfunfi_locker = "0x267444d07c9c8c3ccf4ee661cc35e430c8257a73"
+    robinfunfi_locker = "0x267444d099b10fb5ed7c3cc7b7c767adca574952"
     whale_addr = "0x1234567890123456789012345678901234567890"
     
     # Mock GoPlus response with lock >7 days away for RobinFunFi
