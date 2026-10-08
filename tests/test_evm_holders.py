@@ -98,8 +98,8 @@ def test_honeypot_fitcoin_pair_excluded_pass(isolate_evm_state):
         
         # Check exclusions
         exclusions = {addr.lower(): reason for addr, _, reason in result.excluded}
-        assert "0xpair123" in exclusions
-        assert exclusions["0xpair123"] == "pair_dexscreener"
+        assert "0x1111111111111111111111111111111111111111" in exclusions
+        assert exclusions["0x1111111111111111111111111111111111111111"] == "pair_dexscreener"
         
         # Should pass chain_kill thresholds
         d = {"chain": "bsc", "top_wallet_percent": result.top_wallet, "top_10_percent": result.top_10, "holder_count": 100}

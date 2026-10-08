@@ -37,10 +37,11 @@ def test_multicall3_golden_encode_decode(isolate_evm_state):
     expected_data = "0x82ad56cb" + encode(['(address,bool,bytes)[]'], [expected_calls]).hex()
     
     # Mock RPC response: pool returns token addresses, other returns nothing
-    b13b_padded = b"\\x00" * 12 + bytes.fromhex(b13b_token[2:])
+    b13b_padded = b'\x00' * 12 + bytes.fromhex(b13b_token[2:])
+    other_padded = b'\x00' * 12 + bytes.fromhex(other_addr[2:])
     mock_response = encode(['(bool,bytes)[]'], [[
         (True, b13b_padded),  # token0()
-        (True, bytes.fromhex(other_addr[2:]).rjust(32, b'\\x00')),  # token1()
+        (True, other_padded),  # token1()
         (True, b''),  # other token0()
         (True, b''),  # other token1()
     ]])
@@ -290,8 +291,8 @@ def test_goplus_units_via_dossier_chain_kill(isolate_evm_state):
     # Normalized token for dossier
     normalized_whale = {
         "ticker": "WHALE",
-        "address": "0xabcd1111111111111111111111111111111111ab",
-        "network_id": 56,
+        "addr": "0xabcd1111111111111111111111111111111111ab",
+        "net": 56,
         "age_minutes": 150,
         "liquidity_usd": 50000,
         "volume_h24": 100000,
@@ -307,7 +308,7 @@ def test_goplus_units_via_dossier_chain_kill(isolate_evm_state):
             elif "honeypot" in url:
                 return Mock(status_code=500)  # Force GoPlus fallback
             elif "gopluslabs" in url:
-                return Mock(status_code=200, json=lambda: {"code": 1, "result": {normalized_whale["address"]: mock_goplus_whale}})
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {normalized_whale["addr"]: mock_goplus_whale}})
             return Mock(status_code=404)
         
         mock_get.side_effect = get_side_effect
@@ -336,8 +337,8 @@ def test_goplus_units_via_dossier_chain_kill(isolate_evm_state):
     
     normalized_pass = {
         "ticker": "PASS",
-        "address": "0xabcd2222222222222222222222222222222222ab",
-        "network_id": 56,
+        "addr": "0xabcd2222222222222222222222222222222222ab",
+        "net": 56,
         "age_minutes": 150,
         "liquidity_usd": 50000,
         "volume_h24": 100000,
@@ -353,7 +354,7 @@ def test_goplus_units_via_dossier_chain_kill(isolate_evm_state):
             elif "honeypot" in url:
                 return Mock(status_code=500)
             elif "gopluslabs" in url:
-                return Mock(status_code=200, json=lambda: {"code": 1, "result": {normalized_pass["address"]: mock_goplus_pass}})
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {normalized_pass["addr"]: mock_goplus_pass}})
             return Mock(status_code=404)
         
         mock_get.side_effect = get_side_effect
@@ -545,10 +546,10 @@ def test_goplus_lock_gating_no_unidentified(isolate_evm_state):
         multicall_result = encode(['(bool,bytes)[]'], [[(True, b'\\x00' * 32), (True, b'\\x00' * 32)]])
         mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
         
-        result = evm_holders.evm_holder_concentration(56, "0xcccccccccccccccccccccccccccccccccccccccc", [], 120, book.DB)
+        result = evm_holders.evm_holder_concentration(56, "0xcccccccccccccccccccccccccccccccccccccccc", [], 30, book.DB)  # age_min=30, no GoPlus
         
-        # GoPlus should NOT have been called (no unidentified contract >= 3%)
-        assert not goplus_called[0], "GoPlus should not be called when no unidentified contract"
+        # GoPlus should NOT have been called (age < 120)
+        assert not goplus_called[0], "GoPlus should not be called when age < 120m"
 
 
 def test_goplus_lock_gating_with_unidentified(isolate_evm_state):
