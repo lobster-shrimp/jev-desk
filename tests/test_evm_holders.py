@@ -385,7 +385,7 @@ def test_pinklock_permanent_excluded(isolate_evm_state):
             if "honeypot" in url:
                 return Mock(status_code=200, json=lambda: mock_honeypot)
             elif "gopluslabs" in url:
-                return Mock(status_code=200, json=lambda: {"code": 1, "result": {"0xtoken": mock_goplus}})
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {"0xcccccccccccccccccccccccccccccccccccccccc": mock_goplus}})
             return Mock(status_code=404)
         
         mock_get.side_effect = side_effect
