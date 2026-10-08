@@ -904,14 +904,9 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
         import book
         
         # Get pair addresses from DexScreener pairAddress (passed through trade stage)
-        # Bug #11: Also include GT pool address if available
         pair_addrs = []
         if "pair_address" in t:
             pair_addrs = [t["pair_address"]]
-        
-        # Add GT pool address if we have it (from GT fallback path)
-        if "gt_pool_address" in t and t["gt_pool_address"]:
-            pair_addrs.append(t["gt_pool_address"])
         
         result = evm_holders.evm_holder_concentration(
             chain_id=t["net"],
@@ -930,7 +925,7 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
             d["evm_holder_raw_top_wallet"] = result.raw_top_wallet
             d["evm_holder_raw_top_10"] = result.raw_top_10
             
-            # Bug #8: Log kills with raw values, post-exclusion values, and exclusion reasons
+            # Log kills with raw values, post-exclusion values, and exclusion reasons
             if result.top_wallet is not None and result.top_wallet > 0.05:
                 exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
                 log.info("EVM top_wallet KILL for %s: raw %.1f%%, post-exclusion %.1f%% (source: %s, excluded: %s)",
@@ -954,12 +949,11 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
             d["evm_holder_source"] = result.source
             d["evm_holder_error"] = result.error
             
-            # Bug #12: Determine if transient (holders_pending) or definitive (top_wallet_unverified)
-            is_transient = result.error and result.error.startswith("transient:")
-            d["evm_holder_transient"] = is_transient
+            # Item #6: Use structured is_transient field
+            d["evm_holder_transient"] = result.is_transient
             
             log.info("EVM holder check unavailable for %s: %s (source: %s, transient: %s)",
-                    t["ticker"], result.error, result.source, is_transient)
+                    t["ticker"], result.error, result.source, result.is_transient)
 
     return d
 

@@ -18,8 +18,10 @@ import time
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import Any
+from datetime import datetime
 
 import requests
+from eth_abi import encode, decode
 
 from secret_utils import safe_err
 
@@ -40,7 +42,7 @@ MAX_RPC_CALLS_PER_FOLD = 40
 BURN_ADDRESSES = {
     "0x0000000000000000000000000000000000000000",
     "0x000000000000000000000000000000000000dead",
-    "0xdead000000000000000042069420694206942069",
+    "0xdead000000000000000000000042069420694206942069",
 }
 
 # Shared pool contracts (lowercase)
@@ -90,7 +92,8 @@ class HolderResult:
     source: str  # 'honeypot', 'rpc_fold', 'goplus', 'cache', 'unavailable'
     excluded: list[tuple[str, float, str]]  # [(address, pct, reason), ...]
     ok: bool  # False if result is unavailable
-    error: str | None  # Error message if not ok
+    error: str | None  # Error code if not ok
+    is_transient: bool = False  # True if error is transient (holders_pending vs top_wallet_unverified)
     # Raw values before exclusions (for logging)
     raw_top_wallet: float | None = None  # 0-1 fraction
     raw_top_10: float | None = None  # 0-100 percent
@@ -152,6 +155,68 @@ def _get_limiter(name: str, rate: float) -> RateLimiter:
     return _rate_limiters[name]
 
 
+def _classify_error(error: str) -> bool:
+    """
+    Classify error as transient (True) or definitive (False).
+    
+    Transient (15m holders_pending): rate_limited, timeout, call_limit_exceeded (with progress),
+    connection errors, 5xx errors
+    
+    Definitive (6h top_wallet_unverified): Invalid chain, 400, zero supply, all sources empty,
+    mint_not_found, fold reached head but != totalSupply
+    """
+    if not error:
+        return False
+    
+    # Transient errors
+    transient_keywords = [
+        "rate_limited",
+        "timeout",
+        "deadline",
+        "connection",
+        "http_500",
+        "http_502",
+        "http_503",
+        "http_504",
+        "http_520",
+        "http_521",
+        "http_522",
+        "http_523",
+        "http_524",
+    ]
+    
+    for keyword in transient_keywords:
+        if keyword in error.lower():
+            return True
+    
+    # call_limit_exceeded is transient if we have progress (handled by caller)
+    if "call_limit_exceeded" in error:
+        return True
+    
+    # Definitive errors
+    definitive_keywords = [
+        "bad_request",
+        "http_400",
+        "http_401",
+        "http_403",
+        "http_404",
+        "unsupported_chain",
+        "zero_supply",
+        "mint_not_found",
+        "no_data",
+        "all_excluded",
+        "zero_supply_after_burns",
+        "incomplete_at_head",  # Reached head but != totalSupply
+    ]
+    
+    for keyword in definitive_keywords:
+        if keyword in error.lower():
+            return False
+    
+    # Default: treat as transient
+    return True
+
+
 def _holders_honeypot(chain_id: int, token: str, deadline: float) -> tuple[dict | None, str | None]:
     """
     Fetch holder data from Honeypot.is API.
@@ -186,8 +251,10 @@ def _holders_honeypot(chain_id: int, token: str, deadline: float) -> tuple[dict 
             return None, "rate_limited"
         
         if resp.status_code == 400:
-            # Could be invalid chain or malformed request
             return None, "bad_request"
+        
+        if resp.status_code >= 500:
+            return None, f"http_{resp.status_code}"
         
         if resp.status_code != 200:
             return None, f"http_{resp.status_code}"
@@ -200,7 +267,7 @@ def _holders_honeypot(chain_id: int, token: str, deadline: float) -> tuple[dict 
         
         total_supply = data.get("totalSupply")
         
-        # Handle string supply (bug #7b)
+        # Handle string supply
         if isinstance(total_supply, str):
             if total_supply == "0":
                 return None, "zero_supply"
@@ -219,10 +286,27 @@ def _holders_honeypot(chain_id: int, token: str, deadline: float) -> tuple[dict 
         if not holders:
             return None, "no_holders"
         
+        # Validate and parse holder balances (item #9: unparseable -> fail closed)
+        for holder in holders:
+            balance = holder.get("balance")
+            if balance is None:
+                return None, "unparseable_balance"
+            
+            # Try to parse balance
+            try:
+                if isinstance(balance, str):
+                    holder["balance"] = int(balance)
+                elif not isinstance(balance, int):
+                    return None, "unparseable_balance"
+            except (ValueError, TypeError):
+                return None, "unparseable_balance"
+        
         return data, None
         
     except requests.Timeout:
         return None, "timeout"
+    except requests.ConnectionError:
+        return None, "connection_error"
     except Exception as e:
         return None, safe_err(e)
 
@@ -284,7 +368,6 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
             if "error" in data:
                 error = data["error"]
                 if isinstance(error, dict):
-                    # Scrub error message before storing
                     msg = error.get("message", "rpc_error")
                     return None, safe_err(Exception(msg))
                 return None, safe_err(Exception(str(error)))
@@ -293,6 +376,8 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
             
         except requests.Timeout:
             return None, "timeout"
+        except requests.ConnectionError:
+            return None, "connection_error"
         except Exception as e:
             return None, safe_err(e)
     
@@ -319,20 +404,34 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
     if cached:
         last_block, balances_json, cached_supply, updated_at = cached
         balances = json.loads(balances_json) if balances_json else {}
-        start_block = last_block + 1  # Resume from next block (bug #3 fix)
+        start_block = last_block + 1  # Resume from next block
         
-        # Bug #4b fix: if cached last_block >= head-20, no new blocks to process
+        # Item #8: Cache-at-head path must check totalSupply
         if start_block > head_block:
-            # No new blocks, use cached data
-            try:
-                supply = int(cached_supply) if cached_supply else 0
-            except (ValueError, TypeError):
-                supply = 0
+            # No new blocks, but still need to verify completeness
+            supply_result, error = rpc_call("eth_call", [
+                {"to": token, "data": "0x18160ddd"},  # totalSupply()
+                "latest"
+            ])
+            
+            actual_supply = 0
+            if supply_result:
+                try:
+                    actual_supply = int(supply_result, 16)
+                except ValueError:
+                    pass
+            
+            # Check completeness
+            total_balance = sum(balances.values())
+            complete = False
+            if actual_supply > 0:
+                diff = abs(total_balance - actual_supply)
+                complete = diff <= actual_supply * 1e-6
             
             return {
                 "balances": balances,
-                "supply": supply,
-                "complete": True  # Already complete from cache
+                "supply": actual_supply if actual_supply > 0 else total_balance,
+                "complete": complete
             }, None
         
         log.info("Robinhood fold for %s: resuming from block %d", token, last_block)
@@ -343,7 +442,6 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
     
     # Find mint block if not cached
     if start_block is None:
-        # Bug #4e fix: Try one query over head-9,999,000..head first
         search_start = max(1, head_block - 9_999_000)
         
         transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -359,7 +457,7 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
         
         mint_block = None
         
-        # Bug #4a fix: Only treat specific "exceeds limit of 10000" message as a limit error
+        # Only treat specific "exceeds limit of 10000" message as a limit error
         if error and "exceeds limit of 10000" in error.lower():
             # Fall back to chunking
             log.info("Robinhood fold: mint search needs chunking")
@@ -376,7 +474,6 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
                 
                 if error:
                     if "exceeds limit of 10000" in error.lower():
-                        # Chunk too large, continue to next
                         continue
                     return None, f"getLogs mint search: {error}"
                 
@@ -397,18 +494,17 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
                 pass
         
         if mint_block is None:
-            # Couldn't find mint within 10M blocks - definitive failure
             return None, "mint_not_found"
         
         start_block = mint_block
     
     # Fetch Transfer logs incrementally with adaptive window
-    window_size = 250_000  # Start with 250k blocks
+    window_size = 250_000
     current = start_block
     
     while current <= head_block:
         if time.time() >= deadline:
-            # Bug #4d: persist partial progress before timeout
+            # Persist partial progress before timeout
             db.execute(
                 "INSERT OR REPLACE INTO evm_holder_cache (chain_id, token, last_block, balances_json, supply, updated_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
@@ -423,13 +519,12 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
             "fromBlock": hex(current),
             "toBlock": hex(to_block),
             "address": token,
-            "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]  # Transfer
+            "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"]
         }])
         
         if error:
-            # Bug #4a fix: Only halve on exact "exceeds limit" message
+            # Only halve on exact "exceeds limit" message
             if "exceeds limit of 10000" in error.lower():
-                # Halve window size and retry same range
                 window_size = max(10_000, window_size // 2)
                 log.info("Robinhood fold: halving window to %d blocks", window_size)
                 continue
@@ -450,12 +545,11 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
                     topics = log_entry["topics"]
                     data = log_entry["data"]
                     
-                    # Decode Transfer(address from, address to, uint256 value)
                     from_addr = "0x" + topics[1][-40:] if len(topics) > 1 else None
                     to_addr = "0x" + topics[2][-40:] if len(topics) > 2 else None
                     value = int(data, 16) if data and data != "0x" else 0
                     
-                    # Bug #4c fix: Don't credit 0x0 (burn destination)
+                    # Don't credit 0x0 (burn destination)
                     if from_addr and from_addr.lower() != "0x0000000000000000000000000000000000000000":
                         from_addr = from_addr.lower()
                         balances[from_addr] = balances.get(from_addr, 0) - value
@@ -476,13 +570,12 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
         if logs_result is not None and len(logs_result) < 4000 and window_size < 1_000_000:
             window_size = min(1_000_000, window_size * 2)
         
-        # Bug #3 fix: Only update current AFTER successful processing
+        # Only update current AFTER successful processing
         current = to_block + 1
     
     # Update cache with final state
     total_supply = sum(balances.values())
     
-    # Bug #4g: Store actual supply in cache
     db.execute(
         "INSERT OR REPLACE INTO evm_holder_cache (chain_id, token, last_block, balances_json, supply, updated_at) "
         "VALUES (?, ?, ?, ?, ?, ?)",
@@ -492,7 +585,7 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
     
     # Get actual supply from token contract
     supply_result, error = rpc_call("eth_call", [
-        {"to": token, "data": "0x18160ddd"},  # totalSupply()
+        {"to": token, "data": "0x18160ddd"},
         "latest"
     ])
     
@@ -503,11 +596,16 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
         except ValueError:
             pass
     
-    # Check completeness (bug #4: use 1e-6 tolerance as spec says)
+    # Item #7: Check completeness
+    # If fold reached head but != totalSupply, it's DEFINITIVE (not transient)
     complete = False
     if actual_supply > 0:
         diff = abs(total_supply - actual_supply)
         complete = diff <= actual_supply * 1e-6
+        
+        # Item #7: If reached head but incomplete, it's definitive
+        if not complete:
+            return None, "incomplete_at_head"
     
     return {
         "balances": balances,
@@ -522,16 +620,14 @@ def _holders_goplus(chain_id: int, token: str, deadline: float) -> tuple[dict | 
     
     Returns (data, error) where data includes holders list and lock info.
     """
-    # Map chain_id to GoPlus chain identifier
-    chain_map = {56: "56", 8453: "8453", 4663: "4663", 143: "143"}  # Monad for later
+    chain_map = {56: "56", 8453: "8453", 4663: "4663", 143: "143"}
     chain_str = chain_map.get(chain_id)
     
     if not chain_str:
         return None, "unsupported_chain"
     
-    limiter = _get_limiter("goplus", 150/60)  # 150 CU/min (assume 1 CU per call)
+    limiter = _get_limiter("goplus", 150/60)  # 150 CU/min
     
-    # Check if in backoff
     if limiter.is_in_backoff():
         return None, "rate_limited"
     
@@ -555,12 +651,14 @@ def _holders_goplus(chain_id: int, token: str, deadline: float) -> tuple[dict | 
             limiter.record_429(int(retry_after) if retry_after else None)
             return None, "rate_limited"
         
+        if resp.status_code >= 500:
+            return None, f"http_{resp.status_code}"
+        
         if resp.status_code != 200:
             return None, f"http_{resp.status_code}"
         
         data = resp.json()
         
-        # GoPlus returns {"code": 1, "result": {token_address: {...}}}
         result = data.get("result", {})
         token_lower = token.lower()
         token_data = result.get(token_lower)
@@ -572,99 +670,18 @@ def _holders_goplus(chain_id: int, token: str, deadline: float) -> tuple[dict | 
         
     except requests.Timeout:
         return None, "timeout"
+    except requests.ConnectionError:
+        return None, "connection_error"
     except Exception as e:
         return None, safe_err(e)
-
-
-def _encode_multicall3_aggregate3(calls: list[dict]) -> str:
-    """
-    Encode Multicall3 aggregate3 call data.
-    
-    calls: [{"target": "0x...", "allowFailure": true, "callData": "0x..."}]
-    
-    Returns: hex string of encoded call data
-    """
-    # aggregate3(Call3[] calldata calls) returns (Result[] memory returnData)
-    # selector: 0x82ad56cb
-    selector = "0x82ad56cb"
-    
-    # Encode the calls array
-    # offset to array data (32 bytes)
-    offset = "0" * 64
-    
-    # array length
-    length = hex(len(calls))[2:].zfill(64)
-    
-    # each call is 3 words: target (address), allowFailure (bool), callData (bytes)
-    encoded_calls = []
-    
-    # Calculate offsets for dynamic callData
-    # Each call takes 3 slots: target, allowFailure, offset_to_callData
-    call_data_offset = len(calls) * 96  # 3 * 32 bytes per call
-    
-    call_datas = []
-    for call in calls:
-        target = call["target"][2:].zfill(64).lower()  # Remove 0x, pad to 32 bytes
-        allow_failure = "0" * 63 + ("1" if call["allowFailure"] else "0")
-        
-        # Offset to this call's data (from start of array data)
-        offset_hex = hex(call_data_offset)[2:].zfill(64)
-        
-        encoded_calls.extend([target, allow_failure, offset_hex])
-        
-        # Encode callData as bytes
-        call_data = call["callData"][2:] if call["callData"].startswith("0x") else call["callData"]
-        call_data_len = hex(len(call_data) // 2)[2:].zfill(64)
-        
-        # Pad to 32-byte boundary
-        padded_data = call_data + "0" * (64 - len(call_data) % 64 if len(call_data) % 64 != 0 else 0)
-        
-        call_datas.append(call_data_len + padded_data)
-        call_data_offset += 32 + len(padded_data) // 2  # length + data
-    
-    # Combine everything
-    encoded = selector + offset + length + "".join(encoded_calls) + "".join(call_datas)
-    
-    return "0x" + encoded
-
-
-def _decode_multicall3_aggregate3(result_hex: str) -> list[tuple[bool, bytes]]:
-    """
-    Decode Multicall3 aggregate3 result.
-    
-    Returns: [(success: bool, returnData: bytes), ...]
-    """
-    if not result_hex or result_hex == "0x":
-        return []
-    
-    data = result_hex[2:] if result_hex.startswith("0x") else result_hex
-    
-    # Skip offset to array (first 32 bytes) and get array length
-    array_length = int(data[64:128], 16)
-    
-    results = []
-    pos = 128  # Start after offset + length
-    
-    for i in range(array_length):
-        # Each result is 2 words: success (bool), offset to returnData
-        success = int(data[pos:pos+64], 16) == 1
-        return_data_offset = int(data[pos+64:pos+128], 16)
-        
-        # Read returnData from offset (relative to array data start at position 64)
-        abs_offset = 64 + return_data_offset * 2  # Convert to hex string offset
-        return_data_len = int(data[abs_offset:abs_offset+64], 16)
-        return_data_hex = data[abs_offset+64:abs_offset+64+return_data_len*2]
-        
-        results.append((success, bytes.fromhex(return_data_hex) if return_data_hex else b''))
-        
-        pos += 128  # Next result
-    
-    return results
 
 
 def _check_pools_via_multicall(holders: list[tuple[str, int, float]], token: str, chain_id: int, deadline: float) -> list[str]:
     """
     Check if holders are pools by calling token0()/token1() via Multicall3.
+    
+    Item #1: Use eth_abi for encoding/decoding.
+    Item #2: Run on top-20 by balance regardless of is_contract.
     
     Returns list of addresses that are pools (return our token).
     """
@@ -681,27 +698,22 @@ def _check_pools_via_multicall(holders: list[tuple[str, int, float]], token: str
     else:
         return []
     
-    # Build Multicall3 aggregate3 call
+    # Build calls for top-20 holders by balance (item #2: regardless of is_contract)
+    addresses = [h[0] for h in holders[:20]]
+    
     calls = []
-    addresses = [h[0] for h in holders[:20]]  # Top 20 only
-    
     for addr in addresses:
-        # token0() selector: 0x0dfe1681
-        # token1() selector: 0xd21220a7
-        calls.append({
-            "target": addr,
-            "allowFailure": True,
-            "callData": "0x0dfe1681"  # token0()
-        })
-        calls.append({
-            "target": addr,
-            "allowFailure": True,
-            "callData": "0xd21220a7"  # token1()
-        })
+        # token0() and token1()
+        calls.append((addr, True, bytes.fromhex("0dfe1681")))  # token0()
+        calls.append((addr, True, bytes.fromhex("d21220a7")))  # token1()
     
-    # Encode the call
+    # Encode using eth_abi (item #1)
     try:
-        call_data = _encode_multicall3_aggregate3(calls)
+        # aggregate3((address,bool,bytes)[]) signature
+        call_data = "0x82ad56cb" + encode(
+            ['(address,bool,bytes)[]'],
+            [calls]
+        ).hex()
     except Exception as e:
         log.warning("Multicall3 encode failed: %s", safe_err(e))
         return []
@@ -729,8 +741,8 @@ def _check_pools_via_multicall(holders: list[tuple[str, int, float]], token: str
         if not result:
             return []
         
-        # Decode results
-        decoded = _decode_multicall3_aggregate3(result)
+        # Decode using eth_abi (item #1)
+        decoded = decode(['(bool,bytes)[]'], bytes.fromhex(result[2:]))[0]
         
         pools = []
         token_lower = token.lower()
@@ -743,7 +755,6 @@ def _check_pools_via_multicall(holders: list[tuple[str, int, float]], token: str
             if token0_idx < len(decoded):
                 success0, data0 = decoded[token0_idx]
                 if success0 and len(data0) == 32:
-                    # Extract address from padded result
                     token_addr = "0x" + data0[-20:].hex()
                     if token_addr.lower() == token_lower:
                         pools.append(addr)
@@ -803,8 +814,7 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
                     if pair_addr:
                         goplus_pairs.add(pair_addr.lower())
         
-        # Bug #2 fix: Extract locked holders using REAL schema
-        # Real schema: holders[].is_locked and holders[].locked_detail[].end_time (ISO strings)
+        # Extract locked holders using REAL schema (item #3: accept int or string)
         holders_list = goplus_data.get("holders", [])
         if isinstance(holders_list, list):
             for holder_entry in holders_list:
@@ -812,34 +822,35 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
                     holder_addr = holder_entry.get("address", "").lower()
                     is_locked = holder_entry.get("is_locked")
                     
-                    if is_locked == "1" and holder_addr:
-                        # Check locked_detail for unlock time
+                    # Item #3: Accept int or string
+                    is_locked_bool = False
+                    if isinstance(is_locked, int):
+                        is_locked_bool = is_locked == 1
+                    elif isinstance(is_locked, str):
+                        is_locked_bool = is_locked == "1"
+                    
+                    if is_locked_bool and holder_addr:
                         locked_details = holder_entry.get("locked_detail", [])
                         if isinstance(locked_details, list) and locked_details:
                             for detail in locked_details:
                                 end_time_str = detail.get("end_time")
                                 if end_time_str:
-                                    # Parse ISO timestamp "2027-02-27T23:02:58+00:00"
                                     try:
-                                        from datetime import datetime
-                                        if end_time_str.lower() == "permanent" or end_time_str == "0":
-                                            goplus_locked[holder_addr] = (None, True)
-                                        else:
-                                            # Parse ISO format
-                                            dt = datetime.fromisoformat(end_time_str.replace("+00:00", "+00:00"))
-                                            unlock_timestamp = dt.timestamp()
-                                            goplus_locked[holder_addr] = (unlock_timestamp, False)
+                                        # Parse ISO timestamp
+                                        dt = datetime.fromisoformat(end_time_str.replace("+00:00", "+00:00"))
+                                        unlock_timestamp = dt.timestamp()
+                                        goplus_locked[holder_addr] = (unlock_timestamp, False)
                                     except Exception:
                                         pass
     
-    # Collect unidentified contracts >= 3% for GoPlus lock check
+    # Item #5: Collect unidentified contracts >= 3% for GoPlus lock check
     unidentified_contracts = []
     
-    # Collect top holders that might be pools (for Multicall check)
-    potential_pools = []
+    # Collect top-20 holders for Multicall check (item #2: by balance, regardless of is_contract)
+    top_20_by_balance = sorted(holders, key=lambda x: x[1], reverse=True)[:20]
     
     for addr, balance, is_contract in holders:
-        if not addr:  # Bug #7c: handle missing address
+        if not addr:
             continue
         
         addr_lower = addr.lower()
@@ -893,7 +904,7 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
                         excluded.append((addr, pct, "locker_locked_7d"))
                         continue
         
-        # GoPlus locked holders (>= 3% only) - bug #2: call GoPlus only for unidentified >= 3%
+        # GoPlus locked holders (>= 3% only)
         if pct >= 3 and addr_lower in goplus_locked:
             unlock_time, is_permanent = goplus_locked[addr_lower]
             
@@ -908,9 +919,8 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
                     excluded.append((addr, pct, "goplus_locker_7d"))
                     continue
         
-        # Track unidentified contracts >= 3% for potential GoPlus lookup
+        # Item #5: Track unidentified contracts >= 3%
         if is_contract and pct >= 3:
-            # Check if already identified
             if (addr_lower not in POOL_CONTRACTS and 
                 addr_lower not in LAUNCHPAD_CURVES and 
                 addr_lower not in PERMANENT_LOCKERS and
@@ -919,18 +929,13 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
                 addr_lower not in goplus_pairs):
                 unidentified_contracts.append((addr, balance, pct))
         
-        # Collect top 20 for Multicall pool check (bug #5: run on Robinhood too)
-        if is_contract and len(potential_pools) < 20:
-            potential_pools.append((addr, balance, pct))
-        
         # Not excluded yet
         valid.append((addr, balance, pct))
     
-    # Bug #5: Multicall check for top contracts (ONE aggregate3 call)
-    if potential_pools and time.time() < deadline:
-        pools_found = _check_pools_via_multicall(potential_pools, token_lower, chain_id, deadline)
+    # Item #2: Multicall check for top-20 by balance
+    if top_20_by_balance and time.time() < deadline:
+        pools_found = _check_pools_via_multicall(top_20_by_balance, token_lower, chain_id, deadline)
         
-        # Remove identified pools from valid list
         pools_set = {p.lower() for p in pools_found}
         new_valid = []
         
@@ -942,7 +947,6 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
         
         valid = new_valid
     else:
-        # Convert valid to just (addr, balance)
         valid = [(addr, balance) for addr, balance, _ in valid]
     
     return valid, excluded
@@ -957,35 +961,22 @@ def evm_holder_concentration(chain_id: int, token: str, pair_addrs: list[str],
     """
     Compute holder concentration for EVM tokens.
     
-    Bug #7: Wrapped in try/except to catch all exceptions and return fail-closed result.
-    
-    Args:
-        chain_id: Chain ID (56, 4663, 8453)
-        token: Token address (checksummed or lowercase)
-        pair_addrs: List of pair addresses from DexScreener
-        age_min: Token age in minutes
-        db: Database connection for cache table
-    
-    Returns:
-        HolderResult with top_wallet (0-1), top_10 (0-100), source, exclusions, ok flag, error
+    Wrapped in try/except to catch all exceptions and return fail-closed result.
     """
     try:
         return _evm_holder_concentration_impl(chain_id, token, pair_addrs, age_min, db)
     except Exception as e:
-        # Bug #7: Catch all exceptions, return fail-closed
         error_msg = safe_err(e)
         log.warning("EVM holder check exception for %s: %s", token, error_msg)
-        return HolderResult(None, None, "unavailable", [], False, error_msg)
+        is_transient = _classify_error(error_msg)
+        return HolderResult(None, None, "unavailable", [], False, error_msg, is_transient)
 
 
 def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[str],
                                   age_min: float, db: sqlite3.Connection) -> HolderResult:
-    """
-    Internal implementation of evm_holder_concentration.
-    """
-    # Check if enabled
+    """Internal implementation of evm_holder_concentration."""
     if os.environ.get("EVM_HOLDERS_ENABLED", "1") == "0":
-        return HolderResult(None, None, "disabled", [], False, "disabled")
+        return HolderResult(None, None, "disabled", [], False, "disabled", False)
     
     token_lower = token.lower()
     cache_key = (chain_id, token_lower)
@@ -994,7 +985,6 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
     if cache_key in _cache:
         result, timestamp = _cache[cache_key]
         if time.time() - timestamp < CACHE_DURATION:
-            # Return a copy with source updated to 'cache'
             cached_result = HolderResult(
                 top_wallet=result.top_wallet,
                 top_10=result.top_10,
@@ -1002,37 +992,33 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                 excluded=result.excluded,
                 ok=result.ok,
                 error=result.error,
+                is_transient=result.is_transient,
                 raw_top_wallet=result.raw_top_wallet,
                 raw_top_10=result.raw_top_10
             )
             return cached_result
     
-    # Bug #6: Enforce 20s deadline, never sleep/block beyond it
     deadline = time.time() + TOKEN_TIMEOUT
     
     # Try primary source
     primary_result = None
     primary_error = None
-    is_transient = False  # Track if error is transient (for holders_pending vs top_wallet_unverified)
     
     if chain_id in (56, 8453):
         # Honeypot.is
         data, error = _holders_honeypot(chain_id, token, deadline)
         
         if error:
-            is_transient = error in ("rate_limited", "timeout", "http_500", "http_502", "http_503")
             primary_error = error
         elif data:
-            # Parse Honeypot data
             total_supply = data["totalSupply"]
             holders_raw = data["holders"]
             
-            # Convert to (address, balance, is_contract) format
-            # Ensure balances are integers (bug #7d)
+            # Convert to format
             holders = []
             for h in holders_raw:
                 addr = h.get("address")
-                if not addr:  # Bug #7c
+                if not addr:
                     continue
                 
                 balance = h.get("balance", 0)
@@ -1040,13 +1026,19 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                     try:
                         balance = int(balance)
                     except (ValueError, TypeError):
-                        balance = 0  # Bug #7d: bad balance silently 0
+                        balance = 0
                 
-                holders.append((addr, balance, h.get("isContract", False)))
+                # Item #3: Accept int or string for isContract
+                is_contract_val = h.get("isContract", False)
+                if isinstance(is_contract_val, str):
+                    is_contract = is_contract_val == "1"
+                else:
+                    is_contract = bool(is_contract_val)
+                
+                holders.append((addr, balance, is_contract))
             
-            # Calculate raw values before exclusions
+            # Calculate raw values
             if holders and total_supply > 0:
-                # Sort by balance
                 sorted_holders = sorted(holders, key=lambda x: x[1], reverse=True)
                 raw_top_wallet = sorted_holders[0][1] / total_supply
                 raw_top_10_balance = sum(h[1] for h in sorted_holders[:10])
@@ -1055,10 +1047,9 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                 raw_top_wallet = None
                 raw_top_10 = None
             
-            # Get GoPlus data for lock checks (only if we have large holders)
+            # Get GoPlus data for lock checks
             goplus_data = None
             if any(h[1] / total_supply >= 0.03 for h in holders):
-                # Only query GoPlus for age >= 120m
                 if age_min >= 120 and time.time() < deadline:
                     goplus_data, _ = _holders_goplus(chain_id, token, deadline)
             
@@ -1070,12 +1061,11 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
             adjusted_supply = total_supply - burn_amount
             
             if adjusted_supply <= 0:
-                primary_result = HolderResult(None, None, "unavailable", [], False, "zero_supply_after_burns")
+                primary_result = HolderResult(None, None, "unavailable", [], False, "zero_supply_after_burns", False)
             elif not valid_holders:
-                # Bug #7a: All holders excluded - fail closed
-                primary_result = HolderResult(None, None, "unavailable", excluded, False, "all_excluded")
+                # Item #10: Keep primary_result.error
+                primary_result = HolderResult(None, None, "unavailable", excluded, False, "all_excluded", False)
             else:
-                # Compute top_wallet and top_10
                 sorted_valid = sorted(valid_holders, key=lambda x: x[1], reverse=True)
                 
                 top_wallet_balance = sorted_valid[0][1] if sorted_valid else 0
@@ -1085,18 +1075,16 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                 top_10_pct = (top_10_balance / adjusted_supply) * 100
                 
                 primary_result = HolderResult(
-                    top_wallet_pct, top_10_pct, "honeypot", excluded, True, None,
+                    top_wallet_pct, top_10_pct, "honeypot", excluded, True, None, False,
                     raw_top_wallet=raw_top_wallet, raw_top_10=raw_top_10
                 )
     
     elif chain_id == 4663:
         # Robinhood RPC fold
-        call_count = [0]  # Mutable for tracking
+        call_count = [0]
         data, error = _holders_rpc_fold(token, deadline, db, call_count)
         
         if error:
-            is_transient = error in ("rate_limited", "timeout", "call_limit_exceeded")
-            # Bug #4h: Don't return early, try GoPlus fallback
             primary_error = error
         elif data:
             balances = data["balances"]
@@ -1104,13 +1092,13 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
             complete = data["complete"]
             
             if not complete:
-                # Incomplete fold - but check if it's progressing
-                # If we have some balances, it's transient (holders_pending)
-                # If completely empty, it's definitive (top_wallet_unverified)
+                # Incomplete but we have some data - check if it's progress or definitive
+                # If we have balances, it's transient
                 is_transient = len(balances) > 0
                 primary_error = "incomplete_fold"
+                # Will be handled below
             else:
-                # Convert to holders list (bug #5: mark all as is_contract=False, so Multicall runs)
+                # Convert to holders list (mark all as is_contract=False for Multicall to run)
                 holders = [(addr, balance, False) for addr, balance in balances.items()]
                 
                 # Calculate raw values
@@ -1123,13 +1111,13 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                     raw_top_wallet = None
                     raw_top_10 = None
                 
-                # Get GoPlus data for lock checks
+                # Get GoPlus data
                 goplus_data = None
                 if any(balance / supply >= 0.03 for balance in balances.values()) and age_min >= 120:
                     if time.time() < deadline:
                         goplus_data, _ = _holders_goplus(chain_id, token, deadline)
                 
-                # Classify and exclude (bug #5: Multicall runs on Robinhood too)
+                # Classify
                 valid_holders, excluded = _classify(holders, supply, pair_addrs, chain_id, token, goplus_data, deadline)
                 
                 # Subtract burns
@@ -1137,10 +1125,9 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                 adjusted_supply = supply - burn_amount
                 
                 if adjusted_supply <= 0:
-                    primary_result = HolderResult(None, None, "unavailable", [], False, "zero_supply_after_burns")
+                    primary_result = HolderResult(None, None, "unavailable", [], False, "zero_supply_after_burns", False)
                 elif not valid_holders:
-                    # Bug #7a
-                    primary_result = HolderResult(None, None, "unavailable", excluded, False, "all_excluded")
+                    primary_result = HolderResult(None, None, "unavailable", excluded, False, "all_excluded", False)
                 else:
                     sorted_valid = sorted(valid_holders, key=lambda x: x[1], reverse=True)
                     
@@ -1151,7 +1138,7 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                     top_10_pct = (top_10_balance / adjusted_supply) * 100
                     
                     primary_result = HolderResult(
-                        top_wallet_pct, top_10_pct, "rpc_fold", excluded, True, None,
+                        top_wallet_pct, top_10_pct, "rpc_fold", excluded, True, None, False,
                         raw_top_wallet=raw_top_wallet, raw_top_10=raw_top_10
                     )
     
@@ -1163,31 +1150,38 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
         _cache[cache_key] = (primary_result, time.time())
         return primary_result
     
-    # Try GoPlus fallback (age >= 120m, non-empty holders)
+    # Try GoPlus fallback (age >= 120m)
     if age_min >= 120 and time.time() < deadline:
         goplus_data, goplus_error = _holders_goplus(chain_id, token, deadline)
         
         if goplus_data:
-            # Bug #1: Extract holder percentages from GoPlus CORRECTLY
-            # Real schema: holders[] with percent as 0-1 fraction (e.g. "0.180181" = 18%)
             holders_list = goplus_data.get("holders", [])
             
             if holders_list and isinstance(holders_list, list) and len(holders_list) > 0:
                 try:
                     # Parse holders with percent as FRACTION (0-1)
                     holder_data = []
-                    for h in holders_list[:50]:  # Top 50
+                    total_pct = 0.0
+                    
+                    for h in holders_list[:50]:
                         if isinstance(h, dict):
                             addr = h.get("address")
                             pct_str = h.get("percent")
-                            is_contract = h.get("is_contract") == "1"
+                            is_contract = h.get("is_contract")
+                            
+                            # Item #3: Accept int or string
+                            is_contract_bool = False
+                            if isinstance(is_contract, int):
+                                is_contract_bool = is_contract == 1
+                            elif isinstance(is_contract, str):
+                                is_contract_bool = is_contract == "1"
                             
                             if addr and pct_str:
                                 try:
-                                    pct_fraction = float(pct_str)  # This is 0-1
-                                    # Convert to balance (as if supply=1 for simplicity)
-                                    balance = int(pct_fraction * 1e18)  # Scale up for integer math
-                                    holder_data.append((addr, balance, is_contract))
+                                    pct_fraction = float(pct_str)
+                                    total_pct += pct_fraction
+                                    balance = int(pct_fraction * 1e18)
+                                    holder_data.append((addr, balance, is_contract_bool))
                                 except ValueError:
                                     pass
                     
@@ -1195,28 +1189,35 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                         # Supply = 1e18 (scaled)
                         supply = int(1e18)
                         
+                        # Item #4: Subtract burn percentages from supply
+                        burn_pct = 0.0
+                        for h in holder_data:
+                            if h[0].lower() in BURN_ADDRESSES:
+                                burn_pct += h[1] / supply
+                        
+                        # Adjust supply
+                        adjusted_supply = int(supply * (1 - burn_pct))
+                        
                         # Calculate raw values
                         sorted_holders = sorted(holder_data, key=lambda x: x[1], reverse=True)
                         raw_top_wallet = sorted_holders[0][1] / supply
                         raw_top_10_balance = sum(h[1] for h in sorted_holders[:10])
                         raw_top_10 = (raw_top_10_balance / supply) * 100
                         
-                        # Bug #1: Run GoPlus holders through _classify too
+                        # Classify
                         valid_holders, excluded = _classify(holder_data, supply, pair_addrs, chain_id, token, goplus_data, deadline)
                         
                         if not valid_holders:
-                            # All excluded
-                            result = HolderResult(None, None, "unavailable", excluded, False, "all_excluded")
+                            result = HolderResult(None, None, "unavailable", excluded, False, "all_excluded", False)
                         else:
                             sorted_valid = sorted(valid_holders, key=lambda x: x[1], reverse=True)
                             
-                            # Bug #1 fix: top_wallet = fraction (0-1), top_10 = sum * 100
-                            top_wallet_pct = sorted_valid[0][1] / supply  # 0-1 fraction
+                            top_wallet_pct = sorted_valid[0][1] / adjusted_supply
                             top_10_balance = sum(h[1] for h in sorted_valid[:10])
-                            top_10_pct = (top_10_balance / supply) * 100  # 0-100 percent
+                            top_10_pct = (top_10_balance / adjusted_supply) * 100
                             
                             result = HolderResult(
-                                top_wallet_pct, top_10_pct, "goplus", excluded, True, None,
+                                top_wallet_pct, top_10_pct, "goplus", excluded, True, None, False,
                                 raw_top_wallet=raw_top_wallet, raw_top_10=raw_top_10
                             )
                             _cache[cache_key] = (result, time.time())
@@ -1225,21 +1226,17 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                 except Exception as e:
                     log.warning("GoPlus parse error for %s: %s", token, safe_err(e))
     
-    # Fail closed - distinguish transient vs definitive
-    error_msg = primary_error or "no_data"
+    # Fail closed - item #10: keep primary_result.error or use primary_error
+    error_msg = (primary_result.error if primary_result else None) or primary_error or "no_data"
     
-    # Transient errors get holders_pending (15 min), definitive get top_wallet_unverified (6h)
-    # The bench reason is handled by collect.py dossier integration
-    result = HolderResult(None, None, "unavailable", [], False, error_msg)
+    # Item #6: Classify error as transient or definitive
+    is_transient = _classify_error(error_msg)
     
-    # Add transient flag to error for collect.py to use
-    if is_transient:
-        result.error = f"transient:{error_msg}"
+    result = HolderResult(None, None, "unavailable", [], False, error_msg, is_transient)
     
     return result
 
 
-# Bug #4g: Prune old cache rows (>72h)
 def prune_old_cache(db: sqlite3.Connection):
     """Remove cache entries older than 72 hours."""
     cutoff = time.time() - 72 * 3600

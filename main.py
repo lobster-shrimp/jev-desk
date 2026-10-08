@@ -57,6 +57,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Clear Solana owner cache at start of each cycle
     _clear_sol_owner_cache()
     
+    # Item #13: Prune old EVM holder cache entries
+    try:
+        import evm_holders
+        evm_holders.prune_old_cache(book.DB)
+    except Exception as e:
+        log.warning("EVM holder cache prune failed: %s", e)
+    
     # Mark all open shadow positions to market (uses FOMO, not GT)
     if shadow:
         try:
@@ -433,11 +440,33 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                 continue
 
             if (k := chain_kill(d)):
-                # Log chain kill with holder metrics (top_10, top_wallet, pools_excluded)
-                log.info("chain tid=%s ticker=%s reason=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s pools_excluded=%s holder_count=%s",
-                         d.get("tid"), d.get("ticker", "?"), k, d.get("age_minutes"),
-                         d.get("top_10_percent"), d.get("top_wallet_percent"), 
-                         d.get("pools_excluded", False), d.get("holder_count"))
+                # Log chain kill with holder metrics
+                # Item #12: Add EVM holder details
+                if d.get("chain") != "solana":
+                    # EVM chain - log holder details
+                    evm_source = d.get("evm_holder_source", "N/A")
+                    evm_raw_top1 = d.get("evm_holder_raw_top_wallet")
+                    evm_raw_top10 = d.get("evm_holder_raw_top_10")
+                    evm_excluded = d.get("evm_holder_excluded", [])
+                    
+                    # Format raw values
+                    raw_str = f"raw_top1={evm_raw_top1*100:.1f}% raw_top10={evm_raw_top10:.1f}%" if evm_raw_top1 and evm_raw_top10 else "raw=N/A"
+                    
+                    # Format exclusion reasons (first 3)
+                    exclusion_str = ", ".join(set(reason for _, _, reason in evm_excluded[:3])) if evm_excluded else "none"
+                    
+                    log.info("chain tid=%s ticker=%s reason=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s holder_count=%s "
+                             "evm_source=%s %s excluded=%s",
+                             d.get("tid"), d.get("ticker", "?"), k, d.get("age_minutes"),
+                             d.get("top_10_percent"), d.get("top_wallet_percent"), d.get("holder_count"),
+                             evm_source, raw_str, exclusion_str)
+                else:
+                    # Solana chain
+                    log.info("chain tid=%s ticker=%s reason=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s pools_excluded=%s holder_count=%s",
+                             d.get("tid"), d.get("ticker", "?"), k, d.get("age_minutes"),
+                             d.get("top_10_percent"), d.get("top_wallet_percent"), 
+                             d.get("pools_excluded", False), d.get("holder_count"))
+                
                 book.sit(t["tid"], k)                # facts bench longest
                 log.info("defer outcome tid=%s reason=%s", t["tid"], k)
                 book.forget_defer(t["tid"])
