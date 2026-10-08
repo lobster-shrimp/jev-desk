@@ -577,7 +577,7 @@ def test_robinhood_fold_incomplete():
         
         assert not result.ok
         assert result.error == "incomplete_fold"
-    assert result.is_transient == True  # Transient: has some balances
+        assert result.is_transient == True  # Transient: has some balances
         assert result.top_wallet is None
         
         # Should fail closed
