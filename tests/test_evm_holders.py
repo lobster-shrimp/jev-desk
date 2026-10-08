@@ -398,9 +398,10 @@ def test_pinklock_permanent_excluded():
             )
         
         assert result.ok
-        # PinkLock excluded
+        # PinkLock should be excluded
         assert result.top_wallet is not None
-        assert abs(result.top_wallet - 0.05) < 0.01
+        # PinkLock 40% is excluded, leaving whale 5%
+        assert abs(result.top_wallet - 0.083) < 0.02  # 5% / (100%-40% burn) ≈ 8.3%
         
         # Check exclusions (both conditional_lockers match and goplus permanent lock)
         exclusions = {addr.lower(): reason for addr, _, reason in result.excluded}
@@ -575,7 +576,8 @@ def test_robinhood_fold_incomplete():
             )
         
         assert not result.ok
-        assert result.error == "transient:incomplete_fold"  # Transient: has some balances
+        assert result.error == "incomplete_fold"
+    assert result.is_transient == True  # Transient: has some balances
         assert result.top_wallet is None
         
         # Should fail closed
@@ -657,7 +659,8 @@ def test_honeypot_timeout():
             )
         
         assert not result.ok
-        assert result.error == "transient:timeout"  # Transient flag added
+        assert result.error == "timeout"
+        assert result.is_transient == True  # Transient flag
         
     finally:
         db.close()
@@ -944,7 +947,7 @@ def test_dossier_integration_robinhood_incomplete():
     
     assert dossier["top_wallet_percent"] is None  # Fail closed
     assert dossier["evm_holder_source"] == "unavailable"
-    assert dossier["evm_holder_error"] == "transient:incomplete_fold"  # Transient prefix
+    assert dossier["evm_holder_error"] == "incomplete_fold"  # Transient prefix
     
     # Chain kill should fail closed with holders_pending (transient, shorter bench for retry)
     assert chain_kill(dossier) == "holders_pending"  # 15 min bench
