@@ -523,9 +523,9 @@ def test_goplus_lock_gating_no_unidentified(isolate_evm_state):
     mock_honeypot = {
         "totalSupply": 1000000,
         "holders": [
-            {"address": pair_addr, "balance": 200000, "isContract": True},  # 20%
+            {"address": whale_addr, "balance": 500000, "isContract": False},  # 50% - sorted first by balance
             {"address": burn_addr, "balance": 300000, "isContract": False},  # 30% burn
-            {"address": whale_addr, "balance": 500000, "isContract": False},  # 50%
+            {"address": pair_addr, "balance": 200000, "isContract": True},  # 20% - will be identified as pool via Multicall
         ]
     }
     
@@ -543,12 +543,18 @@ def test_goplus_lock_gating_no_unidentified(isolate_evm_state):
         mock_get.side_effect = get_side_effect
         
         # Multicall identifies the pair with proper abi-encoded addresses
+        # Holders sorted by balance: whale, burn, pair
+        # Calls: whale token0/token1, burn token0/token1, pair token0/token1
         from eth_abi import encode
         token_padded = b'\x00' * 12 + bytes.fromhex(token_addr[2:])
         other_padded = b'\x00' * 12 + bytes.fromhex("3333333333333333333333333333333333333333")
         multicall_result = encode(['(bool,bytes)[]'], [[
-            (True, token_padded),  # token0()
-            (True, other_padded),  # token1()
+            (False, b''),  # whale token0() - not a pool
+            (False, b''),  # whale token1() - not a pool
+            (False, b''),  # burn token0() - not a pool
+            (False, b''),  # burn token1() - not a pool
+            (True, token_padded),  # pair token0() - returns token!
+            (True, other_padded),  # pair token1()
         ]])
         mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
         
@@ -810,7 +816,7 @@ def test_cache_at_head_totalsupply_unavailable(isolate_evm_state):
             "top_10_percent": result.top_10,
             "evm_holder_source": result.source,
             "evm_holder_error": result.error,
-            "evm_holder_is_transient": result.is_transient,
+            "evm_holder_transient": result.is_transient,
         }
         kill_reason = chain_kill(dossier)
         assert kill_reason == "holders_pending"
@@ -868,9 +874,9 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
             if "honeypot" in url:
                 return Mock(status_code=200, json=lambda: mock_honeypot)
             elif "gopluslabs" in url:
-                return Mock(status_code=200, json=lambda: {"code": 1, "result": {"0xtoken": mock_goplus}})
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {"0xcccccccccccccccccccccccccccccccccccccccc": mock_goplus}})
             return Mock(status_code=404)
-        
+    
         mock_get.side_effect = side_effect
         
         # Multicall response (both not pools)
@@ -878,25 +884,25 @@ def test_denominator_excludes_burns_only_not_lockers(isolate_evm_state):
         multicall_result = encode(['(bool,bytes)[]'], [[(False, b''), (False, b''), (False, b''), (False, b''), (False, b''), (False, b'')]])
         mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
         
-        result = evm_holders.evm_holder_concentration(56, "0xtoken", [], 120, book.DB)
-        
-        assert result.ok, f"Result failed: {result.error}"
-        assert result.top_wallet is not None
-        
-        # Exact expected value
-        assert abs(result.top_wallet - EXPECTED_TOP_WALLET) < 0.0001, \
-            f"Expected {EXPECTED_TOP_WALLET:.6f}, got {result.top_wallet:.6f}"
-        
-        # Locker should be excluded
-        exclusions = {addr.lower(): reason for addr, _, reason in result.excluded}
-        assert robinfunfi_locker in exclusions
-        assert "locker" in exclusions[robinfunfi_locker]
-        
-        # Should pass chain_kill (not killed)
-        dossier = {
-            "top_wallet_percent": result.top_wallet,
-            "top_10_percent": result.top_10,
-            "evm_holder_source": result.source,
-        }
-        kill_reason = chain_kill(dossier)
-        assert kill_reason is None, f"Expected pass, got kill: {kill_reason}"
+        result = evm_holders.evm_holder_concentration(56, "0xcccccccccccccccccccccccccccccccccccccccc", [], 120, book.DB)
+    
+    assert result.ok, f"Result failed: {result.error}"
+    assert result.top_wallet is not None
+    
+    # Exact expected value
+    assert abs(result.top_wallet - EXPECTED_TOP_WALLET) < 0.0001, \
+        f"Expected {EXPECTED_TOP_WALLET:.6f}, got {result.top_wallet:.6f}"
+    
+    # Locker should be excluded
+    exclusions = {addr.lower(): reason for addr, _, reason in result.excluded}
+    assert robinfunfi_locker in exclusions
+    assert "locker" in exclusions[robinfunfi_locker]
+    
+    # Should pass chain_kill (not killed)
+    dossier = {
+        "top_wallet_percent": result.top_wallet,
+        "top_10_percent": result.top_10,
+        "evm_holder_source": result.source,
+    }
+    kill_reason = chain_kill(dossier)
+    assert kill_reason is None, f"Expected pass, got kill: {kill_reason}"
