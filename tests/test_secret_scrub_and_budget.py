@@ -420,5 +420,243 @@ def test_universe_scan_logs_pages_fetched(caplog):
         assert "after 1 page" in exhaustion_logs[0].message.lower()
 
 
+# ============================================================================
+# FOMO feed merge tests (always merge regardless of GT budget)
+# ============================================================================
+
+def test_fomo_feeds_merged_when_gt_budget_exhausted():
+    """FOMO feeds should be merged even when GT budget runs out."""
+    from collect import universe
+    
+    limiter = GTRateLimiter(calls_per_min=30)
+    limiter.set_universe_budget(1)  # Budget=1, will exhaust after first GT page
+    
+    # Mock FOMO with known ids
+    mock_fomo = Mock()
+    mock_fomo.trending_tokens.return_value = ["fomo_trending:1399811149"]
+    mock_fomo.graduated_tokens.return_value = ["fomo_graduated:1399811149"]
+    
+    # Mock GT to return one id
+    with patch('collect.requests.get') as mock_get:
+        mock_resp = Mock()
+        mock_resp.json.return_value = {
+            "data": [{
+                "relationships": {
+                    "base_token": {
+                        "data": {"id": "solana_gt_token"}
+                    }
+                }
+            }]
+        }
+        mock_get.return_value = mock_resp
+        
+        ids, cache = universe(nets=("solana",), pages=2, include_trending=True, 
+                             limiter=limiter, fomo=mock_fomo)
+        
+        # Should include GT token + both FOMO feeds despite budget exhaustion
+        assert "gt_token:1399811149" in ids
+        assert "fomo_trending:1399811149" in ids
+        assert "fomo_graduated:1399811149" in ids
+
+
+def test_fomo_feeds_included_with_zero_budget():
+    """FOMO feeds should be included even with budget=0."""
+    from collect import universe
+    
+    limiter = GTRateLimiter(calls_per_min=30)
+    limiter.set_universe_budget(0)  # Zero budget for GT
+    
+    # Mock FOMO with known ids
+    mock_fomo = Mock()
+    mock_fomo.trending_tokens.return_value = ["fomo_only:1399811149"]
+    mock_fomo.graduated_tokens.return_value = []
+    
+    # Mock GT (should not be called)
+    with patch('collect.requests.get') as mock_get:
+        ids, cache = universe(nets=("solana",), pages=1, include_trending=False,
+                             limiter=limiter, fomo=mock_fomo)
+        
+        # Should include FOMO feed
+        assert "fomo_only:1399811149" in ids
+        # GT should not have been called (budget=0)
+        assert mock_get.call_count == 0
+
+
+def test_fomo_feed_failure_returns_gt_ids():
+    """FOMO feed failure should not prevent GT ids from being returned."""
+    from collect import universe
+    
+    limiter = GTRateLimiter(calls_per_min=30)
+    limiter.set_universe_budget(5)
+    
+    # Mock FOMO to raise exception
+    mock_fomo = Mock()
+    mock_fomo.trending_tokens.side_effect = Exception("FOMO API down")
+    mock_fomo.graduated_tokens.return_value = []
+    
+    # Mock GT to return one id
+    with patch('collect.requests.get') as mock_get:
+        mock_resp = Mock()
+        mock_resp.json.return_value = {
+            "data": [{
+                "relationships": {
+                    "base_token": {
+                        "data": {"id": "solana_gt_survived"}
+                    }
+                }
+            }]
+        }
+        mock_get.return_value = mock_resp
+        
+        ids, cache = universe(nets=("solana",), pages=1, include_trending=False,
+                             limiter=limiter, fomo=mock_fomo)
+        
+        # Should still return GT id despite FOMO failure
+        assert "gt_survived:1399811149" in ids
+
+
+def test_universe_logs_source_counts(caplog):
+    """universe() should log per-source counts including dupes."""
+    from collect import universe
+    import logging
+    
+    caplog.set_level(logging.INFO)
+    
+    limiter = GTRateLimiter(calls_per_min=30)
+    limiter.set_universe_budget(5)
+    
+    # Mock FOMO with one duplicate and one new
+    mock_fomo = Mock()
+    mock_fomo.trending_tokens.return_value = ["gt_dup:1399811149", "fomo_new:1399811149"]
+    mock_fomo.graduated_tokens.return_value = []
+    
+    # Mock GT to return the duplicate
+    with patch('collect.requests.get') as mock_get:
+        mock_resp = Mock()
+        mock_resp.json.return_value = {
+            "data": [{
+                "relationships": {
+                    "base_token": {
+                        "data": {"id": "solana_gt_dup"}
+                    }
+                }
+            }]
+        }
+        mock_get.return_value = mock_resp
+        
+        ids, cache = universe(nets=("solana",), pages=1, include_trending=False,
+                             limiter=limiter, fomo=mock_fomo)
+        
+        # Check log contains source breakdown
+        scan_logs = [r for r in caplog.records if "universe scan" in r.message]
+        assert len(scan_logs) > 0
+        log_msg = scan_logs[0].message
+        
+        # Should mention GT count, FOMO counts, dupes, and total
+        assert "GT 1" in log_msg
+        assert "FOMO trending +1" in log_msg
+        assert "1 dupes" in log_msg  # gt_dup was already in GT
+        assert "total 2" in log_msg  # gt_dup + fomo_new
+
+
+# ============================================================================
+# Carry logic tests (unevaluated tokens carried to next cycle)
+# ============================================================================
+
+def test_carry_applied_to_front_of_shortlist():
+    """Unevaluated tokens should be carried to front of next cycle's shortlist."""
+    import book
+    
+    # Setup: clear carry table
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+    
+    # Save some carry ids
+    carry_tids = ["carry1:1399811149", "carry2:1399811149"]
+    book.save_carry(carry_tids)
+    
+    # Get carry back
+    retrieved = book.get_carry()
+    
+    # Should get the same ids back
+    assert set(retrieved) == set(carry_tids)
+    
+    # Cleanup
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+
+
+def test_carry_capped_at_60():
+    """Carry should be capped at 60 ids max."""
+    import book
+    
+    # Setup: clear carry table
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+    
+    # Try to save 100 ids
+    many_tids = [f"tok{i}:1399811149" for i in range(100)]
+    book.save_carry(many_tids)
+    
+    # Should only store up to 60
+    retrieved = book.get_carry()
+    assert len(retrieved) <= book.CARRY_CAP
+    assert len(retrieved) == 60
+    
+    # Cleanup
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+
+
+def test_carry_aged_out_after_2_cycles():
+    """Tokens carried more than 2 cycles should be dropped."""
+    import book
+    
+    # Setup: clear carry table
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+    
+    # Insert a token with cycles_carried = 3 (too old)
+    book.DB.execute("INSERT INTO carry VALUES (?, ?)", ("old_tok:1399811149", 3))
+    book.DB.commit()
+    
+    # Save new tokens (triggers aging and cleanup)
+    book.save_carry(["new_tok:1399811149"])
+    
+    # Old token should be gone
+    retrieved = book.get_carry()
+    assert "old_tok:1399811149" not in retrieved
+    assert "new_tok:1399811149" in retrieved
+    
+    # Cleanup
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+
+
+def test_carry_cleared_for_evaluated_tokens():
+    """Evaluated tokens should be removed from carry."""
+    import book
+    
+    # Setup: clear carry table
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+    
+    # Save carry ids
+    book.save_carry(["eval1:1399811149", "eval2:1399811149", "skip:1399811149"])
+    
+    # Clear the first two (simulating they were evaluated)
+    book.clear_carry(["eval1:1399811149", "eval2:1399811149"])
+    
+    # Only skip should remain
+    retrieved = book.get_carry()
+    assert "eval1:1399811149" not in retrieved
+    assert "eval2:1399811149" not in retrieved
+    assert "skip:1399811149" in retrieved
+    
+    # Cleanup
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

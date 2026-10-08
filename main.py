@@ -104,9 +104,15 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     ids, gt_txns_cache = universe(limiter=gt_limiter, fomo=fomo)  # fresh + trending pools + FOMO feeds, budget-aware
     book.expire_defer()                          # drop rows past max age
     due = book.defer_due()                       # ids ready for rescoring
+    carry = book.get_carry()                     # unevaluated ids from previous cycle
+    
+    if carry:
+        log.info("carrying %d unevaluated ids from previous cycle to front of shortlist", len(carry))
+    
     seen_ids = set()
     combined_ids = []
-    for tid in due + ids:                        # due first, then universe, first occurrence wins
+    # Priority order: carry (unevaluated from last cycle), due (deferred), then universe (new)
+    for tid in carry + due + ids:
         if tid not in seen_ids:
             seen_ids.add(tid)
             combined_ids.append(tid)
@@ -127,8 +133,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     
     # Track young tokens that still need dossiers this cycle (for in-cycle retry logic)
     young_pending_dossier = []
+    evaluated_tids = []  # Track tids that were evaluated (to clear from carry)
     
-    for t in age_prioritized:                    # pass one: free, no per-token requests
+    evaluated_count = 0  # Track how many tokens we evaluated before budget exhaustion
+    for idx, t in enumerate(age_prioritized):    # pass one: free, no per-token requests
+        evaluated_tids.append(t["tid"])  # Track that we saw this token
         stats["seen"] += 1
         t.setdefault("chain", CHAIN_SET.get(t["net"]))
         if book.benched(t["tid"]):               # already judged, still serving its time
@@ -177,8 +186,16 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         
         # Track free passers for circuit breaker
         free_passers.append(t)
+        evaluated_count = idx + 1  # Track last evaluated index
 
         if dex_slots <= 0 or gt_limiter.available() <= 0:
+            # Log unevaluated tokens and carry them to next cycle
+            unevaluated = age_prioritized[evaluated_count:]
+            if unevaluated:
+                log.info("unevaluated %d ids (dex_slots=%d, gt_available=%d)",
+                         len(unevaluated), dex_slots, gt_limiter.available())
+                # Store for next cycle carry (prepend to shortlist)
+                book.save_carry([t["tid"] for t in unevaluated])
             break                                # out of budget, not out of ideas
 
         # Call trade_counts with new signature and GT fallback cache
@@ -435,6 +452,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         record(d, "judged", None)
         survivors.append((d, ans))
 
+    # Clear carry for evaluated tokens (they were processed this cycle)
+    book.clear_carry(evaluated_tids)
+    
     log.info("cycle: %(seen)s seen, %(benched)s benched, free %(free)s, "
              "trade %(trade)s, chain %(chain)s, soft %(soft)s, judged %(judged)s, requeued %(requeued)s", stats)
 
