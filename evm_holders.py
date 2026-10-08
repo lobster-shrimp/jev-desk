@@ -961,9 +961,9 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
     unidentified_contracts = []
     burns_set = BURN_ADDRESSES
     
-    for addr, balance, pct in holders:
+    for addr, balance, is_contract in holders:
         addr_lower = addr.lower()
-        is_contract = next((h[2] for h in holders if h[0] == addr), False)
+        pct = (balance / supply) * 100 if supply > 0 else 0
         
         if not is_contract or pct < 3:
             continue
