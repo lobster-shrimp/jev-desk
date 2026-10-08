@@ -63,17 +63,17 @@ def test_honeypot_fitcoin_pair_excluded_pass(isolate_evm_state):
         mock_response = {
             "totalSupply": 1000000000,
             "holders": [
-                {"address": "0xPAIR123", "balance": 390000000, "isContract": True},  # 39% pair
-                {"address": "0xWHALE1", "balance": 21500000, "isContract": False},   # 2.15% real top
-                {"address": "0xHOLDER2", "balance": 20000000, "isContract": False},  # 2%
-                {"address": "0xHOLDER3", "balance": 19000000, "isContract": False},
-                {"address": "0xHOLDER4", "balance": 18000000, "isContract": False},
-                {"address": "0xHOLDER5", "balance": 17000000, "isContract": False},
-                {"address": "0xHOLDER6", "balance": 16000000, "isContract": False},
-                {"address": "0xHOLDER7", "balance": 15000000, "isContract": False},
-                {"address": "0xHOLDER8", "balance": 14000000, "isContract": False},
-                {"address": "0xHOLDER9", "balance": 13000000, "isContract": False},
-                {"address": "0xHOLDER10", "balance": 12000000, "isContract": False},
+                {"address": "0x1111111111111111111111111111111111111111", "balance": 390000000, "isContract": True},  # 39% pair
+                {"address": "0x2222222222222222222222222222222222222222", "balance": 21500000, "isContract": False},   # 2.15% real top
+                {"address": "0x3333333333333333333333333333333333333333", "balance": 20000000, "isContract": False},  # 2%
+                {"address": "0x4444444444444444444444444444444444444444", "balance": 19000000, "isContract": False},
+                {"address": "0x5555555555555555555555555555555555555555", "balance": 18000000, "isContract": False},
+                {"address": "0x6666666666666666666666666666666666666666", "balance": 17000000, "isContract": False},
+                {"address": "0x7777777777777777777777777777777777777777", "balance": 16000000, "isContract": False},
+                {"address": "0x8888888888888888888888888888888888888888", "balance": 15000000, "isContract": False},
+                {"address": "0x9999999999999999999999999999999999999999", "balance": 14000000, "isContract": False},
+                {"address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "balance": 13000000, "isContract": False},
+                {"address": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "balance": 12000000, "isContract": False},
             ]
         }
         
@@ -82,8 +82,8 @@ def test_honeypot_fitcoin_pair_excluded_pass(isolate_evm_state):
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
-                pair_addrs=["0xPAIR123"],
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
+                pair_addrs=["0x1111111111111111111111111111111111111111"],
                 age_min=30,
                 db=db
             )
@@ -132,9 +132,9 @@ def test_honeypot_whale_kills(isolate_evm_state):
         mock_response = {
             "totalSupply": 1000000000,
             "holders": [
-                {"address": "0xWHALE", "balance": 396000000, "isContract": False},   # 39.6%
-                {"address": "0xHOLDER2", "balance": 80000000, "isContract": False},  # 8%
-                {"address": "0xHOLDER3", "balance": 50000000, "isContract": False},
+                {"address": "0x2222222222222222222222222222222222222222", "balance": 396000000, "isContract": False},   # 39.6%
+                {"address": "0x3333333333333333333333333333333333333333", "balance": 80000000, "isContract": False},  # 8%
+                {"address": "0x4444444444444444444444444444444444444444", "balance": 50000000, "isContract": False},
             ]
         }
         
@@ -143,7 +143,7 @@ def test_honeypot_whale_kills(isolate_evm_state):
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -191,9 +191,9 @@ def test_honeypot_burn_denominator(isolate_evm_state):
             "totalSupply": total_supply,
             "holders": [
                 {"address": "0x0000000000000000000000000000000000000000", "balance": burned, "isContract": False},  # Burn
-                {"address": "0xWHALE", "balance": int(remaining * 0.251), "isContract": False},  # 25.1% of remaining
-                {"address": "0xHOLDER2", "balance": int(remaining * 0.15), "isContract": False},
-                {"address": "0xHOLDER3", "balance": int(remaining * 0.10), "isContract": False},
+                {"address": "0x2222222222222222222222222222222222222222", "balance": int(remaining * 0.251), "isContract": False},  # 25.1% of remaining
+                {"address": "0x3333333333333333333333333333333333333333", "balance": int(remaining * 0.15), "isContract": False},
+                {"address": "0x4444444444444444444444444444444444444444", "balance": int(remaining * 0.10), "isContract": False},
             ]
         }
         
@@ -202,7 +202,7 @@ def test_honeypot_burn_denominator(isolate_evm_state):
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -245,7 +245,7 @@ def test_pool_manager_excluded(isolate_evm_state):
             "totalSupply": 1000000000,
             "holders": [
                 {"address": "0x8366a39cc670b4001a1121b8f6a443a643e40951", "balance": 400000000, "isContract": True},  # Robinhood PoolManager
-                {"address": "0xWHALE", "balance": 30000000, "isContract": False},  # 3% real
+                {"address": "0x2222222222222222222222222222222222222222", "balance": 30000000, "isContract": False},  # 3% real
             ]
         }
         
@@ -263,7 +263,7 @@ def test_pool_manager_excluded(isolate_evm_state):
         with patch('evm_holders._holders_rpc_fold', side_effect=mock_fold):
             result = evm_holders.evm_holder_concentration(
                 chain_id=4663,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -308,7 +308,7 @@ def test_flap_portal_excluded(isolate_evm_state):
             "totalSupply": 1000000000,
             "holders": [
                 {"address": "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0", "balance": 300000000, "isContract": True},  # Flap Portal BSC
-                {"address": "0xWHALE", "balance": 40000000, "isContract": False},  # 4%
+                {"address": "0x2222222222222222222222222222222222222222", "balance": 40000000, "isContract": False},  # 4%
             ]
         }
         
@@ -317,7 +317,7 @@ def test_flap_portal_excluded(isolate_evm_state):
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -397,7 +397,7 @@ def test_pinklock_permanent_excluded(isolate_evm_state):
         
         result = evm_holders.evm_holder_concentration(
             chain_id=56,
-            token="0xTOKEN",
+            token="0xcccccccccccccccccccccccccccccccccccccccc",
             pair_addrs=[],
             age_min=120,  # >= 120m to enable GoPlus
             db=db
@@ -454,7 +454,7 @@ def test_locker_unlocking_under_7d_counted():
             "totalSupply": 1000000000,
             "holders": [
                 {"address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe", "balance": 400000000, "isContract": True},  # Unlocking soon
-                {"address": "0xWHALE", "balance": 50000000, "isContract": False},
+                {"address": "0x2222222222222222222222222222222222222222", "balance": 50000000, "isContract": False},
             ]
         }
         
@@ -470,7 +470,7 @@ def test_locker_unlocking_under_7d_counted():
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=120,
                 db=db
@@ -509,7 +509,7 @@ def test_unknown_contract_counted(isolate_evm_state):
             "totalSupply": 1000000000,
             "holders": [
                 {"address": "0xUNKNOWNCONTRACT", "balance": 255000000, "isContract": True},  # 25.5% unknown contract
-                {"address": "0xWHALE", "balance": 50000000, "isContract": False},
+                {"address": "0x2222222222222222222222222222222222222222", "balance": 50000000, "isContract": False},
             ]
         }
         
@@ -523,7 +523,7 @@ def test_unknown_contract_counted(isolate_evm_state):
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -573,7 +573,7 @@ def test_robinhood_fold_incomplete(isolate_evm_state):
         with patch('evm_holders._holders_rpc_fold', side_effect=mock_fold):
             result = evm_holders.evm_holder_concentration(
                 chain_id=4663,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -617,7 +617,7 @@ def test_honeypot_invalid_chain(isolate_evm_state):
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -656,7 +656,7 @@ def test_honeypot_timeout(isolate_evm_state):
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -731,7 +731,7 @@ def test_evm_with_ok_result_no_longer_unverified(isolate_evm_state):
         mock_response = {
             "totalSupply": 1000000000,
             "holders": [
-                {"address": "0xWHALE", "balance": 30000000, "isContract": False},  # 3%
+                {"address": "0x2222222222222222222222222222222222222222", "balance": 30000000, "isContract": False},  # 3%
             ]
         }
         
@@ -740,7 +740,7 @@ def test_evm_with_ok_result_no_longer_unverified(isolate_evm_state):
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -763,7 +763,7 @@ def test_dossier_integration_bsc_pass(isolate_evm_state):
     """BSC dossier with pair exclusion passes."""
     token_dict = {
         "ticker": "TEST",
-        "addr": "0xTOKEN",
+        "addr": "0xcccccccccccccccccccccccccccccccccccccccc",
         "net": 56,
         "age_minutes": 30,
         "pair_address": "0xPAIR",
@@ -787,7 +787,7 @@ def test_dossier_integration_bsc_pass(isolate_evm_state):
         "totalSupply": 1000000000,
         "holders": [
             {"address": "0xPAIR", "balance": 400000000, "isContract": True},
-            {"address": "0xWHALE", "balance": 30000000, "isContract": False},  # 3% after exclusion
+            {"address": "0x2222222222222222222222222222222222222222", "balance": 30000000, "isContract": False},  # 3% after exclusion
         ]
     }
     
@@ -817,7 +817,7 @@ def test_dossier_integration_bsc_whale_kill(isolate_evm_state):
     """BSC dossier with whale kills."""
     token_dict = {
         "ticker": "WHALE",
-        "addr": "0xTOKEN",
+        "addr": "0xcccccccccccccccccccccccccccccccccccccccc",
         "net": 56,
         "age_minutes": 30,
         "pair_address": None,
@@ -840,7 +840,7 @@ def test_dossier_integration_bsc_whale_kill(isolate_evm_state):
     mock_honeypot = {
         "totalSupply": 1000000000,
         "holders": [
-            {"address": "0xWHALE", "balance": 400000000, "isContract": False},  # 40%
+            {"address": "0x2222222222222222222222222222222222222222", "balance": 400000000, "isContract": False},  # 40%
         ]
     }
     
@@ -868,7 +868,7 @@ def test_dossier_integration_robinhood_poolmanager(isolate_evm_state):
     """Robinhood dossier with PoolManager exclusion passes."""
     token_dict = {
         "ticker": "TEST",
-        "addr": "0xTOKEN",
+        "addr": "0xcccccccccccccccccccccccccccccccccccccccc",
         "net": 4663,
         "age_minutes": 30,
         "pair_address": None
@@ -916,7 +916,7 @@ def test_dossier_integration_robinhood_incomplete(isolate_evm_state):
     """Robinhood dossier with incomplete fold -> top_wallet_unverified."""
     token_dict = {
         "ticker": "TEST",
-        "addr": "0xTOKEN",
+        "addr": "0xcccccccccccccccccccccccccccccccccccccccc",
         "net": 4663,
         "age_minutes": 30,
         "pair_address": None
@@ -985,7 +985,7 @@ def test_secret_scrubbing(isolate_evm_state):
             
             result = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -1026,7 +1026,7 @@ def test_cache(isolate_evm_state):
         mock_response = {
             "totalSupply": 1000000000,
             "holders": [
-                {"address": "0xWHALE", "balance": 30000000, "isContract": False},
+                {"address": "0x2222222222222222222222222222222222222222", "balance": 30000000, "isContract": False},
             ]
         }
         
@@ -1036,7 +1036,7 @@ def test_cache(isolate_evm_state):
             # First call
             result1 = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db
@@ -1045,7 +1045,7 @@ def test_cache(isolate_evm_state):
             # Second call (should hit cache)
             result2 = evm_holders.evm_holder_concentration(
                 chain_id=56,
-                token="0xTOKEN",
+                token="0xcccccccccccccccccccccccccccccccccccccccc",
                 pair_addrs=[],
                 age_min=30,
                 db=db

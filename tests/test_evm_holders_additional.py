@@ -12,36 +12,57 @@ import time
 
 
 def test_multicall3_golden_encode_decode(isolate_evm_state):
-    """Test Multicall3 encoding/decoding matches eth_abi golden bytes."""
-    # Build calls
-    calls = [
-        ("0xcf93d4a19c64e93a2cdb35f1fd14d5f2abd5b43f", True, bytes.fromhex("0dfe1681")),
-        ("0xcf93d4a19c64e93a2cdb35f1fd14d5f2abd5b43f", True, bytes.fromhex("d21220a7")),
+    """Test Multicall3 real call with proper encoding/decoding."""
+    import evm_holders
+    from eth_abi import encode, decode
+    from unittest.mock import Mock, patch
+    
+    # Real B13B address and V3 pool from spec
+    b13b_token = "0x4902c5ebc598265ed2212b559b042de8a5eeec3f"
+    v3_pool = "0xcf936261a1582b45eae2246105b3388d1e31c94d"
+    other_addr = "0x320e9d32c1eea81a30ee00c48b02d74fd79e92d9"
+    
+    holders = [
+        (v3_pool, 1000, True),
+        (other_addr, 500, True),
     ]
     
-    # Encode using eth_abi
-    expected_data = "0x82ad56cb" + encode(
-        ['(address,bool,bytes)[]'],
-        [calls]
-    ).hex()
+    # Expected Multicall3 data
+    expected_calls = [
+        (v3_pool, True, bytes.fromhex("0dfe1681")),  # token0()
+        (v3_pool, True, bytes.fromhex("d21220a7")),  # token1()
+        (other_addr, True, bytes.fromhex("0dfe1681")),
+        (other_addr, True, bytes.fromhex("d21220a7")),
+    ]
+    expected_data = "0x82ad56cb" + encode(['(address,bool,bytes)[]'], [expected_calls]).hex()
     
-    # Should not have double 0x
-    assert expected_data.count("0x") == 1
-    assert expected_data.startswith("0x82ad56cb")
+    # Mock RPC response: pool returns token addresses, other returns nothing
+    b13b_padded = b"\\x00" * 12 + bytes.fromhex(b13b_token[2:])
+    mock_response = encode(['(bool,bytes)[]'], [[
+        (True, b13b_padded),  # token0()
+        (True, bytes.fromhex(other_addr[2:]).rjust(32, b'\\x00')),  # token1()
+        (True, b''),  # other token0()
+        (True, b''),  # other token1()
+    ]])
     
-    # Decode test with real captured response
-    result_hex = "0x" + encode(
-        ['(bool,bytes)[]'],
-        [[(True, bytes.fromhex("0000000000000000000000004902dcA4D7011935322aE83Fef0E0c873ba1b0F0")),
-          (False, b'')]]
-    ).hex()
-    
-    decoded = decode(['(bool,bytes)[]'], bytes.fromhex(result_hex[2:]))[0]
-    
-    assert decoded[0][0] == True
-    assert len(decoded[0][1]) == 32
-    token_addr = "0x" + decoded[0][1][-20:].hex()
-    assert token_addr.lower() == "0x4902dcA4D7011935322aE83Fef0E0c873ba1b0F0".lower()
+    with patch('evm_holders.requests.post') as mock_post:
+        mock_post.return_value = Mock(
+            status_code=200,
+            json=lambda: {"result": "0x" + mock_response.hex()}
+        )
+        
+        result = evm_holders._check_pools_via_multicall(holders, b13b_token, 56, time.time() + 10)
+        
+        # Verify the POST data matches expected encoding
+        assert mock_post.called
+        call_json = mock_post.call_args[1]['json']
+        assert call_json['method'] == 'eth_call'
+        actual_data = call_json['params'][0]['data']
+        assert actual_data == expected_data, f"Expected {expected_data}, got {actual_data}"
+        
+        # Verify result identifies the pool
+        assert v3_pool in result or v3_pool.lower() in result
+        assert other_addr not in result
 
 
 def test_fold_mint_transfer_burn_sequence(isolate_evm_state):
@@ -230,7 +251,7 @@ def test_supply_zero_definitive(isolate_evm_state):
     import book
     with patch('evm_holders.requests.get') as mock_get:
         mock_get.return_value = Mock(status_code=200, json=lambda: {"totalSupply": 0, "holders": []})
-        result = evm_holders.evm_holder_concentration(56, "0xSUPPLY0", [], 30, book.DB)
+        result = evm_holders.evm_holder_concentration(56, "0xcccccccccccccccccccccccccccccccccccccccc", [], 30, book.DB)
         assert not result.ok
         assert result.error == "zero_supply"
         assert result.is_transient == False
@@ -240,54 +261,113 @@ def test_eip7702_wallet_counted(isolate_evm_state):
     """Test EIP-7702 delegated EOAs counted."""
     import book
     with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
-        mock_get.return_value = Mock(status_code=200, json=lambda: {"totalSupply": 1000000, "holders": [{"address": "0x7702HOLDER", "balance": 500000, "isContract": True}, {"address": "0xNORMAL", "balance": 500000, "isContract": False}]})
+        mock_get.return_value = Mock(status_code=200, json=lambda: {"totalSupply": 1000000, "holders": [{"address": "0xdddddddddddddddddddddddddddddddddddddddd", "balance": 500000, "isContract": True}, {"address": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "balance": 500000, "isContract": False}]})
         mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + encode(['(bool,bytes)[]'], [[(False, b''), (False, b'')]]).hex()})
-        result = evm_holders.evm_holder_concentration(56, "0xEIP7702", [], 30, book.DB)
+        result = evm_holders.evm_holder_concentration(56, "0xcccccccccccccccccccccccccccccccccccccccc", [], 30, book.DB)
         assert result.ok
         assert result.top_wallet == 0.5
 
 
 def test_goplus_units_via_dossier_chain_kill(isolate_evm_state):
-    """End-to-end GoPlus units test - verify percent is fraction 0-1."""
+    """End-to-end GoPlus units test via collect.dossier and chain_kill."""
     import book
+    import collect
+    from filter import chain_kill
+    from unittest.mock import Mock, patch
     
-    # Use valid Ethereum addresses
+    # Test case 1: top_wallet 0.20 (20%) should kill on top_wallet
     W1 = "0x1111111111111111111111111111111111111111"
     W2 = "0x2222222222222222222222222222222222222222"
-    W3 = "0x3333333333333333333333333333333333333333"
-    W4 = "0x4444444444444444444444444444444444444444"
     
-    mock_goplus = {
+    mock_goplus_whale = {
         "holders": [
-            {"address": W1, "percent": "0.250", "is_contract": 0},   # 25%
-            {"address": W2, "percent": "0.200", "is_contract": 0},   # 20%
-            {"address": W3, "percent": "0.150", "is_contract": 0},   # 15%
-            {"address": W4, "percent": "0.100", "is_contract": 0},   # 10%
-            # Total top 4: 70%
+            {"address": W1, "percent": "0.20", "is_contract": 0},  # 20%
+            {"address": W2, "percent": "0.10", "is_contract": 0},  # 10%
         ],
         "dex": []
     }
     
-    with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
-        def se(url, **kwargs):
-            if "honeypot" in url:
-                return Mock(status_code=500)
+    # Normalized token for dossier
+    normalized_whale = {
+        "ticker": "WHALE",
+        "address": "0xabcd1111111111111111111111111111111111ab",
+        "network_id": 56,
+        "age_minutes": 150,
+        "liquidity_usd": 50000,
+        "volume_h24": 100000,
+        "mcap_usd": 200000,
+        "holder_count": 200,
+        "trades_h24": 500,
+    }
+    
+    with patch('collect.requests.get') as mock_get, patch('collect.requests.post') as mock_post:
+        def get_side_effect(url, **kwargs):
+            if "geckoterminal" in url:
+                return Mock(status_code=200, json=lambda: {"data": {"attributes": {}}})
+            elif "honeypot" in url:
+                return Mock(status_code=500)  # Force GoPlus fallback
             elif "gopluslabs" in url:
-                return Mock(status_code=200, json=lambda: {"code": 1, "result": {"0xgoplusu": mock_goplus}})
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {normalized_whale["address"]: mock_goplus_whale}})
             return Mock(status_code=404)
         
-        mock_get.side_effect = se
+        mock_get.side_effect = get_side_effect
         
-        # Mock Multicall3 response (none are pools)
+        # Multicall (none are pools)
         from eth_abi import encode
-        multicall_result = encode(['(bool,bytes)[]'], [[(False, b'')] * 8])
+        multicall_result = encode(['(bool,bytes)[]'], [[(False, b'')] * 4])
         mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
         
-        result = evm_holders.evm_holder_concentration(56, "0xGOPLUSU", [], 120, book.DB)
-        assert result.ok
-        # Verify GoPlus percent (0.250) is interpreted as fraction, not percentage
-        assert abs(result.top_wallet - 0.25) < 0.01
-        assert abs(result.top_10 - 70.0) < 1
+        d = collect.dossier(normalized_whale, limiter=None)
+        
+        assert d["top_wallet_percent"] is not None
+        assert abs(d["top_wallet_percent"] - 0.20) < 0.01
+        
+        kill_reason = chain_kill(d)
+        assert kill_reason == "top_wallet", f"Expected top_wallet kill, got {kill_reason}"
+    
+    # Test case 2: top_wallet 0.04 (4%) and top_10 < 60% should NOT kill
+    mock_goplus_pass = {
+        "holders": [
+            {"address": W1, "percent": "0.04", "is_contract": 0},  # 4%
+            {"address": W2, "percent": "0.03", "is_contract": 0},  # 3%
+        ],
+        "dex": []
+    }
+    
+    normalized_pass = {
+        "ticker": "PASS",
+        "address": "0xabcd2222222222222222222222222222222222ab",
+        "network_id": 56,
+        "age_minutes": 150,
+        "liquidity_usd": 50000,
+        "volume_h24": 100000,
+        "mcap_usd": 200000,
+        "holder_count": 200,
+        "trades_h24": 500,
+    }
+    
+    with patch('collect.requests.get') as mock_get, patch('collect.requests.post') as mock_post:
+        def get_side_effect(url, **kwargs):
+            if "geckoterminal" in url:
+                return Mock(status_code=200, json=lambda: {"data": {"attributes": {}}})
+            elif "honeypot" in url:
+                return Mock(status_code=500)
+            elif "gopluslabs" in url:
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {normalized_pass["address"]: mock_goplus_pass}})
+            return Mock(status_code=404)
+        
+        mock_get.side_effect = get_side_effect
+        
+        multicall_result = encode(['(bool,bytes)[]'], [[(False, b'')] * 4])
+        mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
+        
+        d = collect.dossier(normalized_pass, limiter=None)
+        
+        assert d["top_wallet_percent"] is not None
+        assert abs(d["top_wallet_percent"] - 0.04) < 0.01
+        
+        kill_reason = chain_kill(d)
+        assert kill_reason is None, f"Expected no kill, got {kill_reason}"
 
 
 def test_429_non_blocking(isolate_evm_state):
@@ -370,7 +450,7 @@ def test_http_5xx_transient(isolate_evm_state):
 def test_goplus_burn_denominator(isolate_evm_state):
     """Test GoPlus burn denominator."""
     import book
-    mock_goplus = {"holders": [{"address": "0xWHALE", "percent": "0.1802", "is_contract": 0}, {"address": "0x000000000000000000000000000000000000dead", "percent": "0.18", "is_contract": 0}, {"address": "0xOTHER", "percent": "0.10", "is_contract": 0}], "dex": []}
+    mock_goplus = {"holders": [{"address": "0x2222222222222222222222222222222222222222", "percent": "0.1802", "is_contract": 0}, {"address": "0x000000000000000000000000000000000000dead", "percent": "0.18", "is_contract": 0}, {"address": "0xOTHER", "percent": "0.10", "is_contract": 0}], "dex": []}
     with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
         def se(url, **kwargs):
             if "honeypot" in url:
@@ -426,3 +506,188 @@ def test_address_constants(isolate_evm_state):
     assert len(evm_holders.MULTICALL3) == 42
     assert evm_holders.MULTICALL3 == evm_holders.MULTICALL3.lower()
     assert evm_holders.MULTICALL3 == "0xca11bde05977b3631167028862be2a173976ca11"
+
+
+def test_goplus_lock_gating_no_unidentified(isolate_evm_state):
+    """Test GoPlus NOT called when pair 20% + burn 30% and no unidentified contract."""
+    import book
+    import evm_holders
+    from unittest.mock import Mock, patch
+    
+    pair_addr = "0x1111111111111111111111111111111111111111"
+    burn_addr = "0x000000000000000000000000000000000000dead"
+    whale_addr = "0x2222222222222222222222222222222222222222"
+    
+    mock_honeypot = {
+        "totalSupply": 1000000,
+        "holders": [
+            {"address": pair_addr, "balance": 200000, "isContract": True},  # 20% - will be identified as pool via Multicall
+            {"address": burn_addr, "balance": 300000, "isContract": False},  # 30% burn
+            {"address": whale_addr, "balance": 500000, "isContract": False},  # 50%
+        ]
+    }
+    
+    goplus_called = [False]
+    
+    with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
+        def get_side_effect(url, **kwargs):
+            if "honeypot" in url:
+                return Mock(status_code=200, json=lambda: mock_honeypot)
+            elif "gopluslabs" in url:
+                goplus_called[0] = True
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {}})
+            return Mock(status_code=404)
+        
+        mock_get.side_effect = get_side_effect
+        
+        # Multicall identifies the pair
+        from eth_abi import encode
+        multicall_result = encode(['(bool,bytes)[]'], [[(True, b'\\x00' * 32), (True, b'\\x00' * 32)]])
+        mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
+        
+        result = evm_holders.evm_holder_concentration(56, "0xcccccccccccccccccccccccccccccccccccccccc", [], 120, book.DB)
+        
+        # GoPlus should NOT have been called (no unidentified contract >= 3%)
+        assert not goplus_called[0], "GoPlus should not be called when no unidentified contract"
+
+
+def test_goplus_lock_gating_with_unidentified(isolate_evm_state):
+    """Test GoPlus IS called when unidentified contract holds 5%."""
+    import book
+    import evm_holders
+    from unittest.mock import Mock, patch
+    
+    unknown_contract = "0x1111111111111111111111111111111111111111"
+    whale_addr = "0x2222222222222222222222222222222222222222"
+    
+    mock_honeypot = {
+        "totalSupply": 1000000,
+        "holders": [
+            {"address": unknown_contract, "balance": 50000, "isContract": True},  # 5% unknown contract
+            {"address": whale_addr, "balance": 950000, "isContract": False},
+        ]
+    }
+    
+    goplus_called = [False]
+    
+    with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
+        def get_side_effect(url, **kwargs):
+            if "honeypot" in url:
+                return Mock(status_code=200, json=lambda: mock_honeypot)
+            elif "gopluslabs" in url:
+                goplus_called[0] = True
+                return Mock(status_code=200, json=lambda: {"code": 1, "result": {"0xtoken": {"holders": [], "dex": []}}})
+            return Mock(status_code=404)
+        
+        mock_get.side_effect = get_side_effect
+        
+        # Multicall says unknown contract is not a pool
+        from eth_abi import encode
+        multicall_result = encode(['(bool,bytes)[]'], [[(False, b''), (False, b'')]])
+        mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
+        
+        result = evm_holders.evm_holder_concentration(56, "0xcccccccccccccccccccccccccccccccccccccccc", [], 120, book.DB)
+        
+        # GoPlus SHOULD have been called (unidentified contract >= 3%)
+        assert goplus_called[0], "GoPlus should be called when unidentified contract >= 3%"
+
+
+def test_cache_at_head_mismatch_definitive(isolate_evm_state):
+    """Test cache-at-head with totalSupply mismatch returns definitive error."""
+    import book
+    import evm_holders
+    import json
+    import time
+    from unittest.mock import Mock, patch
+    
+    db = book.DB
+    
+    # Insert cache with sum=1000
+    db.execute("INSERT INTO evm_holder_cache VALUES (?, ?, ?, ?, ?, ?)",
+               (4663, "0xcached", 500, json.dumps({"0xholder": 1000}), "1000", time.time()))
+    db.commit()
+    
+    with patch('evm_holders.requests.post') as mock_post:
+        def rpc(url, **kwargs):
+            json_data = kwargs.get('json', {})
+            method = json_data.get("method")
+            
+            if method == "eth_blockNumber":
+                # Head is at block 500, so cache is at head
+                return Mock(status_code=200, json=lambda: {"result": hex(480)})
+            
+            elif method == "eth_call":
+                # totalSupply = 5000 (mismatch with cache sum of 1000)
+                return Mock(status_code=200, json=lambda: {"result": hex(5000)})
+            
+            return Mock(status_code=404)
+        
+        mock_post.side_effect = rpc
+        
+        result = evm_holders.evm_holder_concentration(4663, "0xcached", [], 30, db)
+        
+        assert not result.ok
+        assert result.error == "incomplete_at_head"
+        assert result.is_transient == False  # Definitive (6h bench)
+
+
+def test_prune_old_cache(isolate_evm_state):
+    """Test prune_old_cache deletes rows older than 72h."""
+    import book
+    import evm_holders
+    import json
+    import time
+    
+    db = book.DB
+    now = time.time()
+    
+    # Insert old cache (4 days old)
+    db.execute("INSERT INTO evm_holder_cache VALUES (?, ?, ?, ?, ?, ?)",
+               (4663, "0xold", 100, json.dumps({}), "0", now - 4*24*3600))
+    
+    # Insert new cache (1 day old)
+    db.execute("INSERT INTO evm_holder_cache VALUES (?, ?, ?, ?, ?, ?)",
+               (4663, "0xnew", 200, json.dumps({}), "0", now - 1*24*3600))
+    db.commit()
+    
+    # Prune
+    evm_holders.prune_old_cache(db)
+    
+    # Check: old should be gone, new should remain
+    rows = db.execute("SELECT token FROM evm_holder_cache").fetchall()
+    tokens = [r[0] for r in rows]
+    
+    assert "0xold" not in tokens
+    assert "0xnew" in tokens
+
+
+def test_self_held_balance_counted(isolate_evm_state):
+    """Test token contract holding its own tokens is counted (not excluded)."""
+    import book
+    import evm_holders
+    from unittest.mock import Mock, patch
+    
+    token_addr = "0x1111111111111111111111111111111111111111"
+    whale_addr = "0x2222222222222222222222222222222222222222"
+    
+    mock_honeypot = {
+        "totalSupply": 1000000,
+        "holders": [
+            {"address": token_addr, "balance": 300000, "isContract": True},  # Token holds itself
+            {"address": whale_addr, "balance": 700000, "isContract": False},
+        ]
+    }
+    
+    with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
+        mock_get.return_value = Mock(status_code=200, json=lambda: mock_honeypot)
+        
+        # Multicall says token contract is not a pool
+        from eth_abi import encode
+        multicall_result = encode(['(bool,bytes)[]'], [[(False, b''), (False, b'')]])
+        mock_post.return_value = Mock(status_code=200, json=lambda: {"result": "0x" + multicall_result.hex()})
+        
+        result = evm_holders.evm_holder_concentration(56, token_addr, [], 30, book.DB)
+        
+        assert result.ok
+        # Top wallet should be whale at 70%, not token self-holding
+        assert abs(result.top_wallet - 0.70) < 0.01
