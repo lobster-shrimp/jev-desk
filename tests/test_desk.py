@@ -1155,29 +1155,29 @@ def test_universe_includes_trending_pools():
     """universe should fetch trending_pools in addition to new_pools and dedupe."""
     import requests
     
-    # Mock responses: trending_pools FIRST (new order), then new_pools
+    # Mock responses in correct order: sol new p1, sol new p2, sol trending, bsc trending, bsc new p1, bsc new p2
     mock_responses = [
-        # Solana trending_pools page 1 (called first now)
+        # Solana new_pools page 1 (highest priority)
         Mock(status_code=200, headers={}, json=lambda: {
             "data": [
-                {"relationships": {"base_token": {"data": {"id": "solana_trend1"}}}},
-                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}}  # will be duplicate later
-            ]
-        }),
-        # BSC trending_pools page 1
-        Mock(status_code=200, headers={}, json=lambda: {
-            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_trend1"}}}}]
-        }),
-        # Solana new_pools page 1
-        Mock(status_code=200, headers={}, json=lambda: {
-            "data": [
-                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}},  # duplicate from trending
+                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}},
                 {"relationships": {"base_token": {"data": {"id": "solana_new2"}}}}
             ]
         }),
         # Solana new_pools page 2
         Mock(status_code=200, headers={}, json=lambda: {
             "data": [{"relationships": {"base_token": {"data": {"id": "solana_new3"}}}}]
+        }),
+        # Solana trending_pools page 1
+        Mock(status_code=200, headers={}, json=lambda: {
+            "data": [
+                {"relationships": {"base_token": {"data": {"id": "solana_trend1"}}}},
+                {"relationships": {"base_token": {"data": {"id": "solana_new1"}}}}  # duplicate
+            ]
+        }),
+        # BSC trending_pools page 1
+        Mock(status_code=200, headers={}, json=lambda: {
+            "data": [{"relationships": {"base_token": {"data": {"id": "bsc_trend1"}}}}]
         }),
         # BSC new_pools page 1
         Mock(status_code=200, headers={}, json=lambda: {
@@ -1201,25 +1201,25 @@ def test_universe_includes_trending_pools():
     try:
         ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
         
-        # Should have 7 unique IDs (2 solana trend + 3 solana new + 1 bsc trend + 2 bsc new - 1 duplicate)
-        assert len(ids) == 7
+        # Should have 7 unique IDs (3 solana new + 1 solana trend + 1 bsc trend + 2 bsc new - 1 duplicate)
+        assert len(ids) == 7, f"Expected 7 unique tokens, got {len(ids)}: {ids}"
         
         # Verify no duplicates
         assert len(ids) == len(set(ids))
         
-        # Verify trending IDs are included (after split on "_", "solana_trend1" -> "trend1")
-        assert any("trend1:1399811149" in tid for tid in ids)
-        assert any("trend1:56" in tid for tid in ids)
+        # Verify solana trending IDs are included
+        assert "trend1:1399811149" in ids, f"Expected solana trend1 in {ids}"
+        assert "trend1:56" in ids, f"Expected bsc trend1 in {ids}"
         
         # Verify we made calls to both new_pools and trending_pools
         new_pool_calls = [c for c in call_info if "new_pools" in c[0]]
         trending_calls = [c for c in call_info if "trending_pools" in c[0]]
         
-        assert len(new_pool_calls) == 4  # 2 solana + 2 bsc
-        assert len(trending_calls) == 2  # 1 solana + 1 bsc
+        assert len(new_pool_calls) == 4, f"Expected 4 new_pools calls, got {len(new_pool_calls)}"  # 2 solana + 2 bsc
+        assert len(trending_calls) == 2, f"Expected 2 trending_pools calls, got {len(trending_calls)}"  # 1 solana + 1 bsc
         
         # Verify total call count: 4 new_pools + 2 trending_pools = 6
-        assert len(call_info) == 6
+        assert len(call_info) == 6, f"Expected 6 total calls, got {len(call_info)}"
     finally:
         requests.get = original_get
 
@@ -1459,17 +1459,22 @@ def test_rolling_window_no_more_than_n_calls_per_minute():
 
 
 def test_rate_limiter_trending_before_new_pools():
-    """universe should fetch trending_pools before new_pools."""
+    """universe should prioritize solana new_pools p1-2, then solana trending, then other networks' trending."""
     import requests
     
     original_get = requests.get
     call_order = []
     
     def mock_get(url, **kwargs):
-        if "trending_pools" in url:
-            call_order.append("trending")
-        elif "new_pools" in url:
-            call_order.append("new")
+        if "solana" in url and "new_pools" in url:
+            page = kwargs.get("params", {}).get("page", 1)
+            call_order.append(f"solana_new_p{page}")
+        elif "solana" in url and "trending_pools" in url:
+            call_order.append("solana_trending")
+        elif "bsc" in url and "trending_pools" in url:
+            call_order.append("bsc_trending")
+        elif "bsc" in url and "new_pools" in url:
+            call_order.append("bsc_new")
         return Mock(status_code=200, json=lambda: {
             "data": [{"relationships": {"base_token": {"data": {"id": f"solana_tok1"}}}}]
         })
@@ -1479,26 +1484,28 @@ def test_rate_limiter_trending_before_new_pools():
     try:
         fake_time = [0.0]
         limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
-        collect.universe(nets=("solana",), pages=2, include_trending=True, limiter=limiter)
+        collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True, limiter=limiter)
         
-        # Trending should come before all new_pools
-        assert call_order[0] == "trending", f"Expected trending first, got {call_order}"
-        # Then new_pools pages
-        assert "new" in call_order[1:], f"Expected new_pools after trending, got {call_order}"
+        # Order should be: sol_new p1, sol_new p2, sol_trending, bsc_trending, bsc_new...
+        assert call_order[0] == "solana_new_p1", f"Expected solana_new_p1 first, got {call_order}"
+        assert call_order[1] == "solana_new_p2", f"Expected solana_new_p2 second, got {call_order}"
+        assert call_order[2] == "solana_trending", f"Expected solana_trending third, got {call_order}"
+        assert call_order[3] == "bsc_trending", f"Expected bsc_trending fourth, got {call_order}"
+        assert "bsc_new" in call_order[4:], f"Expected bsc_new after trending, got {call_order}"
     finally:
         requests.get = original_get
 
 
 def test_rate_limiter_429_retry_with_backoff():
-    """GT 429 on trending should retry once with backoff."""
+    """GT 429 on solana trending should retry once with backoff."""
     import requests
     
     original_get = requests.get
     call_count = [0]
     
     def mock_get(url, **kwargs):
-        call_count[0] += 1
-        if "trending_pools" in url:
+        if "trending_pools" in url and "solana" in url:
+            call_count[0] += 1
             if call_count[0] == 1:
                 # First call: 429 with Retry-After
                 return Mock(status_code=429, headers={"Retry-After": "0.1"})
@@ -1514,8 +1521,63 @@ def test_rate_limiter_429_retry_with_backoff():
         limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
         collect.universe(nets=("solana",), pages=1, include_trending=True, limiter=limiter)
         
-        # Should have retried (2 calls total for trending: 429 + retry)
+        # Should have retried (2 calls total for solana trending: 429 + retry)
         assert call_count[0] >= 2, f"Expected retry, got {call_count[0]} calls"
+    finally:
+        requests.get = original_get
+
+
+def test_universe_budget_5_three_networks(caplog):
+    """With budget=5 and 3 networks, should fetch exactly sol_new p1, sol_new p2, sol_trending, bsc_trending, rh_trending."""
+    import requests
+    import logging
+    
+    caplog.set_level(logging.INFO)
+    
+    original_get = requests.get
+    call_order = []
+    
+    def mock_get(url, **kwargs):
+        if "solana" in url and "new_pools" in url:
+            page = kwargs.get("params", {}).get("page", 1)
+            call_order.append(f"solana_new_p{page}")
+        elif "solana" in url and "trending_pools" in url:
+            call_order.append("solana_trending")
+        elif "bsc" in url and "trending_pools" in url:
+            call_order.append("bsc_trending")
+        elif "robinhood" in url and "trending_pools" in url:
+            call_order.append("robinhood_trending")
+        elif "bsc" in url and "new_pools" in url:
+            call_order.append("bsc_new")
+        elif "robinhood" in url and "new_pools" in url:
+            call_order.append("robinhood_new")
+        return Mock(status_code=200, json=lambda: {"data": []})
+    
+    requests.get = mock_get
+    
+    try:
+        fake_time = [0.0]
+        limiter = collect.GTRateLimiter(calls_per_min=30, time_fn=lambda: fake_time[0])
+        limiter.set_universe_budget(5)  # Default budget
+        
+        ids, _ = collect.universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, limiter=limiter)
+        
+        # Should have stopped at exactly 5 calls
+        assert len(call_order) == 5, f"Expected exactly 5 calls with budget=5, got {len(call_order)}: {call_order}"
+        
+        # Verify exact order: sol_new p1, sol_new p2, sol_trending, bsc_trending, rh_trending
+        assert call_order == [
+            "solana_new_p1",
+            "solana_new_p2", 
+            "solana_trending",
+            "bsc_trending",
+            "robinhood_trending"
+        ], f"Expected exact sequence, got {call_order}"
+        
+        # Verify budget exhaustion log appeared
+        exhaustion_logs = [r for r in caplog.records if "budget exhausted after" in r.message.lower()]
+        assert len(exhaustion_logs) > 0, "Expected budget exhaustion log"
+        assert "after 5 pages" in exhaustion_logs[0].message.lower(), f"Expected 'after 5 pages', got {exhaustion_logs[0].message}"
     finally:
         requests.get = original_get
 

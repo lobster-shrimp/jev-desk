@@ -35,6 +35,7 @@ CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"
 CYCLE_SECONDS = 900
 GT_CALLS_PER_MIN = int(os.environ.get("GT_CALLS_PER_MIN", "8"))  # conservative default, configurable
 GT_DOSSIER_RESERVE = 3      # reserve this many slots for dossiers before calling universe
+GT_UNIVERSE_BUDGET = int(os.environ.get("GT_UNIVERSE_BUDGET", "5"))  # universe scan budget per cycle
 DEX_BUDGET    = 25          # DexScreener calls per cycle, pass two only
 log = logging.getLogger("desk")
 
@@ -47,7 +48,7 @@ class JudgeDown(Exception):
 
 
 def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER_RESERVE, 
-             gt_limiter=None):
+             gt_limiter=None, gt_universe_budget=GT_UNIVERSE_BUDGET):
     mode_str = "SHADOW" if shadow else "LIVE"
     judge_str = "MOCK" if os.environ.get("JUDGE_MOCK") == "1" else "LIVE"
     log.info("cycle start: mode=%s judge=%s", mode_str, judge_str)
@@ -74,7 +75,12 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Use shared GT rate limiter (default to global singleton)
     if gt_limiter is None:
         gt_limiter = _gt_limiter
-    gt_limiter.reserve(gt_dossier_reserve)  # Log how much reserved
+    
+    # Set universe budget for this cycle (prevents bunching)
+    gt_limiter.set_universe_budget(gt_universe_budget)
+    
+    # Reserve slots for dossiers (logged inside reserve())
+    gt_limiter.reserve(gt_dossier_reserve)
 
     def record(t, stage, reason=None, soft_noul=None, soft_scores=None):
         """One row per token for the log and the ops panel: where it stopped and why."""
