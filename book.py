@@ -45,10 +45,6 @@ CREATE TABLE IF NOT EXISTS evm_holder_cache(
   updated_at REAL NOT NULL,
   PRIMARY KEY (chain_id, token)
 );
-CREATE TABLE IF NOT EXISTS carry(
-  tid TEXT PRIMARY KEY,
-  cycles_carried INTEGER DEFAULT 0
-);
 """)
 
 # One-time migration: clear authority_open bench entries (falsely benched due to 'no' string bug)

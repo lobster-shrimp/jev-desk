@@ -1,19 +1,15 @@
 """
 Pytest configuration for EVM holder tests.
 
-Ensures proper isolation between tests by clearing all caches and using temporary databases.
+Ensures proper isolation between EVM tests by clearing all caches and using temporary databases.
 """
 import pytest
 import tempfile
 import os
 import sqlite3
-import sys
-
-sys.path.insert(0, '/workspace')
-import evm_holders
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def isolate_evm_state(monkeypatch):
     """
     Clear all EVM holder state before and after each test.
@@ -21,7 +17,11 @@ def isolate_evm_state(monkeypatch):
     - Clears in-memory result cache
     - Clears rate limiter state
     - Uses temporary database for evm_holder_cache
+    
+    This fixture is NOT autouse; tests must request it explicitly.
     """
+    import evm_holders
+    
     # Clear in-memory caches
     evm_holders._cache.clear()
     evm_holders._rate_limiters.clear()

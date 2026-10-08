@@ -11,7 +11,7 @@ from eth_abi import encode, decode
 import time
 
 
-def test_multicall3_golden_encode_decode():
+def test_multicall3_golden_encode_decode(isolate_evm_state):
     """Test Multicall3 encoding/decoding matches eth_abi golden bytes."""
     # Build calls
     calls = [
@@ -44,7 +44,7 @@ def test_multicall3_golden_encode_decode():
     assert token_addr.lower() == "0x4902dcA4D7011935322aE83Fef0E0c873ba1b0F0".lower()
 
 
-def test_fold_mint_transfer_burn_sequence():
+def test_fold_mint_transfer_burn_sequence(isolate_evm_state):
     """Test RPC fold processes mint, transfer, and burn correctly."""
     import book
     db = book.DB
@@ -109,7 +109,7 @@ def test_fold_mint_transfer_burn_sequence():
         assert data["balances"][bob_key] == 200000
 
 
-def test_fold_1e6_tolerance():
+def test_fold_1e6_tolerance(isolate_evm_state):
     """Test fold uses 1e-6 tolerance."""
     import book
     with patch('evm_holders.requests.post') as mock_post:
@@ -128,7 +128,7 @@ def test_fold_1e6_tolerance():
         assert data["complete"] == True
 
 
-def test_fold_halving_on_limit():
+def test_fold_halving_on_limit(isolate_evm_state):
     """Test fold halves window on limit error."""
     import book
     halved = [0]
@@ -176,7 +176,7 @@ def test_fold_halving_on_limit():
         assert halved[0] == 1, "Window should have been halved due to limit error"
 
 
-def test_fold_incremental_from_cache():
+def test_fold_incremental_from_cache(isolate_evm_state):
     """Test fold resumes from cache."""
     import book
     import json
@@ -225,7 +225,7 @@ def test_fold_incremental_from_cache():
         assert data["balances"] == cached_balances
 
 
-def test_supply_zero_definitive():
+def test_supply_zero_definitive(isolate_evm_state):
     """Test supply=0 is definitive."""
     import book
     with patch('evm_holders.requests.get') as mock_get:
@@ -236,7 +236,7 @@ def test_supply_zero_definitive():
         assert result.is_transient == False
 
 
-def test_eip7702_wallet_counted():
+def test_eip7702_wallet_counted(isolate_evm_state):
     """Test EIP-7702 delegated EOAs counted."""
     import book
     with patch('evm_holders.requests.get') as mock_get, patch('evm_holders.requests.post') as mock_post:
@@ -247,7 +247,7 @@ def test_eip7702_wallet_counted():
         assert result.top_wallet == 0.5
 
 
-def test_goplus_units_via_dossier_chain_kill():
+def test_goplus_units_via_dossier_chain_kill(isolate_evm_state):
     """End-to-end GoPlus units test - verify percent is fraction 0-1."""
     import book
     
@@ -290,7 +290,7 @@ def test_goplus_units_via_dossier_chain_kill():
         assert abs(result.top_10 - 70.0) < 1
 
 
-def test_429_non_blocking():
+def test_429_non_blocking(isolate_evm_state):
     """Test 429 returns immediately."""
     import book
     with patch('evm_holders.requests.get') as mock_get:
@@ -304,7 +304,7 @@ def test_429_non_blocking():
         assert elapsed < 5
 
 
-def test_deadline_enforcement():
+def test_deadline_enforcement(isolate_evm_state):
     """Test deadline is enforced."""
     import book
     import requests
@@ -325,7 +325,7 @@ def test_deadline_enforcement():
         assert result.is_transient == True
 
 
-def test_incomplete_at_head_definitive():
+def test_incomplete_at_head_definitive(isolate_evm_state):
     """Test incomplete_at_head is definitive."""
     import book
     with patch('evm_holders.requests.post') as mock_post:
@@ -345,7 +345,7 @@ def test_incomplete_at_head_definitive():
         assert error == "incomplete_at_head"
 
 
-def test_connection_error_transient():
+def test_connection_error_transient(isolate_evm_state):
     """Test connection errors are transient."""
     import book
     with patch('evm_holders.requests.get') as mock_get:
@@ -356,7 +356,7 @@ def test_connection_error_transient():
         assert result.is_transient == True
 
 
-def test_http_5xx_transient():
+def test_http_5xx_transient(isolate_evm_state):
     """Test 5xx errors are transient."""
     import book
     with patch('evm_holders.requests.get') as mock_get:
@@ -367,7 +367,7 @@ def test_http_5xx_transient():
         assert result.is_transient == True
 
 
-def test_goplus_burn_denominator():
+def test_goplus_burn_denominator(isolate_evm_state):
     """Test GoPlus burn denominator."""
     import book
     mock_goplus = {"holders": [{"address": "0xWHALE", "percent": "0.1802", "is_contract": 0}, {"address": "0x000000000000000000000000000000000000dead", "percent": "0.18", "is_contract": 0}, {"address": "0xOTHER", "percent": "0.10", "is_contract": 0}], "dex": []}
@@ -384,3 +384,45 @@ def test_goplus_burn_denominator():
         assert result.ok
         # Denominator = 1 - 0.18 = 0.82, top_wallet = 0.1802 / 0.82 ≈ 0.2197
         assert abs(result.top_wallet - 0.2197) < 0.01
+
+
+def test_address_constants(isolate_evm_state):
+    """Test all address constants are valid 42-char lowercase hex."""
+    import evm_holders
+    
+    # Check all burn addresses
+    for addr in evm_holders.BURN_ADDRESSES:
+        assert len(addr) == 42, f"Burn address {addr} is not 42 chars"
+        assert addr.startswith("0x"), f"Burn address {addr} doesn't start with 0x"
+        assert addr == addr.lower(), f"Burn address {addr} is not lowercase"
+        assert all(c in "0123456789abcdef" for c in addr[2:]), f"Burn address {addr} has invalid hex"
+    
+    # Check specific burn addresses match spec
+    assert "0x0000000000000000000000000000000000000000" in evm_holders.BURN_ADDRESSES
+    assert "0x000000000000000000000000000000000000dead" in evm_holders.BURN_ADDRESSES
+    assert "0xdead000000000000000042069420694206942069" in evm_holders.BURN_ADDRESSES
+    
+    # Check pool contracts
+    for addr in evm_holders.POOL_CONTRACTS:
+        assert len(addr) == 42, f"Pool contract {addr} is not 42 chars"
+        assert addr == addr.lower(), f"Pool contract {addr} is not lowercase"
+    
+    # Check launchpad curves
+    for addr in evm_holders.LAUNCHPAD_CURVES:
+        assert len(addr) == 42, f"Launchpad curve {addr} is not 42 chars"
+        assert addr == addr.lower(), f"Launchpad curve {addr} is not lowercase"
+    
+    # Check permanent lockers
+    for addr in evm_holders.PERMANENT_LOCKERS:
+        assert len(addr) == 42, f"Permanent locker {addr} is not 42 chars"
+        assert addr == addr.lower(), f"Permanent locker {addr} is not lowercase"
+    
+    # Check conditional lockers
+    for addr in evm_holders.CONDITIONAL_LOCKERS:
+        assert len(addr) == 42, f"Conditional locker {addr} is not 42 chars"
+        assert addr == addr.lower(), f"Conditional locker {addr} is not lowercase"
+    
+    # Check Multicall3
+    assert len(evm_holders.MULTICALL3) == 42
+    assert evm_holders.MULTICALL3 == evm_holders.MULTICALL3.lower()
+    assert evm_holders.MULTICALL3 == "0xca11bde05977b3631167028862be2a173976ca11"

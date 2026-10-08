@@ -42,7 +42,7 @@ MAX_RPC_CALLS_PER_FOLD = 40
 BURN_ADDRESSES = {
     "0x0000000000000000000000000000000000000000",
     "0x000000000000000000000000000000000000dead",
-    "0xdead000000000000000000000042069420694206942069",
+    "0xdead000000000000000042069420694206942069",
 }
 
 # Shared pool contracts (lowercase)
@@ -423,15 +423,18 @@ def _holders_rpc_fold(token: str, deadline: float, db: sqlite3.Connection, call_
             
             # Check completeness
             total_balance = sum(balances.values())
-            complete = False
             if actual_supply > 0:
                 diff = abs(total_balance - actual_supply)
                 complete = diff <= actual_supply * 1e-6
+                
+                if not complete:
+                    # Item #10: Cache-at-head with mismatch is definitive (6h)
+                    return None, "incomplete_at_head"
             
             return {
                 "balances": balances,
                 "supply": actual_supply if actual_supply > 0 else total_balance,
-                "complete": complete
+                "complete": True
             }, None
         
         log.info("Robinhood fold for %s: resuming from block %d", token, last_block)
@@ -775,7 +778,7 @@ def _check_pools_via_multicall(holders: list[tuple[str, int, float]], token: str
 
 
 def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: list[str],
-              chain_id: int, token: str, goplus_data: dict | None, deadline: float) -> tuple[list[tuple[str, int]], list[tuple[str, float, str]]]:
+              chain_id: int, token: str, goplus_data: dict | None, deadline: float) -> tuple[list[tuple[str, int]], list[tuple[str, float, str]], list[tuple[str, int, float]]]:
     """
     Classify and exclude holders.
     
@@ -789,9 +792,10 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
         deadline: absolute deadline timestamp
     
     Returns:
-        (valid_holders, excluded) where:
+        (valid_holders, excluded, unidentified_contracts) where:
         - valid_holders: [(address, balance), ...]
         - excluded: [(address, pct, reason), ...]
+        - unidentified_contracts: [(address, balance, pct), ...]
     """
     excluded = []
     valid = []
@@ -835,17 +839,13 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
                             for detail in locked_details:
                                 end_time_str = detail.get("end_time")
                                 if end_time_str:
-                                    # Check for "permanent" string
-                                    if end_time_str.lower() == "permanent":
-                                        goplus_locked[holder_addr] = (None, True)
-                                    else:
-                                        try:
-                                            # Parse ISO timestamp
-                                            dt = datetime.fromisoformat(end_time_str.replace("+00:00", "+00:00"))
-                                            unlock_timestamp = dt.timestamp()
-                                            goplus_locked[holder_addr] = (unlock_timestamp, False)
-                                        except Exception:
-                                            pass
+                                    try:
+                                        # Parse ISO timestamp
+                                        dt = datetime.fromisoformat(end_time_str.replace("+00:00", "+00:00"))
+                                        unlock_timestamp = dt.timestamp()
+                                        goplus_locked[holder_addr] = (unlock_timestamp, False)
+                                    except Exception:
+                                        pass
     
     # Item #5: Collect unidentified contracts >= 3% for GoPlus lock check
     unidentified_contracts = []
@@ -953,7 +953,7 @@ def _classify(holders: list[tuple[str, int, bool]], supply: int, pair_addrs: lis
     else:
         valid = [(addr, balance) for addr, balance, _ in valid]
     
-    return valid, excluded
+    return valid, excluded, unidentified_contracts
 
 
 # In-memory result cache
@@ -1051,22 +1051,30 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                 raw_top_wallet = None
                 raw_top_10 = None
             
-            # Get GoPlus data for lock checks
+            # Classify first WITHOUT GoPlus to identify unidentified contracts and conditional lockers
+            valid_holders, excluded, unidentified_contracts = _classify(holders, total_supply, pair_addrs, chain_id, token, None, deadline)
+            
+            # Check if we need GoPlus: unidentified contract >= 3% OR any conditional locker
+            needs_goplus = bool(unidentified_contracts)
+            if not needs_goplus:
+                # Check for conditional lockers
+                for addr, balance, is_contract in holders:
+                    if addr.lower() in CONDITIONAL_LOCKERS:
+                        needs_goplus = True
+                        break
+            
+            # Get GoPlus data if needed
             goplus_data = None
-            if any(h[1] / total_supply >= 0.03 for h in holders):
-                if age_min >= 120 and time.time() < deadline:
-                    goplus_data, _ = _holders_goplus(chain_id, token, deadline)
+            if needs_goplus and age_min >= 120 and time.time() < deadline:
+                goplus_data, _ = _holders_goplus(chain_id, token, deadline)
+                
+                # Re-classify WITH GoPlus data
+                if goplus_data:
+                    valid_holders, excluded, _ = _classify(holders, total_supply, pair_addrs, chain_id, token, goplus_data, deadline)
             
-            # Classify and exclude
-            valid_holders, excluded = _classify(holders, total_supply, pair_addrs, chain_id, token, goplus_data, deadline)
-            
-            # Subtract burns AND permanent locks from supply
+            # Subtract burns from supply
             burn_amount = sum(balance for addr, balance, _ in holders if addr.lower() in BURN_ADDRESSES)
-            permanent_lock_amount = sum(balance for addr, balance, _ in holders 
-                                       if any(addr.lower() == ex_addr.lower() and 
-                                             reason in ("locker_permanent", "permanent_locker", "goplus_locker_permanent") 
-                                             for ex_addr, _, reason in excluded))
-            adjusted_supply = total_supply - burn_amount - permanent_lock_amount
+            adjusted_supply = total_supply - burn_amount
             
             if adjusted_supply <= 0:
                 primary_result = HolderResult(None, None, "unavailable", [], False, "zero_supply_after_burns", False)
@@ -1119,22 +1127,30 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                     raw_top_wallet = None
                     raw_top_10 = None
                 
-                # Get GoPlus data
+                # Classify first WITHOUT GoPlus to identify unidentified contracts and conditional lockers
+                valid_holders, excluded, unidentified_contracts = _classify(holders, supply, pair_addrs, chain_id, token, None, deadline)
+                
+                # Check if we need GoPlus: unidentified contract >= 3% OR any conditional locker
+                needs_goplus = bool(unidentified_contracts)
+                if not needs_goplus:
+                    # Check for conditional lockers
+                    for addr, balance, is_contract in holders:
+                        if addr.lower() in CONDITIONAL_LOCKERS:
+                            needs_goplus = True
+                            break
+                
+                # Get GoPlus data if needed
                 goplus_data = None
-                if any(balance / supply >= 0.03 for balance in balances.values()) and age_min >= 120:
-                    if time.time() < deadline:
-                        goplus_data, _ = _holders_goplus(chain_id, token, deadline)
+                if needs_goplus and age_min >= 120 and time.time() < deadline:
+                    goplus_data, _ = _holders_goplus(chain_id, token, deadline)
+                    
+                    # Re-classify WITH GoPlus data
+                    if goplus_data:
+                        valid_holders, excluded, _ = _classify(holders, supply, pair_addrs, chain_id, token, goplus_data, deadline)
                 
-                # Classify
-                valid_holders, excluded = _classify(holders, supply, pair_addrs, chain_id, token, goplus_data, deadline)
-                
-                # Subtract burns AND permanent locks from supply
+                # Subtract burns
                 burn_amount = sum(balance for addr, balance in balances.items() if addr.lower() in BURN_ADDRESSES)
-                permanent_lock_amount = sum(balance for addr, balance in balances.items()
-                                           if any(addr.lower() == ex_addr.lower() and 
-                                                 reason in ("locker_permanent", "permanent_locker", "goplus_locker_permanent") 
-                                                 for ex_addr, _, reason in excluded))
-                adjusted_supply = supply - burn_amount - permanent_lock_amount
+                adjusted_supply = supply - burn_amount
                 
                 if adjusted_supply <= 0:
                     primary_result = HolderResult(None, None, "unavailable", [], False, "zero_supply_after_burns", False)
@@ -1217,7 +1233,7 @@ def _evm_holder_concentration_impl(chain_id: int, token: str, pair_addrs: list[s
                         raw_top_10 = (raw_top_10_balance / supply) * 100
                         
                         # Classify
-                        valid_holders, excluded = _classify(holder_data, supply, pair_addrs, chain_id, token, goplus_data, deadline)
+                        valid_holders, excluded, _ = _classify(holder_data, supply, pair_addrs, chain_id, token, goplus_data, deadline)
                         
                         if not valid_holders:
                             result = HolderResult(None, None, "unavailable", excluded, False, "all_excluded", False)

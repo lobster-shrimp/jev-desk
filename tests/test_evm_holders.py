@@ -41,7 +41,7 @@ def clear_evm_cache():
 
 # Test fixtures
 
-def test_honeypot_fitcoin_pair_excluded_pass():
+def test_honeypot_fitcoin_pair_excluded_pass(isolate_evm_state):
     """FITCOIN: raw 39% pair excluded -> real 2.15%/16.3% passes."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -110,7 +110,7 @@ def test_honeypot_fitcoin_pair_excluded_pass():
         os.unlink(db_path)
 
 
-def test_honeypot_whale_kills():
+def test_honeypot_whale_kills(isolate_evm_state):
     """SpaceXSI: 39.6% top wallet, 47.6% top_10 kills."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -164,7 +164,7 @@ def test_honeypot_whale_kills():
         os.unlink(db_path)
 
 
-def test_honeypot_burn_denominator():
+def test_honeypot_burn_denominator(isolate_evm_state):
     """ZNHJ: 79% burned -> 25.1%/68.3% after adjusting supply."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -222,7 +222,7 @@ def test_honeypot_burn_denominator():
         os.unlink(db_path)
 
 
-def test_pool_manager_excluded():
+def test_pool_manager_excluded(isolate_evm_state):
     """Robinhood PoolManager (Uniswap v4) excluded."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -285,7 +285,7 @@ def test_pool_manager_excluded():
         os.unlink(db_path)
 
 
-def test_flap_portal_excluded():
+def test_flap_portal_excluded(isolate_evm_state):
     """Flap Portal launchpad curve excluded."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -336,21 +336,26 @@ def test_flap_portal_excluded():
         os.unlink(db_path)
 
 
-def test_pinklock_permanent_excluded():
-    """PinkLock with permanent lock excluded."""
+def test_pinklock_permanent_excluded(isolate_evm_state):
+    """PinkLock with lock >7 days excluded."""
     # Use fixture DB from conftest
     import book
+    from datetime import datetime, timedelta
     db = book.DB
     
-    # Mock GoPlus response with permanent lock (using REAL schema)
+    # Mock GoPlus response with lock >7 days away
+    from datetime import timezone
+    future_time = datetime.now(timezone.utc) + timedelta(days=30)
+    iso_time = future_time.isoformat()
+    
     mock_goplus = {
         "holders": [
             {
                 "address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe",
-                "is_locked": "1",
+                "is_locked": 1,
                 "locked_detail": [
                     {
-                        "end_time": "permanent"
+                        "end_time": iso_time
                     }
                 ]
             }
@@ -358,19 +363,19 @@ def test_pinklock_permanent_excluded():
         "dex": []
     }
     
-    # Fixture values for exact calculation:
+    # Fixture values: denominator excludes burns only, not locks
     # Total supply: 1,000,000,000
-    # PinkLock: 400,000,000 (40% raw)
+    # PinkLock: 400,000,000 (40% raw) - excluded from holder list after GoPlus check
     # Whale: 50,000,000 (5% raw)
-    # After excluding PinkLock:
-    #   Remaining supply: 600,000,000
-    #   Whale percentage: 50,000,000 / 600,000,000 = 0.08333...
-    EXPECTED_TOP_WALLET = 50000000 / 600000000  # Exact: 0.08333...
+    # Denominator: 1,000,000,000 (no burns)
+    # After excluding PinkLock holder (not from denominator):
+    #   Top wallet: 50,000,000 / 1,000,000,000 = 0.05
+    EXPECTED_TOP_WALLET = 50000000 / 1000000000  # Exact: 0.05
     
     mock_honeypot = {
         "totalSupply": 1000000000,
         "holders": [
-            {"address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe", "balance": 400000000, "isContract": True},  # PinkLock02
+            {"address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe", "balance": 400000000, "isContract": True},  # PinkLock02 (conditional locker)
             {"address": "0x1234567890123456789012345678901234567890", "balance": 50000000, "isContract": False},  # Whale
         ]
     }
@@ -405,9 +410,10 @@ def test_pinklock_permanent_excluded():
     assert abs(result.top_wallet - EXPECTED_TOP_WALLET) < 0.001, \
         f"Expected {EXPECTED_TOP_WALLET:.6f}, got {result.top_wallet:.6f}"
     
-    # Check exclusions
+    # Check exclusions - PinkLock should be excluded due to lock >7d
     exclusions = {addr.lower(): reason for addr, _, reason in result.excluded}
     assert "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe" in exclusions
+    assert "locker" in exclusions["0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe"]
 
 
 def test_locker_unlocking_under_7d_counted():
@@ -480,7 +486,7 @@ def test_locker_unlocking_under_7d_counted():
         os.unlink(db_path)
 
 
-def test_unknown_contract_counted():
+def test_unknown_contract_counted(isolate_evm_state):
     """WOJAK: 25.5% unknown contract kills (not excluded)."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -537,7 +543,7 @@ def test_unknown_contract_counted():
         os.unlink(db_path)
 
 
-def test_robinhood_fold_incomplete():
+def test_robinhood_fold_incomplete(isolate_evm_state):
     """Robinhood fold incomplete -> top_wallet_unverified."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -587,7 +593,7 @@ def test_robinhood_fold_incomplete():
         os.unlink(db_path)
 
 
-def test_honeypot_invalid_chain():
+def test_honeypot_invalid_chain(isolate_evm_state):
     """Honeypot 'Invalid chain' -> unavailable."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -625,7 +631,7 @@ def test_honeypot_invalid_chain():
         os.unlink(db_path)
 
 
-def test_honeypot_timeout():
+def test_honeypot_timeout(isolate_evm_state):
     """Honeypot timeout -> unavailable."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -665,7 +671,7 @@ def test_honeypot_timeout():
         os.unlink(db_path)
 
 
-def test_units_at_gates():
+def test_units_at_gates(isolate_evm_state):
     """Units: top_wallet 0.0546 kills, top_10 61 kills."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -703,7 +709,7 @@ def test_units_at_gates():
         os.unlink(db_path)
 
 
-def test_evm_with_ok_result_no_longer_unverified():
+def test_evm_with_ok_result_no_longer_unverified(isolate_evm_state):
     """EVM with ok result should NOT be top_wallet_unverified."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -753,7 +759,7 @@ def test_evm_with_ok_result_no_longer_unverified():
         os.unlink(db_path)
 
 
-def test_dossier_integration_bsc_pass():
+def test_dossier_integration_bsc_pass(isolate_evm_state):
     """BSC dossier with pair exclusion passes."""
     token_dict = {
         "ticker": "TEST",
@@ -807,7 +813,7 @@ def test_dossier_integration_bsc_pass():
     assert chain_kill(dossier) is None
 
 
-def test_dossier_integration_bsc_whale_kill():
+def test_dossier_integration_bsc_whale_kill(isolate_evm_state):
     """BSC dossier with whale kills."""
     token_dict = {
         "ticker": "WHALE",
@@ -858,7 +864,7 @@ def test_dossier_integration_bsc_whale_kill():
     assert chain_kill(dossier) == "top_wallet"
 
 
-def test_dossier_integration_robinhood_poolmanager():
+def test_dossier_integration_robinhood_poolmanager(isolate_evm_state):
     """Robinhood dossier with PoolManager exclusion passes."""
     token_dict = {
         "ticker": "TEST",
@@ -906,7 +912,7 @@ def test_dossier_integration_robinhood_poolmanager():
     assert chain_kill(dossier) is None
 
 
-def test_dossier_integration_robinhood_incomplete():
+def test_dossier_integration_robinhood_incomplete(isolate_evm_state):
     """Robinhood dossier with incomplete fold -> top_wallet_unverified."""
     token_dict = {
         "ticker": "TEST",
@@ -951,7 +957,7 @@ def test_dossier_integration_robinhood_incomplete():
     assert chain_kill(dossier) == "holders_pending"  # 15 min bench
 
 
-def test_secret_scrubbing():
+def test_secret_scrubbing(isolate_evm_state):
     """All exception/log strings go through safe_err."""
     from secret_utils import safe_err
     
@@ -995,7 +1001,7 @@ def test_secret_scrubbing():
         os.unlink(db_path)
 
 
-def test_cache():
+def test_cache(isolate_evm_state):
     """Result cache works (10 min TTL)."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
