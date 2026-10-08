@@ -303,6 +303,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
     ids, seen = [], set()
     gt_txns_cache = {}  # {tid: transaction data from GT}
     pages_fetched = 0  # Track total pages for logging
+    budget_exhausted = False  # Track if we should stop GT phases early
     
     # Helper to process pool data
     def process_pool(pool, net):
@@ -353,7 +354,8 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                     # Universe budget exhausted
                     log.info("universe scan budget exhausted after %d pages (during solana new_pools page %d)", 
                              pages_fetched, page)
-                    return ids, gt_txns_cache
+                    budget_exhausted = True
+                    break
                 else:
                     log.warning("GeckoTerminal 429 on solana new_pools page %s, stopping Solana pagination", page)
                 break  # stop paging Solana
@@ -363,9 +365,13 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
             for pool in r.get("data", []):
                 process_pool(pool, "solana")
     
+    # Check if budget exhausted in phase 1
+    if budget_exhausted:
+        pass  # Skip remaining GT phases, go to FOMO merge
+    
     # Phase 2: Solana trending_pools page 1 (second priority - liquid tokens that reach judge)
     solana_trending_p2_skip = False  # track if we should skip page 2 later
-    if "solana" in nets and include_trending:
+    if not budget_exhausted and "solana" in nets and include_trending:
         r, should_continue = _gt_call_with_retry(
             f"{GT}/networks/solana/trending_pools",
             {"page": 1},
@@ -379,7 +385,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 # Universe budget exhausted
                 log.info("universe scan budget exhausted after %d pages (during solana trending_pools p1)", 
                          pages_fetched)
-                return ids, gt_txns_cache
+                budget_exhausted = True
             else:
                 log.warning("GeckoTerminal 429 on solana trending_pools p1, skipping Solana trending")
                 solana_trending_p2_skip = True  # also skip page 2
@@ -390,7 +396,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 process_pool(pool, "solana")
     
     # Phase 3: Robinhood trending_pools (third priority)
-    if include_trending and "robinhood" in nets:
+    if not budget_exhausted and include_trending and "robinhood" in nets:
         r, should_continue = _gt_call_with_retry(
             f"{GT}/networks/robinhood/trending_pools",
             {"page": 1},
@@ -404,7 +410,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 # Universe budget exhausted
                 log.info("universe scan budget exhausted after %d pages (during robinhood trending_pools)", 
                          pages_fetched)
-                return ids, gt_txns_cache
+                budget_exhausted = True
             else:
                 log.warning("GeckoTerminal 429 on robinhood trending_pools, skipping Robinhood trending")
         else:
@@ -414,7 +420,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 process_pool(pool, "robinhood")
     
     # Phase 3.5: Solana trending_pools page 2 (fourth priority, after robinhood)
-    if "solana" in nets and include_trending and not solana_trending_p2_skip:
+    if not budget_exhausted and "solana" in nets and include_trending and not solana_trending_p2_skip:
         r, should_continue = _gt_call_with_retry(
             f"{GT}/networks/solana/trending_pools",
             {"page": 2},
@@ -428,7 +434,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                 # Universe budget exhausted
                 log.info("universe scan budget exhausted after %d pages (during solana trending_pools p2)", 
                          pages_fetched)
-                return ids, gt_txns_cache
+                budget_exhausted = True
             else:
                 log.warning("GeckoTerminal 429 on solana trending_pools p2, skipping")
         else:
@@ -439,7 +445,7 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
     
     # Phase 4: Other networks' trending_pools (BSC, Base, etc - lower priority, drops when budget=5)
     other_trending_nets = [n for n in nets if n not in ("solana", "robinhood")]
-    if include_trending and other_trending_nets:
+    if not budget_exhausted and include_trending and other_trending_nets:
         for net in other_trending_nets:
             r, should_continue = _gt_call_with_retry(
                 f"{GT}/networks/{net}/trending_pools",
@@ -454,7 +460,8 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                     # Universe budget exhausted
                     log.info("universe scan budget exhausted after %d pages (during %s trending_pools)", 
                              pages_fetched, net)
-                    return ids, gt_txns_cache
+                    budget_exhausted = True
+                    break
                 else:
                     log.warning("GeckoTerminal 429 on %s trending_pools, skipping trending for this network", net)
                     continue
@@ -466,37 +473,45 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
     
     # Phase 5: Other networks' new_pools (lowest priority - BSC, Robinhood after trending)
     other_nets = [n for n in nets if n != "solana"]
-    for net in other_nets:
-        net_pages = 1 if net == "robinhood" else pages
-        for page in range(1, net_pages + 1):
-            r, should_continue = _gt_call_with_retry(
-                f"{GT}/networks/{net}/new_pools",
-                {"page": page},
-                limiter,
-                priority=False,
-                retry_on_429=False,
-                is_universe=True
-            )
-            if r is None:
-                if should_continue:
-                    # Universe budget exhausted
-                    log.info("universe scan budget exhausted after %d pages (during %s new_pools page %d)", 
-                             pages_fetched, net, page)
-                    return ids, gt_txns_cache
-                else:
-                    log.warning("GeckoTerminal 429 on %s new_pools page %s, stopping pagination for this network", net, page)
-                break  # stop paging this network
+    if not budget_exhausted:
+        for net in other_nets:
+            net_pages = 1 if net == "robinhood" else pages
+            for page in range(1, net_pages + 1):
+                r, should_continue = _gt_call_with_retry(
+                    f"{GT}/networks/{net}/new_pools",
+                    {"page": page},
+                    limiter,
+                    priority=False,
+                    retry_on_429=False,
+                    is_universe=True
+                )
+                if r is None:
+                    if should_continue:
+                        # Universe budget exhausted
+                        log.info("universe scan budget exhausted after %d pages (during %s new_pools page %d)", 
+                                 pages_fetched, net, page)
+                        budget_exhausted = True
+                        break
+                    else:
+                        log.warning("GeckoTerminal 429 on %s new_pools page %s, stopping pagination for this network", net, page)
+                    break  # stop paging this network
+                
+                pages_fetched += 1
+                
+                for pool in r.get("data", []):
+                    process_pool(pool, net)
             
-            pages_fetched += 1
-            
-            for pool in r.get("data", []):
-                process_pool(pool, net)
+            if budget_exhausted:
+                break  # Exit outer loop too
     
     gt_count = len(ids)
     
     # Merge FOMO native feeds (trending, graduated) - zero GT budget cost
+    # Always runs regardless of GT budget exhaustion
     fomo_trending_count = 0
+    fomo_trending_dupes = 0
     fomo_graduated_count = 0
+    fomo_graduated_dupes = 0
     if fomo:
         try:
             trending_ids = fomo.trending_tokens()
@@ -505,6 +520,8 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                     seen.add(tid)
                     ids.append(tid)
                     fomo_trending_count += 1
+                else:
+                    fomo_trending_dupes += 1
         except Exception as e:
             log.warning("FOMO trending_tokens failed, continuing with GT ids: %s", safe_err(e))
         
@@ -515,11 +532,15 @@ def universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True
                     seen.add(tid)
                     ids.append(tid)
                     fomo_graduated_count += 1
+                else:
+                    fomo_graduated_dupes += 1
         except Exception as e:
             log.warning("FOMO graduated_tokens failed, continuing with GT ids: %s", safe_err(e))
     
-    log.info("universe scan completed: GT %d tokens (%d pages), FOMO trending +%d, FOMO graduated +%d, total %d",
-             gt_count, pages_fetched, fomo_trending_count, fomo_graduated_count, len(ids))
+    # Log comprehensive source breakdown
+    total_dupes = fomo_trending_dupes + fomo_graduated_dupes
+    log.info("universe scan: GT %d (%d pages), FOMO trending +%d, FOMO graduated +%d, %d dupes, total %d",
+             gt_count, pages_fetched, fomo_trending_count, fomo_graduated_count, total_dupes, len(ids))
     return ids, gt_txns_cache
 
 

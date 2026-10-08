@@ -8,9 +8,12 @@ RISK CALLS release() AND NOBODY ELSE DOES.
 BENCH ON THE FAILED CHECK, NOT ON THE TOKEN.
 A HELD POSITION MEANS NO SCAN AT ALL.
 """
+import logging
 import os
 import sqlite3
 import time
+
+log = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("DESK_DB", "desk.db")
 DB = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -28,6 +31,10 @@ CREATE TABLE IF NOT EXISTS defer(
 CREATE TABLE IF NOT EXISTS migrations(
   name TEXT PRIMARY KEY,
   applied_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS carry(
+  tid TEXT PRIMARY KEY,
+  cycles_carried INTEGER DEFAULT 0
 );
 """)
 
@@ -172,4 +179,56 @@ def forget_defer(tid: str):
 def expire_defer():
     """Delete rows with drop_at <= now."""
     DB.execute("DELETE FROM defer WHERE drop_at<=?", (time.time(),))
+    DB.commit()
+
+
+CARRY_CAP = 60  # Maximum ids to carry forward
+CARRY_MAX_CYCLES = 2  # Drop entries carried more than this many cycles
+
+
+def age_carry():
+    """Age all carry entries and prune those carried too long. Call every cycle."""
+    # Increment cycles_carried for all entries
+    DB.execute("UPDATE carry SET cycles_carried = cycles_carried + 1")
+    
+    # Delete entries that have been carried too long
+    deleted = DB.execute("DELETE FROM carry WHERE cycles_carried > ?", (CARRY_MAX_CYCLES,)).rowcount
+    
+    DB.commit()
+    
+    if deleted > 0:
+        log.info("carry aging: pruned %d entries (carried > %d cycles)", deleted, CARRY_MAX_CYCLES)
+
+
+def save_carry(tids: list[str]):
+    """Store unevaluated tids for next cycle, capped at CARRY_CAP. Keeps highest-priority (first in list)."""
+    # Get current carry count (after aging has been done)
+    current_count = DB.execute("SELECT COUNT(*) FROM carry").fetchone()[0]
+    available_slots = max(0, CARRY_CAP - current_count)
+    
+    # Keep highest-priority tids (first in list, which are oldest-carried or new high-priority)
+    new_tids = tids[:available_slots]
+    for tid in new_tids:
+        # Insert or ignore if already exists (preserve existing cycles_carried)
+        DB.execute("INSERT OR IGNORE INTO carry VALUES (?, 0)", (tid,))
+    
+    DB.commit()
+    
+    dropped = len(tids) - len(new_tids)
+    if dropped > 0:
+        log.info("carry cap reached: stored %d, dropped %d lowest-priority", len(new_tids), dropped)
+
+
+def get_carry() -> list[str]:
+    """Retrieve carried tids for prepending to shortlist. Returns oldest-carried first."""
+    rows = DB.execute("SELECT tid FROM carry ORDER BY cycles_carried DESC").fetchall()
+    return [r[0] for r in rows]
+
+
+def clear_carry(tids: list[str]):
+    """Remove specific tids from carry (when they were evaluated this cycle)."""
+    if not tids:
+        return
+    placeholders = ",".join("?" * len(tids))
+    DB.execute(f"DELETE FROM carry WHERE tid IN ({placeholders})", tids)
     DB.commit()

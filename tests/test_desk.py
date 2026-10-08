@@ -31,6 +31,15 @@ NOW_MS = int(time.time() * 1000)
 
 
 @pytest.fixture(autouse=True)
+def reset_state():
+    """Reset shared state before each test to ensure isolation."""
+    # Clear carry table
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def reset_gt_limiter():
     """Reset the global GT rate limiter before each test to ensure isolation.
     
