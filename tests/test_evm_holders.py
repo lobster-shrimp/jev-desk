@@ -250,7 +250,7 @@ def test_pool_manager_excluded():
         }
         
         # Mock RPC fold to return complete data
-        def mock_fold(token, timeout, db):
+        def mock_fold(token, timeout, db, call_count):
             return {
                 "balances": {
                     "0x8366a39cc670b4001a1121b8f6a443a643e40951": 400000000,
@@ -355,17 +355,20 @@ def test_pinklock_permanent_excluded():
         );
         """)
         
-        # Mock GoPlus response with permanent lock
+        # Mock GoPlus response with permanent lock (using REAL schema)
         mock_goplus = {
-            "holders": [],
-            "dex": [],
-            "locked_detail": [
+            "holders": [
                 {
-                    "holder": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe",
-                    "is_permanent": True,
-                    "end_time": None
+                    "address": "0x407993575c91ce7643a4d4ccacc9a98c36ee1bbe",
+                    "is_locked": "1",
+                    "locked_detail": [
+                        {
+                            "end_time": "permanent"
+                        }
+                    ]
                 }
-            ]
+            ],
+            "dex": []
         }
         
         mock_honeypot = {
@@ -555,7 +558,7 @@ def test_robinhood_fold_incomplete():
         """)
         
         # Mock incomplete fold
-        def mock_fold(token, timeout, db):
+        def mock_fold(token, timeout, db, call_count):
             return {
                 "balances": {"0xwhale": 300000000},
                 "supply": 1000000000,
@@ -572,7 +575,7 @@ def test_robinhood_fold_incomplete():
             )
         
         assert not result.ok
-        assert result.error == "incomplete_fold"
+        assert result.error == "transient:incomplete_fold"  # Transient: has some balances
         assert result.top_wallet is None
         
         # Should fail closed
@@ -654,7 +657,7 @@ def test_honeypot_timeout():
             )
         
         assert not result.ok
-        assert result.error == "timeout"
+        assert result.error == "transient:timeout"  # Transient flag added
         
     finally:
         db.close()
@@ -877,7 +880,7 @@ def test_dossier_integration_robinhood_poolmanager():
         }
     }
     
-    def mock_fold(token, timeout, db):
+    def mock_fold(token, timeout, db, call_count):
         return {
             "balances": {
                 "0x8366a39cc670b4001a1121b8f6a443a643e40951": 400000000,  # PoolManager
@@ -925,7 +928,7 @@ def test_dossier_integration_robinhood_incomplete():
         }
     }
     
-    def mock_fold(token, timeout, db):
+    def mock_fold(token, timeout, db, call_count):
         return {
             "balances": {"0xwhale": 300000000},
             "supply": 1000000000,
@@ -941,10 +944,10 @@ def test_dossier_integration_robinhood_incomplete():
     
     assert dossier["top_wallet_percent"] is None  # Fail closed
     assert dossier["evm_holder_source"] == "unavailable"
-    assert dossier["evm_holder_error"] == "incomplete_fold"
+    assert dossier["evm_holder_error"] == "transient:incomplete_fold"  # Transient prefix
     
-    # Chain kill should fail closed
-    assert chain_kill(dossier) == "top_wallet_unverified"
+    # Chain kill should fail closed with holders_pending (transient, shorter bench for retry)
+    assert chain_kill(dossier) == "holders_pending"  # 15 min bench
 
 
 def test_secret_scrubbing():
