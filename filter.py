@@ -68,6 +68,13 @@ def trade_kill(t) -> str | None:
 
 def chain_kill(d) -> str | None:
     """After the dossier, still free. Facts, not judgements."""
+    # EVM chains: fail closed without top_wallet verification (Rob's decision)
+    # Solana has RPC-verified top_wallet; EVM does not yet have on-chain holder verification
+    chain = d.get("chain")
+    if chain and chain != "solana":
+        if d.get("top_wallet_percent") is None:
+            return "top_wallet_unverified"
+    
     if d.get("top_wallet_percent") is not None and \
        d["top_wallet_percent"] > HARD["max_top_wallet"]:
         return "top_wallet"

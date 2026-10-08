@@ -50,11 +50,22 @@ def _clear_authority_open_bench():
 
 _apply_migration("clear_authority_open_bench", _clear_authority_open_bench)
 
+def _clear_top_wallet_bench():
+    """Remove bench entries with reason='top_wallet' (now 1 day instead of 100k min)."""
+    deleted = DB.execute("DELETE FROM bench WHERE reason='top_wallet'").rowcount
+    if deleted > 0:
+        import logging
+        log = logging.getLogger("book")
+        log.info("migration clear_top_wallet_bench: removed %d top_wallet benches (now 1 day)", deleted)
+
+_apply_migration("clear_top_wallet_bench", _clear_top_wallet_bench)
+
 # how long a rejection stands, by what fired it (minutes)
 BENCH_MINUTES = {
     # facts that will not change while this token exists
     "honeypot": 100_000, "authority_open": 100_000,
-    "top_wallet": 100_000, "sell_side": 100_000,
+    "top_wallet": 1440, "sell_side": 100_000,  # top_wallet: 1 day (can change if whale dumps)
+    "top_wallet_unverified": 360,  # EVM tokens without on-chain verification: 6h bench
     # slow to change
     "recycled_account": 360, "account_is_the_project": 360,
     # can change as the float moves
@@ -95,8 +106,20 @@ def benched(tid: str) -> bool:
     return bool(r and r[0] > time.time())
 
 
-def sit(tid: str, reason: str):
+def sit(tid: str, reason: str, age_minutes: float | None = None):
+    """Bench a token for a specific reason.
+    
+    Age-aware for momentum_already_spent: tokens aged >= 24h get 180 min bench,
+    younger tokens get the default 25 min bench.
+    """
     mins = BENCH_MINUTES.get(reason, DEFAULT_BENCH)
+    
+    # Age-aware momentum bench: tokens aged >= 24h get longer bench (180 min)
+    if reason == "momentum_already_spent" and age_minutes is not None:
+        if age_minutes >= 24 * 60:  # >= 24 hours
+            mins = 180
+        # else: use default 25 from BENCH_MINUTES
+    
     DB.execute("INSERT OR REPLACE INTO bench VALUES (?,?,?)",
                (tid, reason, time.time() + mins * 60))
     DB.commit()

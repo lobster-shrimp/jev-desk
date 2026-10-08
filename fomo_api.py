@@ -26,6 +26,8 @@ import time
 
 import requests
 
+from secret_utils import safe_err
+
 log = logging.getLogger("fomo")
 
 FOMO_API   = os.environ.get("FOMO_API", "https://prod-api.fomo.family")
@@ -34,6 +36,8 @@ BATCH      = 20
 TOKEN_TTL  = 50 * 60            # refresh before the ~60 min Privy expiry
 # Privy keeps the access token in localStorage under these keys (first hit wins)
 PRIVY_KEYS = ("privy:token", "privy:access_token")
+# Multi-chain support: header required for BSC, Robinhood, etc. Without it, FOMO returns Solana only
+FOMO_SUPPORTED_CHAINS = os.environ.get("FOMO_SUPPORTED_CHAINS", "56,143,4663,8453,1399811149")
 
 # FOMO -> desk field names. normalise() in collect.py reads exactly these.
 CHANGE_WINDOWS = {"change5m": 300, "change1": 3600, "change4": 14400,
@@ -55,6 +59,7 @@ class Fomo:
         self.s.headers.update({"Content-Type": "application/json",
                                "Origin": "https://fomo.family",
                                "Referer": "https://fomo.family/",
+                               "X-Supported-Chains": FOMO_SUPPORTED_CHAINS,
                                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                                              "AppleWebKit/537.36 Chrome/128.0 Safari/537.36"})
 
@@ -146,6 +151,74 @@ class Fomo:
             for tid, m in rows.items():
                 out[tid] = self._row(m)
         return out
+
+    def trending_tokens(self) -> list[str]:
+        """Fetch FOMO trending tokens feed. Returns list of '<addr>:<netId>' token ids.
+           Multi-chain with X-Supported-Chains header. Zero GT budget cost."""
+        try:
+            r = self.s.post(f"{FOMO_API}/proxy/trendingTokens", json={}, timeout=30,
+                            headers={"Authorization": f"Bearer {self.token()}"})
+            if r.status_code in (401, 403):
+                log.info("FOMO bearer expired on trending, refreshing")
+                r = self.s.post(f"{FOMO_API}/proxy/trendingTokens", json={}, timeout=30,
+                                headers={"Authorization": f"Bearer {self.token(force=True)}"})
+                if r.status_code in (401, 403):
+                    log.error("FOMO trending auth failed after refresh")
+                    return []
+            r.raise_for_status()
+            rows = r.json()
+            if isinstance(rows, dict) and "responseObject" in rows:
+                rows = rows["responseObject"]
+            elif isinstance(rows, dict) and "data" in rows:
+                rows = rows["data"]
+            if not isinstance(rows, list):
+                log.warning("FOMO trending returned non-list: %s", type(rows))
+                return []
+            ids = []
+            for item in rows:
+                token_data = item.get("token") if isinstance(item.get("token"), dict) else item
+                addr = token_data.get("address")
+                netid = token_data.get("networkId") or token_data.get("netId")
+                if addr and netid:
+                    ids.append(f"{addr}:{netid}")
+            return ids
+        except Exception as e:
+            log.warning("FOMO trending_tokens failed: %s", safe_err(e))
+            return []
+
+    def graduated_tokens(self) -> list[str]:
+        """Fetch FOMO graduated tokens feed. Returns list of '<addr>:<netId>' token ids.
+           Multi-chain with X-Supported-Chains header. Zero GT budget cost."""
+        try:
+            r = self.s.post(f"{FOMO_API}/proxy/graduatedTokens", json={}, timeout=30,
+                            headers={"Authorization": f"Bearer {self.token()}"})
+            if r.status_code in (401, 403):
+                log.info("FOMO bearer expired on graduated, refreshing")
+                r = self.s.post(f"{FOMO_API}/proxy/graduatedTokens", json={}, timeout=30,
+                                headers={"Authorization": f"Bearer {self.token(force=True)}"})
+                if r.status_code in (401, 403):
+                    log.error("FOMO graduated auth failed after refresh")
+                    return []
+            r.raise_for_status()
+            rows = r.json()
+            if isinstance(rows, dict) and "responseObject" in rows:
+                rows = rows["responseObject"]
+            elif isinstance(rows, dict) and "data" in rows:
+                rows = rows["data"]
+            if not isinstance(rows, list):
+                log.warning("FOMO graduated returned non-list: %s", type(rows))
+                return []
+            ids = []
+            for item in rows:
+                token_data = item.get("token") if isinstance(item.get("token"), dict) else item
+                addr = token_data.get("address")
+                netid = token_data.get("networkId") or token_data.get("netId")
+                if addr and netid:
+                    ids.append(f"{addr}:{netid}")
+            return ids
+        except Exception as e:
+            log.warning("FOMO graduated_tokens failed: %s", safe_err(e))
+            return []
 
     def _filter_tokens(self, chunk: list[str]) -> dict[str, dict]:
         # Retry logic for transient network errors with exponential backoff
@@ -292,6 +365,7 @@ class Fomo:
                 "vol24":   _f(g("volume24", "volume24h", "vol24")),
                 "price":   _f(g("priceUSD", "price")),
                 "holders": _i(g("holders", "holderCount")),
+                "top10_holders_percent": _f(g("top10HoldersPercent")),
                 "change":  {sec: _f(m.get(k)) for k, sec in CHANGE_WINDOWS.items()},
                 "created": g("createdAt", "created", "pairCreatedAt")}
 
