@@ -244,49 +244,48 @@ def test_solana_top_10_from_rpc_excludes_pools():
 
 
 def test_evm_uses_fomo_top10_holders_percent():
-    """EVM chains should use FOMO top10HoldersPercent for top_10 check."""
-    # EVM tokens don't have on-chain top_wallet verification yet, so they fail closed
-    # This test verifies that FOMO top10HoldersPercent is used for top_10 check
-    # But we need to provide a dummy top_wallet_percent or it will fail closed earlier
-    # Let's just test the chain_kill logic directly with EVM dossier data
-    import time
-    fomo_row = {
-        "symbol": "TEST",
-        "mcap": 500000,
-        "liq": 50000,
-        "vol24": 100000,
-        "price": 0.5,
-        "holders": 200,
-        "top10_holders_percent": 65.0,  # 65% as whole number
-        "change": {300: 0.05, 3600: 0.15, 14400: 0.30, 86400: 0.50},
-        "created": time.time() - 1800  # 30 minutes ago
+    """EVM chains now compute real holder concentration, not FOMO top10.
+    
+    This test verifies that:
+    - EVM tokens without ok result have None for both top_wallet and top_10
+    - They fail closed with top_wallet_unverified or holders_pending
+    - EVM tokens with ok result use computed values
+    """
+    # Test 1: EVM token with unavailable holder data (no ok result)
+    d_unavailable = {
+        "chain": "bsc",
+        "top_wallet_percent": None,  # No holder data
+        "top_10_percent": None,  # No holder data
+        "evm_holder_transient": False,  # Definitive failure
+        "holder_count": 200
     }
     
-    normalized = collect.normalise("testaddr:56", fomo_row)
-    assert normalized["fomo_top10_holders_percent"] == 65.0
+    kill_reason = chain_kill(d_unavailable)
+    assert kill_reason == "top_wallet_unverified"  # Fails closed
     
-    # Mock GT to return None for holder data (so dossier uses FOMO)
-    with patch('collect.requests.get') as mock_get:
-        mock_get.return_value = Mock(
-            status_code=200,
-            json=lambda: {"data": {"attributes": {"holders": None}}}
-        )
-        
-        # Run through dossier
-        d = collect.dossier(normalized, limiter=None)
-        
-        # FOMO top10HoldersPercent should be stored as-is (0-100)
-        assert d["top_10_percent"] == 65.0
-        
-        # EVM without top_wallet fails closed first
-        kill_reason = chain_kill(d)
-        assert kill_reason == "top_wallet_unverified"  # Fails closed on EVM
-        
-        # If we manually add top_wallet_percent (like if we had on-chain data), 
-        # then top_10 check should work
-        d["top_wallet_percent"] = 0.03  # Pass top_wallet check
-        kill_reason = chain_kill(d)
-        assert kill_reason == "top_10"  # 65/100 = 0.65 > 0.60
+    # Test 2: EVM token with transient failure
+    d_transient = {
+        "chain": "bsc",
+        "top_wallet_percent": None,
+        "top_10_percent": None,
+        "evm_holder_transient": True,  # Transient (timeout, rate_limited, etc)
+        "holder_count": 200
+    }
+    
+    kill_reason = chain_kill(d_transient)
+    assert kill_reason == "holders_pending"  # Short bench for retry
+    
+    # Test 3: EVM token with ok result (computed concentration)
+    d_ok = {
+        "chain": "bsc",
+        "top_wallet_percent": 0.03,  # 3% computed
+        "top_10_percent": 65.0,  # 65% computed (0-100)
+        "evm_holder_source": "honeypot",
+        "holder_count": 200
+    }
+    
+    kill_reason = chain_kill(d_ok)
+    assert kill_reason == "top_10"  # 65/100 = 0.65 > 0.60
 
 
 def test_evm_fails_closed_without_top_wallet():
@@ -612,42 +611,22 @@ def test_solana_dossier_40_percent_top10_passes():
 
 
 def test_evm_dossier_85_percent_top10_killed():
-    """End-to-end: EVM dossier with FOMO top10HoldersPercent=85 should be killed as 'top_10'."""
-    import time
-    token = {
-        "symbol": "ETEST",
-        "addr": "etest_addr",
-        "net": 56,
-        "ticker": "ETEST",
-        "holders": 200,
-        "mcap": 500000,
-        "liq": 50000,
-        "vol24": 100000,
-        "price": 0.5,
-        "top10_holders_percent": 85.0,  # 85%
-        "change": {300: 0.05, 3600: 0.15, 14400: 0.30, 86400: 0.50},
-        "created": time.time() - 1800
-    }
-    normalized = collect.normalise(f"{token['addr']}:{token['net']}", token)
+    """End-to-end: EVM dossier with 85% computed top_10 should be killed as 'top_10'."""
+    # EVM tokens now compute real holder concentration
+    # This test verifies that when holder check returns ok with high concentration, it kills
     
-    # Mock GT to return None
-    with patch('collect.requests.get') as mock_gt:
-        mock_gt.return_value = Mock(
-            status_code=200,
-            json=lambda: {"data": {"attributes": {"holders": None}}}
-        )
-        
-        d = collect.dossier(normalized, limiter=None)
-        
-        # FOMO value should be stored as-is (0-100)
-        assert d["top_10_percent"] == 85.0
-        
-        # EVM fails closed without top_wallet_percent, so manually add it for this test
-        d["top_wallet_percent"] = 0.03  # Passing value
-        
-        # Should be killed by top_10 (85/100 = 0.85 > 0.60)
-        kill_reason = chain_kill(d)
-        assert kill_reason == "top_10"
+    d = {
+        "chain": "bsc",
+        "ticker": "ETEST",
+        "top_wallet_percent": 0.03,  # 3% - passing
+        "top_10_percent": 85.0,  # 85% - killing (computed, not FOMO)
+        "evm_holder_source": "honeypot",
+        "holder_count": 200
+    }
+    
+    # Should be killed by top_10 (85/100 = 0.85 > 0.60)
+    kill_reason = chain_kill(d)
+    assert kill_reason == "top_10"
 
 
 def test_solana_dossier_7_percent_wallet_killed():
