@@ -153,6 +153,9 @@ class Fomo:
                 rows = self._filter_tokens(chunk)
                 for tid, m in rows.items():
                     out[tid] = self._row(m)
+            except FomoAuthError:
+                # Auth errors must propagate to main() for ops banner and forced-refresh handling
+                raise
             except Exception as e:
                 # Log batch failure with safe error scrubbing, continue with remaining batches
                 log.warning("FOMO filterTokens batch %d-%d failed: %s (skipping %d ids)",

@@ -926,5 +926,177 @@ def test_fomo_batch_failure_loses_only_that_batch():
     assert 3 == call_count[0], "Should have tried all 3 batches"
 
 
+def test_fomo_auth_error_propagates_from_tokens():
+    """FomoAuthError should propagate from tokens() on first failing batch, not get swallowed."""
+    import fomo_api
+    from unittest.mock import Mock
+    
+    fomo = fomo_api.Fomo(bearer="test_token")
+    
+    # Create 40 ids (2 batches of 20)
+    ids = [f"tok{i}:1399811149" for i in range(40)]
+    
+    call_count = [0]
+    
+    def fake_filter_tokens(chunk):
+        call_count[0] += 1
+        # First batch raises FomoAuthError
+        raise fomo_api.FomoAuthError("FOMO auth failed after refresh")
+    
+    fomo._filter_tokens = fake_filter_tokens
+    
+    # Should propagate FomoAuthError, not swallow it
+    with pytest.raises(fomo_api.FomoAuthError, match="FOMO auth failed"):
+        fomo.tokens(ids)
+    
+    # Should have only attempted first batch (not continued to second)
+    assert call_count[0] == 1, f"Expected 1 batch attempt (propagate immediately), got {call_count[0]}"
+
+
+def test_carry_appears_in_shortlist_for_exactly_2_cycles():
+    """Token not re-seen should appear in shortlist input for exactly 2 cycles."""
+    import book
+    import main as shift
+    from unittest.mock import Mock
+    
+    # Clear state
+    book.DB.execute("DELETE FROM carry")
+    book.DB.execute("DELETE FROM defer")
+    book.DB.commit()
+    
+    test_tid = "unseen_token:1399811149"
+    
+    # Cycle 1: Token passes free but hits break (carried for first time)
+    book.DB.execute("INSERT INTO carry VALUES (?, 0)", (test_tid,))
+    book.DB.commit()
+    
+    # Age and retrieve (simulating cycle start)
+    book.age_carry()  # cycles_carried: 0 -> 1
+    carry1 = book.get_carry()
+    assert test_tid in carry1, "Token should be in carry after aging (cycles_carried=1)"
+    
+    # Simulate token not being in shortlist (dropped by FOMO or filtered)
+    # Don't call clear_carry for this token
+    
+    # Cycle 2: Age and retrieve again
+    book.age_carry()  # cycles_carried: 1 -> 2
+    carry2 = book.get_carry()
+    assert test_tid in carry2, "Token should still be in carry (cycles_carried=2)"
+    
+    # Cycle 3: Age again (should prune since cycles_carried will become 3)
+    book.age_carry()  # cycles_carried: 2 -> 3, then pruned (> CARRY_MAX_CYCLES=2)
+    carry3 = book.get_carry()
+    assert test_tid not in carry3, "Token should be pruned after 3rd aging (cycles_carried=3 > 2)"
+    
+    # Cleanup
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+
+
+def test_benched_and_killed_tokens_cleared_from_carry():
+    """Benched, free-killed, and free-deferred tokens should be cleared from carry."""
+    import book
+    import main as shift
+    from unittest.mock import Mock
+    
+    # Clear state
+    book.DB.execute("DELETE FROM carry")
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    # Setup: 4 carried tokens that will have different outcomes
+    carried_tids = [
+        "benched_tok:1399811149",     # Already benched
+        "liquidity_kill:1399811149",  # Free-killed (liquidity)
+        "age_defer:1399811149",       # Free-deferred (age)
+        "pass_tok:1399811149"         # Passes free, gets trade-checked
+    ]
+    
+    for tid in carried_tids:
+        book.DB.execute("INSERT INTO carry VALUES (?, 0)", (tid,))
+    book.DB.commit()
+    
+    # Bench the first token
+    book.sit("benched_tok:1399811149", "momentum_already_spent")
+    
+    # Mock components
+    now = time.time()
+    
+    def fake_universe(limiter=None, fomo=None):
+        return ([], {})
+    
+    def fake_shortlist(fomo, ids):
+        # Return all 4 tokens
+        return [
+            {"tid": "benched_tok:1399811149", "ticker": "BENCH", "addr": "benched_tok", "net": 1399811149,
+             "age_minutes": 30, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
+             "holder_count": 200, "price": 0.1, "created": now - 1800},
+            {"tid": "liquidity_kill:1399811149", "ticker": "LIQKILL", "addr": "liquidity_kill", "net": 1399811149,
+             "age_minutes": 30, "mcap_usd": 500000, "liquidity_usd": 1000, "volume_h24": 100000,  # Below threshold
+             "holder_count": 200, "price": 0.1, "created": now - 1800},
+            {"tid": "age_defer:1399811149", "ticker": "AGEDEF", "addr": "age_defer", "net": 1399811149,
+             "age_minutes": 10, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,  # Too young
+             "holder_count": 200, "price": 0.1, "created": now - 600},
+            {"tid": "pass_tok:1399811149", "ticker": "PASS", "addr": "pass_tok", "net": 1399811149,
+             "age_minutes": 30, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
+             "holder_count": 200, "price": 0.1, "created": now - 1800}
+        ]
+    
+    def fake_trade_counts(t, gt_txns_cache=None):
+        return ({"buys_h1": 100, "sells_h1": 50, "trades_h24": 1000}, 'ok')
+    
+    def fake_dossier(t, limiter=None):
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "x_handle": None, "description": "test", "mint_authority": None,
+                "freeze_authority": None, "is_honeypot": None, "gt_score_details": None,
+                "developer_holding_percentage": None}
+    
+    def fake_judge(question_set, state):
+        return {"model": "test", "answers": {
+            "concentration_is_exit_risk": {"type": "noul", "noul": 0.3}
+        }, "usage": {}}
+    
+    # Monkeypatch
+    original_universe = shift.universe
+    original_shortlist = shift.shortlist
+    original_trade = shift.trade_counts
+    original_dossier = shift.dossier
+    
+    shift.universe = fake_universe
+    shift.shortlist = fake_shortlist
+    shift.trade_counts = fake_trade_counts
+    shift.dossier = fake_dossier
+    
+    try:
+        fake_fomo = Mock()
+        fake_desk = Mock()
+        fake_desk.read_x = Mock(return_value=None)
+        fake_desk.write_state = Mock()
+        
+        order, stats = shift.run_once(fake_fomo, fake_judge, fake_desk, 10000, shadow=True)
+        
+        # All 4 tokens should have completed their iterations (benched, killed, deferred, evaluated)
+        # None should remain in carry
+        remaining_carry = book.get_carry()
+        
+        assert "benched_tok:1399811149" not in remaining_carry, "Benched token should be cleared from carry"
+        assert "liquidity_kill:1399811149" not in remaining_carry, "Free-killed token should be cleared from carry"
+        assert "age_defer:1399811149" not in remaining_carry, "Free-deferred token should be cleared from carry"
+        assert "pass_tok:1399811149" not in remaining_carry, "Evaluated token should be cleared from carry"
+        
+    finally:
+        shift.universe = original_universe
+        shift.shortlist = original_shortlist
+        shift.trade_counts = original_trade
+        shift.dossier = original_dossier
+        
+        # Cleanup
+        book.DB.execute("DELETE FROM carry")
+        book.DB.execute("DELETE FROM defer")
+        book.DB.execute("DELETE FROM bench")
+        book.DB.commit()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

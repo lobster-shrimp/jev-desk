@@ -104,10 +104,10 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     ids, gt_txns_cache = universe(limiter=gt_limiter, fomo=fomo)  # fresh + trending pools + FOMO feeds, budget-aware
     book.expire_defer()                          # drop rows past max age
     due = book.defer_due()                       # ids ready for rescoring
-    carry = book.get_carry()                     # unevaluated ids from previous cycle
     
-    # Age carry every cycle (including ids that shortlist drops)
+    # Age carry every cycle (including ids that shortlist drops), then retrieve
     book.age_carry()
+    carry = book.get_carry()                     # unevaluated ids from previous cycle
     
     # Cap carry admission per cycle: leave room for due ids
     # Due ids get highest priority, so reserve budget for them
@@ -164,12 +164,17 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     
     # Track young tokens that still need dossiers this cycle (for in-cycle retry logic)
     young_pending_dossier = []
-    evaluated_tids = []  # Track tids that were evaluated (to clear from carry)
+    processed_tids = []  # Track tids whose loop iteration completed (to clear from carry)
     
     evaluated_count = 0  # Track how many tokens we evaluated before budget exhaustion
     for idx, t in enumerate(age_prioritized):    # pass one: free, no per-token requests
         stats["seen"] += 1
         t.setdefault("chain", CHAIN_SET.get(t["net"]))
+        
+        # Track this tid as processed at start of iteration
+        # (will be removed from processed list if we break before completing)
+        processed_tids.append(t["tid"])
+        
         if book.benched(t["tid"]):               # already judged, still serving its time
             stats["benched"] += 1
             continue
@@ -220,17 +225,19 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             # Log unevaluated tokens (including current) and carry them to next cycle
             # Current token passed free but hasn't been trade-checked yet
             unevaluated = age_prioritized[idx:]  # Include current token
+            # Remove unprocessed tail from processed_tids (they're being carried)
+            unprocessed_tids = [t["tid"] for t in unevaluated]
+            processed_tids = [tid for tid in processed_tids if tid not in unprocessed_tids]
+            
             if unevaluated:
                 log.info("unevaluated %d ids (dex_slots=%d, gt_available=%d)",
                          len(unevaluated), dex_slots, gt_limiter.available())
                 # Store for next cycle carry (prepend to shortlist)
-                book.save_carry([t["tid"] for t in unevaluated])
+                book.save_carry(unprocessed_tids)
             break                                # out of budget, not out of ideas
         
         # Defer row cleared only after we confirm we're processing this token
         book.forget_defer(t["tid"])
-        # Token is now being fully evaluated (passed free, about to trade check)
-        evaluated_tids.append(t["tid"])
 
         # Call trade_counts with new signature and GT fallback cache
         trade_data, dex_status = trade_counts(t, gt_txns_cache=gt_txns_cache)
@@ -486,8 +493,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         record(d, "judged", None)
         survivors.append((d, ans))
 
-    # Clear carry for evaluated tokens (they were processed this cycle)
-    book.clear_carry(evaluated_tids)
+    # Clear carry for all processed tokens (any outcome: benched, killed, deferred, evaluated)
+    book.clear_carry(processed_tids)
     
     log.info("cycle: %(seen)s seen, %(benched)s benched, free %(free)s, "
              "trade %(trade)s, chain %(chain)s, soft %(soft)s, judged %(judged)s, requeued %(requeued)s", stats)
