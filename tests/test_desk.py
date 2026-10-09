@@ -1023,6 +1023,78 @@ def test_run_once_records_tokens(monkeypatch):
             assert t["reason"] is not None
 
 
+def test_run_once_pick_failure_scrubs_secrets_and_no_unbound_error(monkeypatch, caplog):
+    """Pick failure should return (None, stats) without UnboundLocalError and scrub secrets."""
+    import logging
+    
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    # Test both one and two survivors (pick should fail for both)
+    for num_survivors in [1, 2]:
+        caplog.clear()
+        
+        def fake_shortlist(fomo, id_list):
+            tokens = []
+            for i in range(num_survivors):
+                tid = f"SurvivorToken{i}:1399811149"
+                t = tok(i, tid=tid, addr=f"SurvivorToken{i}", age_minutes=45)
+                tokens.append(t)
+            return tokens
+        
+        ids = [f"SurvivorToken{i}:1399811149" for i in range(num_survivors)]
+        
+        monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: (ids, {}))
+        monkeypatch.setattr(collect, "shortlist", fake_shortlist)
+        monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: (
+            {"buys_h1": 540, "sells_h1": 120,
+            "buys_h6": 900, "sells_h6": 400, "trades_h24": 4000}, 'ok'))
+        monkeypatch.setattr(shift, "dossier", lambda t, limiter=None: {
+            **t, "chain": "solana", "top_10_percent": 30,
+            "top_wallet_percent": 0.02, "developer_holding_percentage": 2,
+            "gt_score_details": None, "is_honeypot": None,
+            "mint_authority": None, "freeze_authority": None,
+            "description": "a token", "x_handle": None})
+        
+        # Monkeypatch pick to raise exception with secret
+        def fake_pick_with_secret(judge, survivors):
+            raise Exception("boom api-key=SECRET999")
+        
+        monkeypatch.setattr(shift, "pick", fake_pick_with_secret)
+        
+        # Use a fake judge that always passes
+        def fake_judge(question_set, state):
+            return {"model": "test", "answers": {
+                "concentration_is_exit_risk": {"type": "noul", "noul": 0.3},
+                "momentum_already_spent": {"type": "noul", "noul": 0.3}
+            }, "usage": {}}
+        
+        desk = FakeDesk()
+        
+        # Should return (None, stats) without raising UnboundLocalError
+        with caplog.at_level(logging.WARNING):
+            order, stats = shift.run_once(FakeFomo(), fake_judge, desk, desk.bank(), shadow=True, gt_dossier_reserve=12)
+        
+        assert order is None, f"Expected None order on pick failure, got {order}"
+        assert stats is not None, "Expected stats dict even on pick failure"
+        
+        # Check logs contain NO PICK message
+        pick_failed_logs = [r for r in caplog.records if "NO PICK" in r.message]
+        assert len(pick_failed_logs) > 0, \
+            f"Expected 'NO PICK' in logs for {num_survivors} survivors. All logs: {[r.message for r in caplog.records]}"
+        
+        # Check logs do NOT contain the secret
+        all_log_text = " ".join([r.message for r in caplog.records])
+        assert "SECRET999" not in all_log_text, \
+            f"Secret leaked in logs for {num_survivors} survivors: {all_log_text}"
+        
+        # Check logs contain scrubbed version
+        assert "REDACTED" in all_log_text or "boom" in all_log_text, \
+            f"Expected scrubbed error in logs for {num_survivors} survivors: {all_log_text}"
+
+
 def test_normalise_and_clean_handle():
     m = FakeFomo().tokens(["Addr1:56"])["Addr1:56"]
     t = collect.normalise("Addr1:56", m)
@@ -2974,7 +3046,7 @@ def test_young_token_429_backoff_actually_waits(monkeypatch):
 
 
 def test_old_token_429_skips_while_young_pending(monkeypatch):
-    """Old token (≥60m) should be deferred if young tokens still need dossiers this cycle."""
+    """Old token (≥60m) gets dossier after young token's retry fails and is removed from pending."""
     book.release()
     book.DB.execute("DELETE FROM defer")
     book.DB.execute("DELETE FROM bench")
@@ -2984,14 +3056,15 @@ def test_old_token_429_skips_while_young_pending(monkeypatch):
     old_tid = f"OldSkipped:{1399811149}"
     
     def fake_shortlist(fomo, id_list):
-        # Young with high turnover comes first, old with lower turnover second
+        # OLD token first with HIGHER turnover, young second with lower turnover
+        # Sorting by (not is_young, tier) will prioritize young first
         return [
-            {"tid": young_tid, "addr": "YoungPending", "net": 1399811149, "ticker": "YPEND",
-             "age_minutes": 30.0, "liquidity_usd": 50000, "volume_h24": 400000,
-             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
-             "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}},
             {"tid": old_tid, "addr": "OldSkipped", "net": 1399811149, "ticker": "OSKIP",
-             "age_minutes": 75.0, "liquidity_usd": 50000, "volume_h24": 300000,
+             "age_minutes": 75.0, "liquidity_usd": 50000, "volume_h24": 500000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.05, "1h": 0.25, "4h": 0.5, "24h": 0.7}},
+            {"tid": young_tid, "addr": "YoungPending", "net": 1399811149, "ticker": "YPEND",
+             "age_minutes": 30.0, "liquidity_usd": 50000, "volume_h24": 300000,
              "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
              "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}}
         ]
@@ -3003,7 +3076,7 @@ def test_old_token_429_skips_while_young_pending(monkeypatch):
         if t["tid"] == young_tid:
             # Young token hits 429
             raise collect.DossierRetryNeeded("GT 429 for young")
-        # Old token should not reach here if young is still pending
+        # Old token should now reach here after young token fails and is removed from pending
         return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
                 "developer_holding_percentage": 2, "gt_score_details": None,
                 "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
@@ -3017,23 +3090,108 @@ def test_old_token_429_skips_while_young_pending(monkeypatch):
     monkeypatch.setattr(shift, "dossier", fake_dossier_young_429)
     
     desk = FakeDesk()
-    # Limited budget: young hits 429 twice, old should be deferred
+    # Limited budget: young hits 429 twice (initial + retry), then old gets dossier
     order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
     
-    # Verify young token attempted dossier at least twice (initial + retry)
-    young_attempts = [tid for tid in dossier_calls if tid == young_tid]
-    assert len(young_attempts) >= 2, f"Young token should attempt dossier at least twice, got {len(young_attempts)}"
+    # Verify ordering: young attempts (2x), then old attempt (1x)
+    young_idx = [i for i, tid in enumerate(dossier_calls) if tid == young_tid]
+    old_idx = [i for i, tid in enumerate(dossier_calls) if tid == old_tid]
+    assert len(young_idx) == 2 and len(old_idx) == 1, \
+        f"Expected young=2, old=1, got young={len(young_idx)}, old={len(old_idx)}: {dossier_calls}"
+    assert old_idx[0] > max(young_idx), \
+        f"old dossier ran before young's in-cycle retry finished: {dossier_calls}"
     
-    # Verify old token was NOT attempted for dossier (deferred while young pending)
-    old_attempts = [tid for tid in dossier_calls if tid == old_tid]
-    assert len(old_attempts) == 0, f"Old token should not attempt dossier while young pending, got {len(old_attempts)}"
-    
-    # Verify old token was deferred
+    # Verify young token was deferred
     deferred = book.defer_due()
-    assert old_tid in deferred, "Old token should be deferred while young token is pending"
+    assert young_tid in deferred, "Young token should be deferred after retry failure"
     
-    # Verify requeued count includes both young and old
-    assert stats.get("requeued", 0) >= 2, "Both young (after retry fail) and old should be requeued"
+    # Verify requeued count includes young (old may or may not be requeued depending on path)
+    assert stats.get("requeued", 0) >= 1, "Young token should be requeued after retry fail"
+
+
+def test_old_token_429_backoff_path_ordering(monkeypatch):
+    """Old token gets dossier after young token's backoff+retry fails (wait-and-retry branch)."""
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    young_tid = f"YoungBackoff:{1399811149}"
+    old_tid = f"OldAfterWait:{1399811149}"
+    
+    def fake_shortlist(fomo, id_list):
+        # OLD token first with HIGHER turnover, young second with lower turnover
+        return [
+            {"tid": old_tid, "addr": "OldAfterWait", "net": 1399811149, "ticker": "OWAIT",
+             "age_minutes": 75.0, "liquidity_usd": 50000, "volume_h24": 500000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.05, "1h": 0.25, "4h": 0.5, "24h": 0.7}},
+            {"tid": young_tid, "addr": "YoungBackoff", "net": 1399811149, "ticker": "YBACK",
+             "age_minutes": 30.0, "liquidity_usd": 50000, "volume_h24": 300000,
+             "mcap_usd": 100000, "holder_count": 300, "price_usd": 0.001,
+             "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61}}
+        ]
+    
+    dossier_calls = []
+    sleep_calls = []
+    
+    import time as real_time
+    original_sleep = real_time.sleep
+    
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        # Don't actually sleep in tests
+    
+    def fake_dossier_young_429(t, limiter=None):
+        dossier_calls.append(t["tid"])
+        if t["tid"] == young_tid:
+            # Young token hits 429
+            raise collect.DossierRetryNeeded("GT 429 for young")
+        # Old token should reach here after young token's backoff+retry fails
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None}
+    
+    # Patch time.sleep
+    monkeypatch.setattr("time.sleep", fake_sleep)
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([young_tid, old_tid], {}))
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
+                                                            "buys_h6": 900, "sells_h6": 400,
+                                                            "trades_h24": 4000}, 'ok'))
+    monkeypatch.setattr(shift, "dossier", fake_dossier_young_429)
+    
+    desk = FakeDesk()
+    
+    # Mock GT limiter with backoff_until set to now + 5s (within 30s cap for in-cycle retry)
+    from unittest.mock import Mock, MagicMock
+    import time
+    
+    # Create a mock GT limiter with backoff_until set to now + 5s
+    mock_limiter = Mock()
+    mock_limiter.available.return_value = 100
+    mock_limiter.backoff_until = time.time() + 5.0  # Within 30s cap for in-cycle retry
+    mock_limiter.wait_if_needed.return_value = None
+    
+    order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, 
+                                  gt_dossier_reserve=3, gt_limiter=mock_limiter)
+    
+    # Verify sleep was called (backoff wait)
+    assert len(sleep_calls) > 0, "Expected time.sleep to be called for backoff wait"
+    assert any(s >= 4.5 and s <= 5.5 for s in sleep_calls), f"Expected ~5s sleep for backoff, got {sleep_calls}"
+    
+    # Verify ordering: young attempts (2x with backoff+retry), then old attempt (1x)
+    young_idx = [i for i, tid in enumerate(dossier_calls) if tid == young_tid]
+    old_idx = [i for i, tid in enumerate(dossier_calls) if tid == old_tid]
+    assert len(young_idx) == 2 and len(old_idx) == 1, \
+        f"Expected young=2, old=1, got young={len(young_idx)}, old={len(old_idx)}: {dossier_calls}"
+    assert old_idx[0] > max(young_idx), \
+        f"old dossier ran before young's backoff+retry finished: {dossier_calls}"
+    
+    # Verify young token was deferred
+    deferred = book.defer_due()
+    assert young_tid in deferred, "Young token should be deferred after backoff+retry failure"
 
 
 def test_old_token_gets_dossier_after_young_clears(monkeypatch):

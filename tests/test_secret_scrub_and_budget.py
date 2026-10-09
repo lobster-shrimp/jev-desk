@@ -1098,5 +1098,288 @@ def test_benched_and_killed_tokens_cleared_from_carry():
         book.DB.commit()
 
 
+def test_young_token_dossier_429_and_retry_fail_then_old_tokens_still_get_dossiers():
+    """Young token with 429 dossier + retry failure should be deferred AND old tokens should still get dossiers."""
+    import book
+    import main as shift
+    from main import DossierRetryNeeded
+    from unittest.mock import Mock
+    
+    # Clear state
+    book.DB.execute("DELETE FROM carry")
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    now = time.time()
+    
+    # Two tokens: one young (30 min), one old (90 min)
+    young_tid = "young_429:1399811149"
+    old_tid = "old_pass:1399811149"
+    
+    dossier_call_count = {"young": 0, "old": 0}
+    
+    def fake_universe(limiter=None, fomo=None):
+        return ([], {})
+    
+    def fake_shortlist(fomo, ids):
+        return [
+            {"tid": young_tid, "ticker": "YOUNG", "addr": "young_429", "net": 1399811149,
+             "age_minutes": 30, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
+             "holder_count": 200, "price": 0.1, "created": now - 1800},
+            {"tid": old_tid, "ticker": "OLD", "addr": "old_pass", "net": 1399811149,
+             "age_minutes": 90, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
+             "holder_count": 200, "price": 0.1, "created": now - 5400}
+        ]
+    
+    def fake_trade_counts(t, gt_txns_cache=None):
+        return ({"buys_h1": 100, "sells_h1": 50, "trades_h24": 1000}, 'ok')
+    
+    def fake_dossier(t, limiter=None):
+        if t["tid"] == young_tid:
+            dossier_call_count["young"] += 1
+            # Young token always raises 429 (both initial and retry)
+            raise DossierRetryNeeded("GT 429")
+        else:
+            dossier_call_count["old"] += 1
+            # Old token succeeds
+            return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                    "x_handle": None, "description": "test", "mint_authority": None,
+                    "freeze_authority": None, "is_honeypot": None, "gt_score_details": None,
+                    "developer_holding_percentage": None}
+    
+    def fake_judge(question_set, state):
+        return {"model": "test", "answers": {
+            "concentration_is_exit_risk": {"type": "noul", "noul": 0.3}
+        }, "usage": {}}
+    
+    # Monkeypatch
+    original_universe = shift.universe
+    original_shortlist = shift.shortlist
+    original_trade = shift.trade_counts
+    original_dossier = shift.dossier
+    
+    shift.universe = fake_universe
+    shift.shortlist = fake_shortlist
+    shift.trade_counts = fake_trade_counts
+    shift.dossier = fake_dossier
+    
+    try:
+        fake_fomo = Mock()
+        fake_desk = Mock()
+        fake_desk.read_x = Mock(return_value=None)
+        fake_desk.write_state = Mock()
+        
+        order, stats = shift.run_once(fake_fomo, fake_judge, fake_desk, 10000, shadow=True)
+        
+        # Young token should have been called at least once (initial attempt)
+        assert dossier_call_count["young"] >= 1, "Young token should attempt dossier at least once"
+        
+        # Old token should have been called (not blocked by young token in pending list)
+        assert dossier_call_count["old"] >= 1, "Old token should get dossier after young token deferred"
+        
+        # Young token should be deferred or benched (depending on retry path)
+        deferred = book.DB.execute("SELECT * FROM defer WHERE tid = ?", (young_tid,)).fetchone()
+        benched = book.DB.execute("SELECT * FROM bench WHERE tid = ?", (young_tid,)).fetchone()
+        assert deferred is not None or benched is not None, "Young token should be deferred or benched after retry failure"
+        
+    finally:
+        shift.universe = original_universe
+        shift.shortlist = original_shortlist
+        shift.trade_counts = original_trade
+        shift.dossier = original_dossier
+        
+        # Cleanup
+        book.DB.execute("DELETE FROM carry")
+        book.DB.execute("DELETE FROM defer")
+        book.DB.execute("DELETE FROM bench")
+        book.DB.commit()
+
+
+def test_young_token_dossier_success_removes_from_pending():
+    """Young token that succeeds in dossier retrieval should be removed from young_pending_dossier."""
+    import book
+    import main as shift
+    from unittest.mock import Mock
+    
+    # Clear state
+    book.DB.execute("DELETE FROM carry")
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    now = time.time()
+    
+    # Two tokens: both young, first succeeds, second should not be blocked
+    young1_tid = "young_success:1399811149"
+    young2_tid = "young_also:1399811149"
+    
+    dossier_call_count = {"young1": 0, "young2": 0}
+    
+    def fake_universe(limiter=None, fomo=None):
+        return ([], {})
+    
+    def fake_shortlist(fomo, ids):
+        return [
+            {"tid": young1_tid, "ticker": "YOUNG1", "addr": "young_success", "net": 1399811149,
+             "age_minutes": 30, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
+             "holder_count": 200, "price": 0.1, "created": now - 1800},
+            {"tid": young2_tid, "ticker": "YOUNG2", "addr": "young_also", "net": 1399811149,
+             "age_minutes": 40, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
+             "holder_count": 200, "price": 0.1, "created": now - 2400}
+        ]
+    
+    def fake_trade_counts(t, gt_txns_cache=None):
+        return ({"buys_h1": 100, "sells_h1": 50, "trades_h24": 1000}, 'ok')
+    
+    def fake_dossier(t, limiter=None):
+        if t["tid"] == young1_tid:
+            dossier_call_count["young1"] += 1
+        else:
+            dossier_call_count["young2"] += 1
+        
+        # Both succeed
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "x_handle": None, "description": "test", "mint_authority": None,
+                "freeze_authority": None, "is_honeypot": None, "gt_score_details": None,
+                "developer_holding_percentage": None}
+    
+    def fake_judge(question_set, state):
+        return {"model": "test", "answers": {
+            "concentration_is_exit_risk": {"type": "noul", "noul": 0.3}
+        }, "usage": {}}
+    
+    # Monkeypatch
+    original_universe = shift.universe
+    original_shortlist = shift.shortlist
+    original_trade = shift.trade_counts
+    original_dossier = shift.dossier
+    
+    shift.universe = fake_universe
+    shift.shortlist = fake_shortlist
+    shift.trade_counts = fake_trade_counts
+    shift.dossier = fake_dossier
+    
+    try:
+        fake_fomo = Mock()
+        fake_desk = Mock()
+        fake_desk.read_x = Mock(return_value=None)
+        fake_desk.write_state = Mock()
+        
+        order, stats = shift.run_once(fake_fomo, fake_judge, fake_desk, 10000, shadow=True)
+        
+        # Both young tokens should have gotten dossiers
+        assert dossier_call_count["young1"] >= 1, "First young token should get dossier"
+        assert dossier_call_count["young2"] >= 1, "Second young token should also get dossier (not blocked)"
+        
+    finally:
+        shift.universe = original_universe
+        shift.shortlist = original_shortlist
+        shift.trade_counts = original_trade
+        shift.dossier = original_dossier
+        
+        # Cleanup
+        book.DB.execute("DELETE FROM carry")
+        book.DB.execute("DELETE FROM defer")
+        book.DB.execute("DELETE FROM bench")
+        book.DB.commit()
+
+
+def test_young_token_dossier_exception_removes_from_pending():
+    """Young token that raises a generic exception should be removed from young_pending_dossier."""
+    import book
+    import main as shift
+    from unittest.mock import Mock
+    
+    # Clear state
+    book.DB.execute("DELETE FROM carry")
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.commit()
+    
+    now = time.time()
+    
+    # Two tokens: one young (raises exception), one old (should get dossier)
+    young_tid = "young_exception:1399811149"
+    old_tid = "old_after:1399811149"
+    
+    dossier_call_count = {"young": 0, "old": 0}
+    
+    def fake_universe(limiter=None, fomo=None):
+        return ([], {})
+    
+    def fake_shortlist(fomo, ids):
+        return [
+            {"tid": young_tid, "ticker": "YOUNG", "addr": "young_exception", "net": 1399811149,
+             "age_minutes": 30, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
+             "holder_count": 200, "price": 0.1, "created": now - 1800},
+            {"tid": old_tid, "ticker": "OLD", "addr": "old_after", "net": 1399811149,
+             "age_minutes": 90, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
+             "holder_count": 200, "price": 0.1, "created": now - 5400}
+        ]
+    
+    def fake_trade_counts(t, gt_txns_cache=None):
+        return ({"buys_h1": 100, "sells_h1": 50, "trades_h24": 1000}, 'ok')
+    
+    def fake_dossier(t, limiter=None):
+        if t["tid"] == young_tid:
+            dossier_call_count["young"] += 1
+            # Young token raises generic exception
+            raise RuntimeError("GT API error")
+        else:
+            dossier_call_count["old"] += 1
+            # Old token succeeds
+            return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                    "x_handle": None, "description": "test", "mint_authority": None,
+                    "freeze_authority": None, "is_honeypot": None, "gt_score_details": None,
+                    "developer_holding_percentage": None}
+    
+    def fake_judge(question_set, state):
+        return {"model": "test", "answers": {
+            "concentration_is_exit_risk": {"type": "noul", "noul": 0.3}
+        }, "usage": {}}
+    
+    # Monkeypatch
+    original_universe = shift.universe
+    original_shortlist = shift.shortlist
+    original_trade = shift.trade_counts
+    original_dossier = shift.dossier
+    
+    shift.universe = fake_universe
+    shift.shortlist = fake_shortlist
+    shift.trade_counts = fake_trade_counts
+    shift.dossier = fake_dossier
+    
+    try:
+        fake_fomo = Mock()
+        fake_desk = Mock()
+        fake_desk.read_x = Mock(return_value=None)
+        fake_desk.write_state = Mock()
+        
+        order, stats = shift.run_once(fake_fomo, fake_judge, fake_desk, 10000, shadow=True)
+        
+        # Young token should have been called
+        assert dossier_call_count["young"] >= 1, "Young token should attempt dossier"
+        
+        # Old token should have been called (not blocked by young token with exception)
+        assert dossier_call_count["old"] >= 1, "Old token should get dossier after young token exception"
+        
+        # Young token should be benched
+        benched = book.DB.execute("SELECT * FROM bench WHERE tid = ?", (young_tid,)).fetchone()
+        assert benched is not None, "Young token should be benched after exception"
+        
+    finally:
+        shift.universe = original_universe
+        shift.shortlist = original_shortlist
+        shift.trade_counts = original_trade
+        shift.dossier = original_dossier
+        
+        # Cleanup
+        book.DB.execute("DELETE FROM carry")
+        book.DB.execute("DELETE FROM defer")
+        book.DB.execute("DELETE FROM bench")
+        book.DB.commit()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
