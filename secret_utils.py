@@ -31,17 +31,32 @@ def safe_err(e: Exception) -> str:
         exc_type = type(e).__name__
         msg = str(e)
         
-        # Get SOLANA_RPC_URL for exact replacement
-        solana_rpc_url = os.environ.get("SOLANA_RPC_URL")
+        # Get all *_RPC_URL environment variables (bug #11)
+        rpc_urls = []
+        for key, value in os.environ.items():
+            if key.endswith("_RPC_URL") and value:
+                rpc_urls.append(value)
         
-        # Redact the full SOLANA_RPC_URL if it appears
-        if solana_rpc_url and solana_rpc_url in msg:
-            # Parse and redact the URL
-            redacted = _redact_url(solana_rpc_url)
-            msg = msg.replace(solana_rpc_url, redacted)
+        # Redact all RPC URLs
+        for rpc_url in rpc_urls:
+            if rpc_url in msg:
+                redacted = _redact_url(rpc_url)
+                msg = msg.replace(rpc_url, redacted)
+            
+            # Also redact path+query forms
+            try:
+                parsed = urlparse(rpc_url)
+                if parsed.path or parsed.query:
+                    path_query = parsed.path if parsed.path else "/"
+                    if parsed.query:
+                        path_query += f"?{parsed.query}"
+                    if path_query in msg:
+                        redacted_pq = _redact_url(f"https://dummy{path_query}").replace("https://dummy", "")
+                        msg = msg.replace(path_query, redacted_pq)
+            except Exception:
+                pass
         
         # Redact query parameters in full URLs (api-key, apikey, token)
-        # Pattern: looks for URLs with query strings
         url_pattern = r'(https?://[^\s\'"]+)'
         
         def redact_match(match):
@@ -49,23 +64,6 @@ def safe_err(e: Exception) -> str:
             return _redact_url(url)
         
         msg = re.sub(url_pattern, redact_match, msg)
-        
-        # Redact path+query forms from SOLANA_RPC_URL if set
-        # e.g., "/?api-key=..." when the URL is "https://mainnet.helius-rpc.com/?api-key=..."
-        if solana_rpc_url:
-            try:
-                parsed = urlparse(solana_rpc_url)
-                if parsed.path or parsed.query:
-                    # Build path+query string (e.g., "/?api-key=...")
-                    path_query = parsed.path if parsed.path else "/"
-                    if parsed.query:
-                        path_query += f"?{parsed.query}"
-                    # Redact this pattern
-                    if path_query in msg:
-                        redacted_pq = _redact_url(f"https://dummy{path_query}").replace("https://dummy", "")
-                        msg = msg.replace(path_query, redacted_pq)
-            except Exception:
-                pass  # Failed to parse, continue with other redactions
         
         # Final catch-all: redact any key=value patterns for sensitive parameters
         # Matches: api-key, api_key, apikey, token, access-token, access_token

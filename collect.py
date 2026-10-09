@@ -597,7 +597,7 @@ def shortlist(fomo: Fomo, ids: list[str]) -> list[dict]:
 
 
 _EMPTY_TRADES = {"buys_h1": None, "sells_h1": None, "buys_h6": None, "sells_h6": None,
-                 "trades_h24": None}
+                 "trades_h24": None, "pair_address": None}
 
 
 # Known liquid tokens for canary checks (Solana addresses)
@@ -728,7 +728,8 @@ def trade_counts(t: dict, gt_txns_cache: dict = None) -> tuple[dict, str]:
             "sells_h1": h1.get("sells"),
             "buys_h6": h6.get("buys"), 
             "sells_h6": h6.get("sells"),
-            "trades_h24": buys_h24 + sells_h24  # Always a number, never None
+            "trades_h24": buys_h24 + sells_h24,  # Always a number, never None
+            "pair_address": best_pair.get("pairAddress")  # Store for EVM holder checks
         }, 'ok'
     except (TypeError, AttributeError, KeyError, ValueError) as e:
         log.warning("DexScreener data parse error for %s (%s): %s", t["ticker"], t["addr"], e)
@@ -765,14 +766,19 @@ def _try_gt_fallback(t: dict, gt_txns_cache: dict, genuine_empty: bool = False) 
             "sells_h1": h1.get("sells"),
             "buys_h6": h6.get("buys"),
             "sells_h6": h6.get("sells"),
-            "trades_h24": buys_h24 + sells_h24  # Always a number, even if 0
+            "trades_h24": buys_h24 + sells_h24,  # Always a number, even if 0
+            "pair_address": None  # GT fallback has no pair info
         }, 'gt_fallback'
     
     # No GT fallback available
     if genuine_empty:
-        return dict(_EMPTY_TRADES), 'empty'
+        result = dict(_EMPTY_TRADES)
+        result["pair_address"] = None
+        return result, 'empty'
     else:
-        return dict(_EMPTY_TRADES), 'error'
+        result = dict(_EMPTY_TRADES)
+        result["pair_address"] = None
+        return result, 'error'
 
 
 def _normalize_authority(raw_value) -> tuple[bool | None, str | None]:
@@ -892,12 +898,62 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
             d["rpc_ok"] = False
             d["rpc_error"] = safe_msg
     else:
-        # EVM chains: use FOMO's top10HoldersPercent (doesn't count LP/burn like GT does)
-        # top_wallet is unavailable on EVM (will be checked in chain_kill)
-        # FOMO returns percent (0-100), store as-is (filter.py expects 0-100)
-        fomo_top10 = t.get("fomo_top10_holders_percent")
-        if fomo_top10 is not None:
-            d["top_10_percent"] = fomo_top10  # Already a percent (0-100)
+        # EVM chains: compute real holder concentration
+        # Import here to avoid circular dependency
+        import evm_holders
+        import book
+        
+        # Get pair addresses from DexScreener pairAddress (passed through trade stage)
+        pair_addrs = []
+        if "pair_address" in t:
+            pair_addrs = [t["pair_address"]]
+        
+        result = evm_holders.evm_holder_concentration(
+            chain_id=t["net"],
+            token=t["addr"],
+            pair_addrs=pair_addrs,
+            age_min=t.get("age_minutes", 0),
+            db=book.DB
+        )
+        
+        if result.ok:
+            # Store computed values
+            d["top_wallet_percent"] = result.top_wallet  # 0-1 fraction
+            d["top_10_percent"] = result.top_10  # 0-100 percent
+            d["evm_holder_source"] = result.source
+            d["evm_holder_excluded"] = result.excluded
+            d["evm_holder_raw_top_wallet"] = result.raw_top_wallet
+            d["evm_holder_raw_top_10"] = result.raw_top_10
+            
+            # Log kills with raw values, post-exclusion values, and exclusion reasons
+            if result.top_wallet is not None and result.top_wallet > 0.05:
+                exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
+                log.info("EVM top_wallet KILL for %s: raw %.1f%%, post-exclusion %.1f%% (source: %s, excluded: %s)",
+                        t["ticker"], 
+                        (result.raw_top_wallet * 100) if result.raw_top_wallet else 0,
+                        result.top_wallet * 100, 
+                        result.source, 
+                        exclusion_reasons or "none")
+            if result.top_10 is not None and result.top_10 > 60:
+                exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
+                log.info("EVM top_10 KILL for %s: raw %.1f%%, post-exclusion %.1f%% (source: %s, excluded: %s)",
+                        t["ticker"],
+                        result.raw_top_10 if result.raw_top_10 else 0,
+                        result.top_10,
+                        result.source,
+                        exclusion_reasons or "none")
+        else:
+            # Fail closed: no top_wallet_percent -> top_wallet_unverified or holders_pending in filter
+            d["top_wallet_percent"] = None
+            d["top_10_percent"] = None
+            d["evm_holder_source"] = result.source
+            d["evm_holder_error"] = result.error
+            
+            # Item #6: Use structured is_transient field
+            d["evm_holder_transient"] = result.is_transient
+            
+            log.info("EVM holder check unavailable for %s: %s (source: %s, transient: %s)",
+                    t["ticker"], result.error, result.source, result.is_transient)
 
     return d
 

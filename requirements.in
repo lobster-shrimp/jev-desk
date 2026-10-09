@@ -9,6 +9,7 @@ fastapi>=0.110
 uvicorn>=0.29
 requests>=2.31
 websocket-client>=1.7
+eth_abi>=5.0
 
 # testing only, but the desk ships its tests, so it stays in the one file
 pytest>=8

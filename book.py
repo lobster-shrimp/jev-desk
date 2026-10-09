@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS carry(
   tid TEXT PRIMARY KEY,
   cycles_carried INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS evm_holder_cache(
+  chain_id INTEGER NOT NULL,
+  token TEXT NOT NULL,
+  last_block INTEGER NOT NULL,
+  balances_json TEXT NOT NULL,
+  supply TEXT NOT NULL,
+  updated_at REAL NOT NULL,
+  PRIMARY KEY (chain_id, token)
+);
 """)
 
 # One-time migration: clear authority_open bench entries (falsely benched due to 'no' string bug)
@@ -73,6 +82,8 @@ BENCH_MINUTES = {
     "honeypot": 100_000, "authority_open": 100_000,
     "top_wallet": 1440, "sell_side": 100_000,  # top_wallet: 1 day (can change if whale dumps)
     "top_wallet_unverified": 360,  # EVM tokens without on-chain verification: 6h bench
+    # transient failures need shorter bench for retry
+    "holders_pending": 15,  # transient EVM holder check failures (rate_limited, timeout, etc)
     # slow to change
     "recycled_account": 360, "account_is_the_project": 360,
     # can change as the float moves
