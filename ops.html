@@ -517,6 +517,68 @@ tr:hover td { background: #151515; }
 .token-link:hover {
   text-decoration: underline;
 }
+.briefing-panel {
+  margin-bottom: 25px;
+  padding: 20px;
+  background: #111;
+  border-left: 4px solid #42a5f5;
+}
+.briefing-meta {
+  color: #888;
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+.briefing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin-bottom: 15px;
+}
+.briefing-md {
+  white-space: pre-wrap;
+  font-size: 12px;
+  color: #bbb;
+  background: #0a0a0a;
+  padding: 12px;
+  max-height: 420px;
+  overflow: auto;
+  margin-top: 12px;
+}
+.trend-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.trend-label {
+  flex: 0 0 160px;
+  color: #888;
+}
+.trend-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 36px;
+  flex: 1;
+}
+.trend-bar {
+  width: 14px;
+  background: #42a5f5;
+  min-height: 2px;
+}
+.trend-bar.today { background: #fb8c00; }
+.trend-flag {
+  color: #ffcc80;
+  font-size: 11px;
+}
+.trend-flag.notable { color: #ef5350; font-weight: 600; }
+.solana-box {
+  background: #0a0a0a;
+  padding: 12px;
+  border-left: 3px solid #9945ff;
+  margin: 12px 0;
+}
 @media (max-width: 768px) {
   body { padding: 10px; font-size: 12px; }
   .histogram { grid-template-columns: 1fr; }
@@ -537,6 +599,36 @@ tr:hover td { background: #151515; }
   <div id="fomo-status-grid" class="fomo-status-grid"></div>
   <button id="fomo-fix-button" class="fomo-fix-button">Fix FOMO Login</button>
   <div id="fomo-fix-message" class="fomo-fix-message"></div>
+</div>
+
+<div id="briefing-panel" class="briefing-panel">
+  <div class="summary-title">Morning briefing <span class="badge shadow">last 24h</span></div>
+  <div class="briefing-meta" id="briefing-meta">No history yet — wait for a cycle, or backfill outbox/run.log.</div>
+  <div class="shadow-disclaimer">Shadow mode only. Picks are not fills. Desk stays bound to 127.0.0.1.</div>
+  <div class="briefing-grid" id="briefing-stats"></div>
+  <div class="section-title">Per chain</div>
+  <div id="briefing-chains"></div>
+  <div class="solana-box" id="briefing-solana"></div>
+  <div class="section-title">Kill reasons (24h)</div>
+  <div id="briefing-kills" class="histogram"></div>
+  <div class="section-title">Judged tokens (24h)</div>
+  <div id="briefing-judged"></div>
+  <div class="section-title">Young free-pass outcomes</div>
+  <div id="briefing-young"></div>
+  <div class="section-title">Picks / fills / shadow P&amp;L</div>
+  <div id="briefing-shadow"></div>
+  <div class="section-title">Desk uptime</div>
+  <div id="briefing-uptime"></div>
+  <details>
+    <summary class="funnel-guide-title" style="margin-top:12px;">▶ Full briefing markdown</summary>
+    <pre class="briefing-md" id="briefing-md"></pre>
+  </details>
+</div>
+
+<div id="trends-panel" class="section">
+  <div class="section-title">Trends vs prior 7 days</div>
+  <div id="trends-flags"></div>
+  <div id="trends-charts"></div>
 </div>
 
 <div id="summary-box" class="summary" style="display:none;">
@@ -1576,6 +1668,15 @@ async function refresh() {
     } catch (e) {
       console.warn('Could not fetch shadow ledger:', e);
     }
+
+    try {
+      const briefResp = await fetch('/ops/briefing');
+      if (briefResp.ok) {
+        renderBriefing(await briefResp.json());
+      }
+    } catch (e) {
+      console.warn('Could not fetch briefing:', e);
+    }
     
     lastUpdated = state.updated_at;
   } catch (err) {
@@ -1630,6 +1731,169 @@ document.getElementById('fomo-fix-button').addEventListener('click', async funct
     }, 3000);
   }
 });
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function renderBriefing(data) {
+  const meta = document.getElementById('briefing-meta');
+  const w = data.last_24h || {};
+  if (!w.cycles && !data.markdown) {
+    meta.textContent = 'No history yet — wait for a cycle, or backfill outbox/run.log.';
+  } else {
+    const morning = data.morning ? ` Morning file: ${data.morning.date_local}.` : '';
+    meta.textContent = `Window ending ${data.generated_at_iso || 'now'} · ${w.cycles || 0} cycles.${morning}`;
+  }
+
+  const up = w.uptime || {};
+  const sh = w.shadow || {};
+  const stats = [
+    ['Seen', w.seen || 0],
+    ['Benched', w.benched || 0],
+    ['Judged', w.judged || 0],
+    ['Requeued', w.requeued || 0],
+    ['GT 429s', w.gt_429 || 0],
+    ['GT defers', w.gt_defer || 0],
+    ['Carry', w.carry || 0],
+    ['Unevaluated', w.unevaluated || 0],
+    ['Uptime', (up.uptime_pct != null ? up.uptime_pct.toFixed(1) + '%' : '—')],
+  ];
+  document.getElementById('briefing-stats').innerHTML = stats.map(([k,v]) =>
+    `<div class="stat-box"><div class="stat-label">${k}</div><div class="stat-value">${v}</div></div>`
+  ).join('');
+
+  const by = (w.per_chain && w.per_chain.by_chain) || {};
+  const names = Object.keys(by).sort();
+  if (!names.length) {
+    document.getElementById('briefing-chains').innerHTML = '<div class="empty">No per-chain rows</div>';
+  } else {
+    document.getElementById('briefing-chains').innerHTML = `<table><thead><tr>
+      <th>Chain</th><th>Judged</th><th>Soft</th><th>Young free</th><th>Young 429</th><th>Young chain</th><th>Young soft</th>
+    </tr></thead><tbody>${names.map(n => {
+      const b = by[n]; const yo = b.young_outcomes || {};
+      return `<tr><td>${esc(n)}</td><td>${b.judged||0}</td><td>${b.soft||0}</td>
+        <td>${b.young_free||0}</td><td>${yo.deferred_429||0}</td><td>${yo.chain||0}</td><td>${yo.soft||0}</td></tr>`;
+    }).join('')}</tbody></table>`;
+  }
+
+  const sol = w.solana || {};
+  const syo = sol.young_outcomes || {};
+  document.getElementById('briefing-solana').innerHTML =
+    `<div class="age-title">Solana only</div>
+     <div class="age-stat"><span class="age-stat-label">Judged</span><span class="age-stat-value">${sol.judged||0}</span></div>
+     <div class="age-stat"><span class="age-stat-label">Soft</span><span class="age-stat-value">${sol.soft||0}</span></div>
+     <div class="age-stat"><span class="age-stat-label">Young free</span><span class="age-stat-value">${sol.young_free||0}</span></div>
+     <div class="age-stat"><span class="age-stat-label">deferred on 429</span><span class="age-stat-value">${syo.deferred_429||0}</span></div>
+     <div class="age-stat"><span class="age-stat-label">chain kill</span><span class="age-stat-value">${syo.chain||0}</span></div>
+     <div class="age-stat"><span class="age-stat-label">soft</span><span class="age-stat-value">${syo.soft||0}</span></div>`;
+
+  const kills = w.kills || {};
+  const killDiv = document.getElementById('briefing-kills');
+  killDiv.innerHTML = '';
+  let anyKill = false;
+  ['free','trade','chain','soft'].forEach(stage => {
+    const bag = kills[stage] || {};
+    const entries = Object.entries(bag);
+    if (!entries.length) return;
+    anyKill = true;
+    const group = document.createElement('div');
+    group.className = `hist-group ${stage}`;
+    group.innerHTML = `<div class="hist-title">${stage}</div>` +
+      entries.sort((a,b)=>b[1]-a[1]).map(([r,c]) =>
+        `<div class="hist-item"><span class="hist-reason">${esc(r)}</span><span class="hist-count">${c}</span></div>`
+      ).join('');
+    killDiv.appendChild(group);
+  });
+  if (!anyKill) killDiv.innerHTML = '<div class="empty">No kills in the window</div>';
+
+  const judged = w.judged_tokens || [];
+  if (!judged.length) {
+    document.getElementById('briefing-judged').innerHTML = '<div class="empty">No judged tokens</div>';
+  } else {
+    document.getElementById('briefing-judged').innerHTML = `<table><thead><tr>
+      <th>Ticker</th><th>Chain</th><th>Age min</th><th>Momentum</th><th>Scores</th>
+    </tr></thead><tbody>${judged.map(t => {
+      const scores = t.soft_scores || {};
+      const mom = scores.momentum_already_spent;
+      const compact = Object.keys(scores).sort().map(k => `${k}=${Number(scores[k]).toFixed(3)}`).join(', ');
+      const age = t.age_minutes != null ? Number(t.age_minutes).toFixed(1) : '—';
+      return `<tr><td>${esc(t.ticker||'—')}</td><td>${esc(t.chain||'—')}</td>
+        <td>${age}</td><td>${mom == null ? '—' : Number(mom).toFixed(3)}</td><td>${esc(compact||'—')}</td></tr>`;
+    }).join('')}</tbody></table>`;
+  }
+
+  const yo = w.young_outcomes || {};
+  const labels = {deferred_429:'deferred on 429', chain:'chain kill', soft:'soft',
+                  judged:'judged', trade:'trade', unevaluated:'unevaluated', other:'other'};
+  const yoKeys = Object.keys(yo);
+  if (!yoKeys.length) {
+    document.getElementById('briefing-young').innerHTML = '<div class="empty">No young free-passers</div>';
+  } else {
+    document.getElementById('briefing-young').innerHTML = `<div class="pnl-grid">${
+      yoKeys.map(k => `<div class="pnl-stat"><div class="pnl-label">${labels[k]||k}</div>
+        <div class="pnl-value">${yo[k]}</div></div>`).join('')
+    }<div class="pnl-stat"><div class="pnl-label">Young free-pass rate</div>
+      <div class="pnl-value">${((w.young_free_pass_rate||0)*100).toFixed(1)}%</div></div></div>`;
+  }
+
+  document.getElementById('briefing-shadow').innerHTML = `<div class="pnl-grid">
+    <div class="pnl-stat"><div class="pnl-label">Picks</div><div class="pnl-value">${sh.picks||0}</div></div>
+    <div class="pnl-stat"><div class="pnl-label">Fills</div><div class="pnl-value">${sh.fills||0}</div></div>
+    <div class="pnl-stat"><div class="pnl-label">Realized PnL</div>
+      <div class="pnl-value ${(sh.realized_pnl_usd||0)>=0?'positive':'negative'}">$${(sh.realized_pnl_usd||0).toFixed(2)}</div></div>
+    <div class="pnl-stat"><div class="pnl-label">Closed</div><div class="pnl-value">${sh.closed_trades||0}</div></div>
+    <div class="pnl-stat"><div class="pnl-label">Open</div><div class="pnl-value">${sh.open_positions||0}</div></div>
+  </div><div class="shadow-disclaimer">${esc(sh.fills_note||'shadow only — picks are not fills')}</div>`;
+
+  document.getElementById('briefing-uptime').innerHTML =
+    `${up.cycles||0} cycles / ${up.expected_cycles||0} expected (${(up.uptime_pct||0).toFixed(1)}%)`;
+
+  document.getElementById('briefing-md').textContent = data.markdown || '';
+
+  renderTrends(data.trends || {});
+}
+
+function renderTrends(trends) {
+  const flagsDiv = document.getElementById('trends-flags');
+  const chartsDiv = document.getElementById('trends-charts');
+  const flags = trends.flags || [];
+  const notable = flags.filter(f => f.notable);
+  if (!notable.length) {
+    flagsDiv.innerHTML = '<div class="trend-flag">No notable shifts versus the prior 7 daily aggregates.</div>';
+  } else {
+    flagsDiv.innerHTML = notable.map(f => {
+      const d = f.delta == null ? '' : (f.unit === 'pp' || f.unit === '%'
+        ? ` (${Number(f.delta)>=0?'+':''}${Number(f.delta).toFixed(1)}${f.unit})`
+        : ` (${Number(f.delta)>=0?'+':''}${Number(f.delta).toFixed(3)})`);
+      return `<div class="trend-flag notable">${esc(f.metric)}: ${esc(f.current)} vs ${esc(f.baseline)}${d}</div>`;
+    }).join('');
+  }
+
+  const days = trends.days || [];
+  const series = [
+    ['judged/day', d => d.judged],
+    ['median momentum', d => d.median_momentum],
+    ['young free-pass rate', d => (d.young_free_pass_rate || 0) * 100],
+    ['GT defers', d => d.gt_defers],
+  ];
+  if (!days.length) {
+    chartsDiv.innerHTML = '<div class="empty">Not enough daily history for charts</div>';
+    return;
+  }
+  chartsDiv.innerHTML = series.map(([label, pick]) => {
+    const vals = days.map(pick).map(v => v == null ? 0 : Number(v));
+    const max = Math.max(1, ...vals);
+    const bars = days.map((d, i) => {
+      const h = Math.max(2, (vals[i] / max) * 36);
+      return `<div class="trend-bar" title="${d.date}: ${vals[i]}" style="height:${h}px"></div>`;
+    }).join('');
+    return `<div class="trend-row"><div class="trend-label">${label}</div>
+      <div class="trend-bars">${bars}</div>
+      <div class="meta-value">${days[0].date} → ${days[days.length-1].date}</div></div>`;
+  }).join('');
+}
 
 refresh();
 setInterval(refresh, 20000);
