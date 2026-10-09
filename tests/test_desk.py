@@ -1714,7 +1714,9 @@ def test_universe_uses_limiter():
     try:
         # Limiter with only 3 slots (should stop early)
         fake_time = [0.0]
-        limiter = collect.GTRateLimiter(calls_per_min=3, time_fn=lambda: fake_time[0])
+        # Add fake sleep to prevent real sleeping
+        limiter = collect.GTRateLimiter(calls_per_min=3, time_fn=lambda: fake_time[0], 
+                                        sleep_fn=lambda d: fake_time.__setitem__(0, fake_time[0] + d))
         ids, gt_cache = collect.universe(nets=("solana",), pages=5, include_trending=True, limiter=limiter)
         
         # Should have made at most 3 calls (budget exhausted)
@@ -1875,6 +1877,12 @@ def test_limiter_prioritizes_dossier_over_universe(monkeypatch, caplog):
     book.DB.execute("DELETE FROM bench")
     book.DB.commit()
     
+    # Use fake clock to avoid real sleeping
+    fake_time = [0.0]
+    fake_limiter = collect.GTRateLimiter(calls_per_min=10, min_spacing_sec=1.0,
+                                          time_fn=lambda: fake_time[0],
+                                          sleep_fn=lambda d: fake_time.__setitem__(0, fake_time[0] + d))
+    
     # Track GT calls
     gt_calls = []
     
@@ -1893,6 +1901,8 @@ def test_limiter_prioritizes_dossier_over_universe(monkeypatch, caplog):
     
     monkeypatch.setattr(shift, "universe", spy_universe)
     monkeypatch.setattr(shift, "dossier", spy_dossier)
+    monkeypatch.setattr(shift, "_now", lambda: fake_time[0])
+    monkeypatch.setattr(shift, "_sleep", lambda d: fake_time.__setitem__(0, fake_time[0] + d))
     
     # Create tokens that pass free and trade
     tid1 = f"PrioAddr1:{1399811149}"
@@ -1916,8 +1926,17 @@ def test_limiter_prioritizes_dossier_over_universe(monkeypatch, caplog):
     desk = FakeDesk()
     caplog.clear()
     with caplog.at_level(logging.INFO):
-        # Reserve 3 for dossiers, leaving 7 for universe
-        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, gt_dossier_reserve=3)
+        # Reserve 3 for dossiers, leaving 7 for universe; use fake limiter
+        order, stats = shift.run_once(FakeFomo(), JUDGE, desk, desk.bank(), shadow=True, 
+                                       gt_dossier_reserve=3, gt_limiter=fake_limiter)
+    
+    # Check that reserve was logged
+    assert any("reserved 3 for dossiers" in rec.message for rec in caplog.records), \
+        "Expected reserve log"
+    
+    # Verify gt_calls shows universe ran before dossiers
+    assert len(gt_calls) > 0
+    assert gt_calls[0][0] == "universe", "Universe should be called first"
     
     # Check that reserve was logged
     assert any("reserved 3 for dossiers" in rec.message for rec in caplog.records), \
