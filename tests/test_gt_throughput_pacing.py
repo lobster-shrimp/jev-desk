@@ -429,7 +429,7 @@ def test_time_budget_carry_in_priority_order():
                                        gt_limiter=limiter, cycle_time_budget=180)
         
         # Should have carried the rest in priority order
-        carry = book.get_carry())
+        carry = book.get_carry()
         assert len(carry) > 0, "Should have carried some tokens when time budget exhausted"
         assert len(carry) <= 5, "Should have carried at most 5 tokens"
         
