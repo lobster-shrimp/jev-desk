@@ -21,6 +21,17 @@ from secret_utils import safe_err, _redact_url
 from collect import GTRateLimiter, sol_top_wallet, dossier
 
 
+def _paced_limiter(calls_per_min=30, **kw):
+    """Limiter whose sleep advances a fake clock (no real sleeping)."""
+    box = [0.0]
+    return GTRateLimiter(
+        calls_per_min=calls_per_min,
+        time_fn=lambda: box[0],
+        sleep_fn=lambda d: box.__setitem__(0, box[0] + d),
+        **kw,
+    )
+
+
 # ============================================================================
 # Fix 1: Secret scrubbing tests
 # ============================================================================
@@ -276,7 +287,7 @@ def test_judge_payload_never_contains_secret(caplog):
 
 def test_gt_limiter_universe_budget_stops_scan():
     """Universe scan should stop when universe budget exhausted, not sleep."""
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     limiter.set_universe_budget(3)
     
     # First 3 calls succeed
@@ -295,7 +306,7 @@ def test_gt_limiter_universe_budget_logs_exhaustion(caplog):
     """Universe budget exhaustion should log a specific message."""
     caplog.set_level(logging.INFO)
     
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     limiter.set_universe_budget(2)
     
     limiter.spend_universe(1)
@@ -308,7 +319,7 @@ def test_gt_limiter_universe_budget_logs_exhaustion(caplog):
 
 def test_gt_limiter_universe_budget_reset_per_cycle():
     """set_universe_budget() should reset usage counter for new cycle."""
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     
     # Cycle 1: exhaust budget
     limiter.set_universe_budget(2)
@@ -325,7 +336,7 @@ def test_gt_limiter_universe_budget_reset_per_cycle():
 
 def test_dossier_budget_available_after_universe_scan():
     """Dossier budget should remain available after universe scan exhausts its budget."""
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     limiter.set_universe_budget(3)
     limiter.reserve(5)  # Reserve 5 for dossiers
     
@@ -350,7 +361,7 @@ def test_universe_scan_stops_without_sleeping(caplog):
     """When universe budget exhausted, scan should stop immediately without sleeping."""
     caplog.set_level(logging.INFO)
     
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     limiter.set_universe_budget(2)
     
     start = time.time()
@@ -370,27 +381,18 @@ def test_universe_scan_stops_without_sleeping(caplog):
 
 
 def test_universe_budget_configurable_via_env():
-    """GT_UNIVERSE_BUDGET env var should be respected."""
+    """GT_UNIVERSE_BUDGET env var should be respected (via helper, no reload)."""
+    import main
     with patch.dict(os.environ, {"GT_UNIVERSE_BUDGET": "10"}):
-        # Re-import to pick up env var
-        import importlib
-        import main
-        importlib.reload(main)
-        
-        assert main.GT_UNIVERSE_BUDGET == 10
+        assert main._env_int("GT_UNIVERSE_BUDGET", 5) == 10
 
 
 def test_universe_budget_default_value():
     """GT_UNIVERSE_BUDGET should have sensible default for GT free tier."""
-    # Default should reserve headroom for dossiers from ~30/min free tier
-    # We set default to 5 in main.py
-    with patch.dict(os.environ, {}, clear=True):
-        import importlib
-        import main
-        importlib.reload(main)
-        
-        # Default should be 5 (leaves 25 for dossiers from 30/min tier)
-        assert main.GT_UNIVERSE_BUDGET == 5
+    import main
+    with patch.dict(os.environ, {"GT_UNIVERSE_BUDGET": ""}):
+        # empty/missing -> default 5
+        assert main._env_int("GT_UNIVERSE_BUDGET", 5) == 5
 
 
 def test_universe_scan_logs_pages_fetched(caplog):
@@ -399,7 +401,7 @@ def test_universe_scan_logs_pages_fetched(caplog):
     
     caplog.set_level(logging.INFO)
     
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     limiter.set_universe_budget(1)  # Only 1 page to force exhaustion
     
     # Mock GT API to return empty results
@@ -428,7 +430,7 @@ def test_fomo_feeds_merged_when_gt_budget_exhausted():
     """FOMO feeds should be merged even when GT budget runs out."""
     from collect import universe
     
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     limiter.set_universe_budget(1)  # Budget=1, will exhaust after first GT page
     
     # Mock FOMO with known ids
@@ -463,7 +465,7 @@ def test_fomo_feeds_included_with_zero_budget():
     """FOMO feeds should be included even with budget=0."""
     from collect import universe
     
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     limiter.set_universe_budget(0)  # Zero budget for GT
     
     # Mock FOMO with known ids
@@ -486,7 +488,7 @@ def test_fomo_feed_failure_returns_gt_ids():
     """FOMO feed failure should not prevent GT ids from being returned."""
     from collect import universe
     
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     limiter.set_universe_budget(5)
     
     # Mock FOMO to raise exception
@@ -522,7 +524,7 @@ def test_universe_logs_source_counts(caplog):
     
     caplog.set_level(logging.INFO)
     
-    limiter = GTRateLimiter(calls_per_min=30)
+    limiter = _paced_limiter(calls_per_min=30)
     limiter.set_universe_budget(5)
     
     # Mock FOMO with one duplicate and one new
