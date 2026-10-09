@@ -1163,7 +1163,8 @@ def test_universe_429_stops_network_not_all():
     requests.get = mock_get
     
     try:
-        ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
+        limiter, _ = _paced_limiter(calls_per_min=30)
+        ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True, limiter=limiter)
         
         # Should have IDs from solana trending, solana page 1, and both bsc new_pools pages
         # (bsc trending 429'd, solana new_pools stopped at page 2 due to 429, but BSC new_pools continued)
@@ -1367,7 +1368,8 @@ def test_universe_trending_429_continues():
     requests.get = mock_get
     
     try:
-        ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True)
+        limiter, _ = _paced_limiter(calls_per_min=30)
+        ids, gt_cache = collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True, limiter=limiter)
         
         # Should have collected: 2 solana new + 2 bsc new + 1 bsc trending = 5
         # (solana trending skipped due to 429)
@@ -1897,19 +1899,23 @@ def test_limiter_prioritizes_dossier_over_universe(monkeypatch, caplog):
     
     # Track GT calls
     gt_calls = []
+    tid1 = f"PrioAddr1:{1399811149}"
+    tid2 = f"PrioAddr2:{1399811149}"
     
-    original_universe = collect.universe
     def spy_universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, limiter=None, fomo=None):
-        result = original_universe(nets=nets, pages=pages, include_trending=include_trending, limiter=limiter, fomo=fomo)
         if limiter:
             gt_calls.append(("universe", limiter.available()))
-        return result
+        return ([tid1, tid2], {})
     
-    original_dossier = collect.dossier
     def spy_dossier(t, limiter=None):
         if limiter:
+            limiter.wait_if_needed(priority=True)
+            limiter.spend(1, priority=True)
             gt_calls.append(("dossier", limiter.available()))
-        return original_dossier(t, limiter=limiter)
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "x_handle": None, "description": "test", "mint_authority": None,
+                "freeze_authority": None, "is_honeypot": None, "gt_score_details": None,
+                "developer_holding_percentage": None}
     
     monkeypatch.setattr(shift, "universe", spy_universe)
     monkeypatch.setattr(shift, "dossier", spy_dossier)
@@ -1930,7 +1936,7 @@ def test_limiter_prioritizes_dossier_over_universe(monkeypatch, caplog):
                             volume_h24=120000, mcap_usd=600000))
         return tokens
     
-    monkeypatch.setattr(collect, "shortlist", fake_shortlist_prio)
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist_prio)
     monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: ({"buys_h1": 540, "sells_h1": 120,
                                                             "buys_h6": 900, "sells_h6": 400, 
                                                             "trades_h24": 4000}, 'ok'))
