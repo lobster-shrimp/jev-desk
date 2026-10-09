@@ -16,6 +16,8 @@ click==8.5.0
     # via uvicorn
 colorama==0.4.6 ; sys_platform == 'win32'
     # via pytest
+cytoolz==1.2.0 ; implementation_name == 'cpython'
+    # via eth-utils
 eth-abi==6.0.0
     # via -r requirements.in
 eth-hash==0.7.0
@@ -79,6 +81,10 @@ tenacity==9.1.4
     # via typesafe-sdk
 tomli==2.4.1 ; python_full_version < '3.11'
     # via pytest
+toolz==1.2.0 ; implementation_name == 'cpython' or implementation_name == 'pypy'
+    # via
+    #   cytoolz
+    #   eth-utils
 truststore==0.10.4 ; sys_platform != 'emscripten'
     # via
     #   httpcore2
@@ -88,6 +94,7 @@ typesafe-sdk==0.7.2
 typing-extensions==4.16.0
     # via
     #   anyio
+    #   eth-typing
     #   exceptiongroup
     #   fastapi
     #   httpx2
