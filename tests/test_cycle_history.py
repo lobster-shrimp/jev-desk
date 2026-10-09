@@ -21,10 +21,6 @@ os.environ["TZ"] = "UTC"
 if hasattr(time, "tzset"):
     time.tzset()
 
-# Pin server.OUTBOX to the suite outbox before any tmp-path fixture remaps
-# DESK_OUTBOX. Otherwise GET /api/state in test_desk looks at a deleted dir.
-import server as _server_pin  # noqa: F401
-
 
 def ts(y, m, d, hh=12, mm=0, ss=0) -> float:
     return time.mktime((y, m, d, hh, mm, ss, 0, 0, -1))

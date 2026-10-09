@@ -29,8 +29,12 @@ from judge import app, DESK_SECRET
 from secret_utils import safe_err
 
 HERE = pathlib.Path(__file__).parent
-OUTBOX = pathlib.Path(os.environ.get("DESK_OUTBOX", "outbox"))
 router = APIRouter(prefix="/book")
+
+
+def _outbox() -> pathlib.Path:
+    """Resolve at call time so tests (and ops) follow the current DESK_OUTBOX."""
+    return pathlib.Path(os.environ.get("DESK_OUTBOX", "outbox"))
 
 
 def _auth(authorization: str):
@@ -84,7 +88,7 @@ async def ops_briefing():
 @app.get("/api/state")
 async def api_state():
     """Serve outbox/state.json for the ops panel."""
-    state_path = OUTBOX / "state.json"
+    state_path = _outbox() / "state.json"
     if not state_path.exists():
         return JSONResponse({"demo": False, "tokens": [], "cycle": None}, status_code=404)
     return JSONResponse(json.loads(state_path.read_text()))
@@ -110,7 +114,7 @@ async def api_fomo_status():
     Safe for ops panel display.
     """
     # Try to get FOMO health from the most recent state.json
-    state_path = OUTBOX / "state.json"
+    state_path = _outbox() / "state.json"
     if state_path.exists():
         try:
             state = json.loads(state_path.read_text())
