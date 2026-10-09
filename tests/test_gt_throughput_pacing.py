@@ -124,7 +124,7 @@ def test_gt_limiter_reset_for_test_clears_last_call_and_stats(fake_clock):
     limiter.stats_wait_time = 100.0
     limiter.reserve(3)
     limiter.reset_for_test()
-    assert limiter.last_call_time == 0.0
+    assert limiter.last_call_time is None
     assert len(limiter.calls) == 0
     assert limiter.stats_429_count == 0
     assert limiter.stats_wait_time == 0.0
@@ -223,6 +223,9 @@ def test_no_break_on_full_window():
         return [_token(tid) for tid in tids]
 
     def fake_dossier(t, limiter=None, deadline=None):
+        if limiter:
+            limiter.wait_if_needed(priority=True)
+            limiter.spend(1, priority=True)
         dossier_calls.append((clock.time(), t["tid"]))
         return _ok_dossier(t)
 

@@ -57,7 +57,7 @@ class GTRateLimiter:
         if min_spacing_sec is None:
             min_spacing_sec = 60.0 / calls_per_min
         self.min_spacing_sec = min_spacing_sec
-        self.last_call_time = 0.0  # timestamp of last call for spacing enforcement
+        self.last_call_time = None  # timestamp of last call; None = no call yet
         self.cycle_deadline = None  # optional per-cycle wait deadline (F5)
         
         # Universe scan budget tracking (separate from dossier budget)
@@ -122,7 +122,7 @@ class GTRateLimiter:
         self.backoff_until = 0.0
         self.consecutive_429s = 0
         self.saturated = False
-        self.last_call_time = 0.0
+        self.last_call_time = None
         self.cycle_deadline = None
         self.universe_budget = 999999
         self.universe_calls_used = 0
@@ -156,7 +156,7 @@ class GTRateLimiter:
             now = self.time_fn()
         
         # Second, enforce minimum spacing between calls
-        if self.last_call_time > 0:
+        if self.last_call_time is not None:
             time_since_last = now - self.last_call_time
             if time_since_last < self.min_spacing_sec:
                 spacing_wait = self.min_spacing_sec - time_since_last
