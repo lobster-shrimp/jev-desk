@@ -38,10 +38,11 @@ class GTRateLimiter:
     
     def __init__(self, calls_per_min: int = 8, window_sec: float = 60.0, time_fn=None,
                  backoff_floor_sec: float = 25.0, backoff_max_sec: float = 120.0,
-                 min_spacing_sec: float | None = None):
+                 min_spacing_sec: float | None = None, sleep_fn=None):
         self.calls_per_min = calls_per_min
         self.window_sec = window_sec
         self.time_fn = time_fn or time.time
+        self.sleep_fn = sleep_fn or time.sleep
         self.calls = deque()  # timestamps of calls in the window
         self.reserved = 0     # slots reserved for dossiers
         self.backoff_until = 0.0  # timestamp until which we must wait due to 429
@@ -112,22 +113,39 @@ class GTRateLimiter:
         self.stats_429_count = 0
         self.stats_wait_time = 0.0
     
-    def wait_if_needed(self, priority: bool = False):
+    def reset_for_test(self):
+        """Reset limiter state for test isolation. Clears calls, stats, and last_call_time."""
+        self.calls.clear()
+        self.reserved = 0
+        self.backoff_until = 0.0
+        self.consecutive_429s = 0
+        self.saturated = False
+        self.last_call_time = 0.0
+        self.universe_budget = 999999
+        self.universe_calls_used = 0
+        self.stats_429_count = 0
+        self.stats_wait_time = 0.0
+    
+    def wait_if_needed(self, priority: bool = False, deadline: float | None = None):
         """Block until a call can be made within rate limits.
         
         If priority=True (dossier), can use reserved slots.
         If priority=False (universe), cannot use reserved slots.
         
         Also waits out any 429 backoff period and enforces minimum spacing between calls.
-        Returns immediately if a slot is available, no backoff is active, and spacing is met."""
+        If deadline is provided, returns False if waiting would exceed deadline; caller should defer token.
+        Returns True if a slot was acquired, False if deadline would be exceeded."""
         now = self.time_fn()
         wait_start = now
         
         # First, wait out any 429 backoff period
         if self.backoff_until > now:
             wait_sec = self.backoff_until - now
+            # Check deadline
+            if deadline is not None and (now + wait_sec) > deadline:
+                return False
             log.info("GT 429 backoff: waiting %.1fs before retry", wait_sec)
-            time.sleep(wait_sec)
+            self.sleep_fn(wait_sec)
             now = self.time_fn()
         
         # Second, enforce minimum spacing between calls
@@ -135,37 +153,39 @@ class GTRateLimiter:
             time_since_last = now - self.last_call_time
             if time_since_last < self.min_spacing_sec:
                 spacing_wait = self.min_spacing_sec - time_since_last
+                # Check deadline
+                if deadline is not None and (now + spacing_wait) > deadline:
+                    return False
                 log.debug("GT pacing: waiting %.1fs for min spacing (%.1fs between calls)", 
                          spacing_wait, self.min_spacing_sec)
-                time.sleep(spacing_wait)
+                self.sleep_fn(spacing_wait)
                 now = self.time_fn()
         
-        # Then check rolling window rate limits
+        # Then check rolling window rate limits - loop until slot is free
         self._expire_old_calls()
         
         # Determine effective limit based on priority
         effective_limit = self.calls_per_min if priority else (self.calls_per_min - self.reserved)
         
-        if len(self.calls) < effective_limit:
-            # Track total wait time for stats
-            total_wait = now - wait_start
-            if total_wait > 0.01:  # Only count waits > 10ms
-                self.stats_wait_time += total_wait
-            return
-        
-        # Wait until the oldest call expires
-        wait_until = self.calls[0] + self.window_sec
-        wait_sec = max(0, wait_until - now)
-        if wait_sec > 0:
-            log.info("GT rate limit: waiting %.1fs for slot", wait_sec)
-            time.sleep(wait_sec)
-            self._expire_old_calls()
+        while len(self.calls) >= effective_limit:
+            # Wait until the oldest call expires, with small buffer to avoid boundary issues
+            wait_until = self.calls[0] + self.window_sec + 0.01
+            wait_sec = max(0, wait_until - now)
+            if wait_sec > 0:
+                # Check deadline
+                if deadline is not None and (now + wait_sec) > deadline:
+                    return False
+                log.info("GT rate limit: waiting %.1fs for slot", wait_sec)
+                self.sleep_fn(wait_sec)
+                now = self.time_fn()
+                self._expire_old_calls()
         
         # Track total wait time for stats
-        now = self.time_fn()
         total_wait = now - wait_start
         if total_wait > 0.01:
             self.stats_wait_time += total_wait
+        
+        return True
     
     def record_success(self):
         """Record a successful API call. Clears saturated flag and resets consecutive 429 counter."""
@@ -273,7 +293,8 @@ def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None,
     
     if limiter:
         # Wait BEFORE spending to avoid burst after backoff
-        limiter.wait_if_needed(priority=priority)
+        if not limiter.wait_if_needed(priority=priority):
+            return None, True  # Would exceed deadline
         if not limiter.spend(1, priority=priority):
             return None, True  # budget exhausted, but continue other feeds
     
@@ -296,9 +317,12 @@ def _gt_call_with_retry(url: str, params: dict, limiter: GTRateLimiter | None,
             if not retry_on_429:
                 return None, False  # non-retryable feed, stop
             
-            # Retry once after backoff (wait_if_needed will honor the recorded backoff)
+            # Retry once after backoff (F4: pace the retry through spend)
             if limiter:
-                limiter.wait_if_needed(priority=priority)
+                if not limiter.wait_if_needed(priority=priority):
+                    return None, False  # Would exceed deadline
+                if not limiter.spend(1, priority=priority):
+                    return None, False  # budget exhausted after backoff
             else:
                 # No limiter, manual backoff
                 backoff = retry_after_sec if retry_after_sec is not None else 60.0
@@ -855,24 +879,8 @@ def _normalize_authority(raw_value) -> tuple[bool | None, str | None]:
 def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
     """One GT call per token. Fills what the chain actually has, null where it does not.
     
-    If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
+    Note: caller is responsible for rate limiting (wait_if_needed + spend).
     On GT 429, records the backoff with the limiter and raises DossierRetryNeeded."""
-    if limiter:
-        # Wait for any 429 backoff BEFORE spending a slot (order matters!)
-        # This ensures young in-cycle retries honor the backoff period set by record_429()
-        wait_start = limiter.time_fn()
-        limiter.wait_if_needed(priority=True)
-        wait_duration = limiter.time_fn() - wait_start
-        
-        # Log actual wait duration if we waited
-        if wait_duration >= 0.1:  # only log waits >= 100ms
-            log.info("dossier for %s waited %.1fs for GT rate limit/429 backoff", 
-                     t["ticker"], wait_duration)
-        
-        if not limiter.spend(1, priority=True):
-            log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
-            raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
-    
     net = GT_NET[t["net"]]
     resp = requests.get(f"{GT}/networks/{net}/tokens/{t['addr']}/info", headers=UA, timeout=20)
     if resp.status_code == 429:

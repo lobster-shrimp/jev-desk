@@ -36,11 +36,15 @@ CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"
 CYCLE_SECONDS = 900
 GT_CALLS_PER_MIN = int(os.environ.get("GT_CALLS_PER_MIN", "5"))  # ~5/min for keyless GT
 GT_MIN_SPACING_SEC = float(os.environ.get("GT_MIN_SPACING_SEC", str(60.0 / GT_CALLS_PER_MIN)))  # ~12s between calls
-GT_DOSSIER_RESERVE = 3      # reserve this many slots for dossiers before calling universe
+GT_DOSSIER_RESERVE = max(1, GT_CALLS_PER_MIN - 4) if GT_CALLS_PER_MIN >= 5 else 1  # reserve 1 for dossiers (5/min -> 1, 10/min -> 6)
 GT_UNIVERSE_BUDGET = int(os.environ.get("GT_UNIVERSE_BUDGET", "5"))  # universe scan budget per cycle
 CYCLE_TIME_BUDGET_SEC = float(os.environ.get("CYCLE_TIME_BUDGET_SEC", "660"))  # ~11 minutes per cycle
 DEX_BUDGET    = int(os.environ.get("DEX_BUDGET", "60"))  # DexScreener calls per cycle, raised from 25
 log = logging.getLogger("desk")
+
+# Injectable clock and sleep for tests (module-level so tests can patch)
+_now = time.time
+_sleep = time.sleep
 
 # Shared GT rate limiter for the entire process (not per-cycle)
 _gt_limiter = GTRateLimiter(calls_per_min=GT_CALLS_PER_MIN, min_spacing_sec=GT_MIN_SPACING_SEC)
@@ -71,7 +75,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     log.info("cycle start: mode=%s judge=%s", mode_str, judge_str)
     
     # Track cycle start time and budget
-    cycle_start = time.time()
+    cycle_start = _now()
     cycle_deadline = cycle_start + cycle_time_budget
     
     # Clear Solana owner cache at start of each cycle
@@ -98,12 +102,14 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
 
     stats = {"seen": 0, "benched": 0, "free": {}, "trade": {},
              "chain": {}, "soft": {}, "judged": 0, "tokens": [], "requeued": 0,
-             "gt_universe": 0, "gt_dossier": 0, "gt_retry": 0,
+             "gt_universe": 0, "gt_dossier_attempts": 0, "gt_dossier_ok": 0, "gt_retry": 0,
              "free_passed": 0, "dossiered": 0}
     survivors = []
     dex_slots = DEX_BUDGET
     dex_degraded = False  # track DexScreener health
     free_passers = []  # tokens that passed free checks (for circuit breaker)
+    budget_exhausted = False  # track if Dex or time budget exhausted
+    carry_candidates = []  # free-passers after budget exhaustion
     
     # Use shared GT rate limiter (default to global singleton)
     if gt_limiter is None:
@@ -254,32 +260,26 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         free_passers.append(t)
         stats["free_passed"] += 1
 
-        # Check DexScreener budget (no waiting, just carry if exhausted)
+        # If budget exhausted, collect for carry and continue with next token
+        if budget_exhausted:
+            carry_candidates.append(t)
+            continue
+        
+        # Check DexScreener budget (no waiting, just set flag and continue)
         if dex_slots <= 0:
-            # DexScreener budget exhausted - carry remaining tokens
-            unevaluated = age_prioritized[idx:]  # Include current token
-            unprocessed_tids = [t["tid"] for t in unevaluated]
-            processed_tids = [tid for tid in processed_tids if tid not in unprocessed_tids]
-            
-            if unevaluated:
-                log.info("DexScreener budget exhausted: carrying %d ids (dex_slots=0)",
-                         len(unevaluated))
-                book.save_carry(unprocessed_tids)
-            break
+            log.info("DexScreener budget exhausted at token %d, switching to carry mode", idx + 1)
+            budget_exhausted = True
+            carry_candidates.append(t)
+            continue
         
         # Check cycle time budget before proceeding (leave headroom for judge/pick)
-        time_remaining = cycle_deadline - time.time()
+        time_remaining = cycle_deadline - _now()
         if time_remaining < 60:  # Need at least 60s for judge/pick phase
-            # Time budget exhausted - carry remaining tokens
-            unevaluated = age_prioritized[idx:]  # Include current token
-            unprocessed_tids = [t["tid"] for t in unevaluated]
-            processed_tids = [tid for tid in processed_tids if tid not in unprocessed_tids]
-            
-            if unevaluated:
-                log.info("cycle time budget exhausted: carrying %d ids (%.1fs remaining, need 60s for judge)",
-                         len(unevaluated), time_remaining)
-                book.save_carry(unprocessed_tids)
-            break
+            log.info("cycle time budget exhausted at token %d, switching to carry mode (%.1fs remaining)", 
+                     idx + 1, time_remaining)
+            budget_exhausted = True
+            carry_candidates.append(t)
+            continue
         
         # Defer row cleared only after we confirm we're processing this token
         book.forget_defer(t["tid"])
@@ -385,8 +385,30 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         try:
             d = None
             try:
+                stats["gt_dossier_attempts"] += 1  # Track attempt before call
+                # Check deadline before waiting (F5)
+                time_before_wait = _now()
+                if not gt_limiter.wait_if_needed(priority=True, deadline=cycle_deadline - 60):
+                    # Would exceed deadline, defer this token
+                    log.info("dossier for %s would exceed deadline, deferring", t["ticker"])
+                    now = _now()
+                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                    book.defer(t["tid"], now, drop_at)
+                    stats["requeued"] += 1
+                    record(t, "chain", "deferred_deadline")
+                    continue
+                if not gt_limiter.spend(1, priority=True):
+                    # Budget exhausted after wait
+                    log.warning("GT budget exhausted after wait for %s", t["ticker"])
+                    now = _now()
+                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                    book.defer(t["tid"], now, drop_at)
+                    stats["requeued"] += 1
+                    record(t, "chain", "requeued_budget")
+                    continue
+                
                 d = dossier(t, limiter=gt_limiter)   # pass three: one GeckoTerminal slot (budget-aware)
-                stats["gt_dossier"] += 1  # Track GT dossier call
+                stats["gt_dossier_ok"] += 1  # Track successful dossier
                 stats["dossiered"] += 1  # Track successfully dossiered tokens
             except DossierRetryNeeded as e:
                 log.info("dossier retry needed for %s (age %.1fm): %s", 
@@ -408,9 +430,28 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                             time.sleep(wait_needed)
                             
                             try:
-                                d = dossier(t, limiter=gt_limiter)
+                                stats["gt_dossier_attempts"] += 1  # Track retry attempt
                                 stats["gt_retry"] += 1  # Track GT retry attempt
-                                stats["gt_dossier"] += 1  # Also count as dossier call
+                                # Check deadline before retry wait
+                                if not gt_limiter.wait_if_needed(priority=True, deadline=cycle_deadline - 60):
+                                    log.info("young token %s retry would exceed deadline, deferring", t["ticker"])
+                                    now = _now()
+                                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                                    book.defer(t["tid"], now, drop_at)
+                                    stats["requeued"] += 1
+                                    record(t, "chain", "requeued_deadline")
+                                    continue
+                                if not gt_limiter.spend(1, priority=True):
+                                    log.info("young token %s retry budget exhausted, deferring", t["ticker"])
+                                    now = _now()
+                                    drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                                    book.defer(t["tid"], now, drop_at)
+                                    stats["requeued"] += 1
+                                    record(t, "chain", "requeued_budget")
+                                    continue
+                                
+                                d = dossier(t, limiter=gt_limiter)
+                                stats["gt_dossier_ok"] += 1  # Also count as successful dossier
                                 stats["dossiered"] += 1  # Successfully dossiered
                                 log.info("young token %s dossier succeeded on in-cycle retry after %.1fs wait", 
                                          t["ticker"], wait_needed)
@@ -444,9 +485,28 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                         log.info("young token %s (age %.1fm) retrying dossier (no backoff)", 
                                  t["ticker"], t.get("age_minutes", 0))
                         try:
-                            d = dossier(t, limiter=gt_limiter)
+                            stats["gt_dossier_attempts"] += 1  # Track retry attempt
                             stats["gt_retry"] += 1  # Track GT retry attempt
-                            stats["gt_dossier"] += 1  # Also count as dossier call
+                            # Check deadline before retry
+                            if not gt_limiter.wait_if_needed(priority=True, deadline=cycle_deadline - 60):
+                                log.info("young token %s retry would exceed deadline, deferring", t["ticker"])
+                                now = _now()
+                                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                                book.defer(t["tid"], now, drop_at)
+                                stats["requeued"] += 1
+                                record(t, "chain", "requeued_deadline")
+                                continue
+                            if not gt_limiter.spend(1, priority=True):
+                                log.info("young token %s retry budget exhausted, deferring", t["ticker"])
+                                now = _now()
+                                drop_at = now + max(0, (HARD["max_age_hours"] * 60 - t["age_minutes"]) * 60)
+                                book.defer(t["tid"], now, drop_at)
+                                stats["requeued"] += 1
+                                record(t, "chain", "requeued_budget")
+                                continue
+                            
+                            d = dossier(t, limiter=gt_limiter)
+                            stats["gt_dossier_ok"] += 1  # Also count as successful dossier
                             stats["dossiered"] += 1  # Successfully dossiered
                             log.info("young token %s dossier succeeded on immediate retry", t["ticker"])
                         except DossierRetryNeeded as retry_e:
@@ -571,8 +631,21 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Clear carry for all processed tokens (any outcome: benched, killed, deferred, evaluated)
     book.clear_carry(processed_tids)
     
+    # Save carry candidates (free-passers after budget exhaustion) in priority order
+    if carry_candidates:
+        # Cap at 60, keep highest priority (first in age_prioritized order)
+        carry_tids = [t["tid"] for t in carry_candidates[:60]]
+        dropped = len(carry_candidates) - len(carry_tids)
+        
+        log.info("unevaluated %d ids (dex_slots=%d, time_remaining=%.1fs)",
+                 len(carry_candidates), dex_slots, max(0, cycle_deadline - _now()))
+        book.save_carry(carry_tids)
+        
+        if dropped > 0:
+            log.info("carry cap: saved %d, dropped %d lowest-priority", len(carry_tids), dropped)
+    
     # Calculate cycle duration and GT stats
-    cycle_duration = time.time() - cycle_start
+    cycle_duration = _now() - cycle_start
     
     # Count universe GT calls (from limiter's universe budget usage)
     stats["gt_universe"] = gt_limiter.universe_calls_used
@@ -580,15 +653,17 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Get carried count
     unevaluated_count = len(book.get_carry())
     
-    # Comprehensive cycle logging
+    # Keep existing log line for external monitoring (F6)
+    log.info("cycle: %(seen)s seen, %(benched)s benched, free %(free)s, "
+             "trade %(trade)s, chain %(chain)s, soft %(soft)s, judged %(judged)s, requeued %(requeued)s", stats)
+    
+    # New comprehensive cycle logging
     log.info("cycle summary: seen=%d benched=%d free_passed=%d dossiered=%d judged=%d requeued=%d carried=%d",
              stats["seen"], stats["benched"], stats["free_passed"], 
              stats["dossiered"], stats["judged"], stats["requeued"], unevaluated_count)
-    log.info("cycle GT calls: universe=%d dossier=%d retry=%d 429s=%d wait_time=%.1fs",
-             stats["gt_universe"], stats["gt_dossier"], stats["gt_retry"],
+    log.info("cycle GT calls: universe=%d dossier_attempts=%d dossier_ok=%d retry=%d 429s=%d wait_time=%.1fs",
+             stats["gt_universe"], stats["gt_dossier_attempts"], stats["gt_dossier_ok"], stats["gt_retry"],
              gt_limiter.stats_429_count, gt_limiter.stats_wait_time)
-    log.info("cycle breakdown: free %s, trade %s, chain %s, soft %s",
-             stats["free"], stats["trade"], stats["chain"], stats["soft"])
     log.info("cycle duration: %.1fs / %.1fs budget", cycle_duration, cycle_time_budget)
 
     if not survivors:
@@ -635,10 +710,10 @@ def main(fomo, judge, desk, shadow=True, once=False):
     # Wire fomo client to desk for health tracking
     desk.fomo_client = fomo
     
-    next_cycle_start = time.time()  # First cycle starts immediately
+    next_cycle_start = _now()  # First cycle starts immediately
     
     while True:
-        cycle_start_actual = time.time()
+        cycle_start_actual = _now()
         try:
             fomo.token()                         # Privy bearer lives ~60 min, refresh it
             order, stats = run_once(fomo, judge, desk, desk.bank(), shadow)
@@ -682,13 +757,13 @@ def main(fomo, judge, desk, shadow=True, once=False):
         
         # Start-to-start scheduling: next cycle starts CYCLE_SECONDS from this cycle's start
         next_cycle_start += CYCLE_SECONDS
-        now = time.time()
+        now = _now()
         sleep_time = next_cycle_start - now
         
         if sleep_time > 0:
             log.info("sleeping %.1fs until next cycle (start-to-start: %.1fs)", 
                      sleep_time, CYCLE_SECONDS)
-            time.sleep(sleep_time)
+            _sleep(sleep_time)
         else:
             log.warning("cycle overran by %.1fs, starting next cycle immediately", -sleep_time)
             next_cycle_start = now  # Reset to avoid drift
