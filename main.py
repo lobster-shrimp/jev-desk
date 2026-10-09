@@ -34,14 +34,16 @@ from thresholds import HARD, SOFT
 
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
 CYCLE_SECONDS = 900
-GT_CALLS_PER_MIN = int(os.environ.get("GT_CALLS_PER_MIN", "8"))  # conservative default, configurable
+GT_CALLS_PER_MIN = int(os.environ.get("GT_CALLS_PER_MIN", "5"))  # ~5/min for keyless GT
+GT_MIN_SPACING_SEC = float(os.environ.get("GT_MIN_SPACING_SEC", str(60.0 / GT_CALLS_PER_MIN)))  # ~12s between calls
 GT_DOSSIER_RESERVE = 3      # reserve this many slots for dossiers before calling universe
 GT_UNIVERSE_BUDGET = int(os.environ.get("GT_UNIVERSE_BUDGET", "5"))  # universe scan budget per cycle
-DEX_BUDGET    = 25          # DexScreener calls per cycle, pass two only
+CYCLE_TIME_BUDGET_SEC = float(os.environ.get("CYCLE_TIME_BUDGET_SEC", "660"))  # ~11 minutes per cycle
+DEX_BUDGET    = int(os.environ.get("DEX_BUDGET", "60"))  # DexScreener calls per cycle, raised from 25
 log = logging.getLogger("desk")
 
 # Shared GT rate limiter for the entire process (not per-cycle)
-_gt_limiter = GTRateLimiter(calls_per_min=GT_CALLS_PER_MIN)
+_gt_limiter = GTRateLimiter(calls_per_min=GT_CALLS_PER_MIN, min_spacing_sec=GT_MIN_SPACING_SEC)
 
 
 class JudgeDown(Exception):
@@ -63,10 +65,14 @@ def _fmt_evm_exclusions(excluded: list[tuple[str, float, str]]) -> str:
 
 
 def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER_RESERVE, 
-             gt_limiter=None, gt_universe_budget=GT_UNIVERSE_BUDGET):
+             gt_limiter=None, gt_universe_budget=GT_UNIVERSE_BUDGET, cycle_time_budget=CYCLE_TIME_BUDGET_SEC):
     mode_str = "SHADOW" if shadow else "LIVE"
     judge_str = "MOCK" if os.environ.get("JUDGE_MOCK") == "1" else "LIVE"
     log.info("cycle start: mode=%s judge=%s", mode_str, judge_str)
+    
+    # Track cycle start time and budget
+    cycle_start = time.time()
+    cycle_deadline = cycle_start + cycle_time_budget
     
     # Clear Solana owner cache at start of each cycle
     _clear_sol_owner_cache()
@@ -91,7 +97,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         return None, {"held": h["ticker"], "minutes": round(h["minutes"])}
 
     stats = {"seen": 0, "benched": 0, "free": {}, "trade": {},
-             "chain": {}, "soft": {}, "judged": 0, "tokens": [], "requeued": 0}
+             "chain": {}, "soft": {}, "judged": 0, "tokens": [], "requeued": 0,
+             "gt_universe": 0, "gt_dossier": 0, "gt_retry": 0,
+             "free_passed": 0, "dossiered": 0}
     survivors = []
     dex_slots = DEX_BUDGET
     dex_degraded = False  # track DexScreener health
@@ -100,6 +108,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Use shared GT rate limiter (default to global singleton)
     if gt_limiter is None:
         gt_limiter = _gt_limiter
+    
+    # Reset cycle stats
+    gt_limiter.reset_cycle_stats()
     
     # Set universe budget for this cycle (prevents bunching)
     gt_limiter.set_universe_budget(gt_universe_budget)
@@ -239,23 +250,36 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                  t.get("mcap_usd"))
         log.info("defer outcome tid=%s reason=pass", t["tid"])
         
-        # Track free passers for circuit breaker
+        # Track free passers for circuit breaker and stats
         free_passers.append(t)
+        stats["free_passed"] += 1
 
-        if dex_slots <= 0 or gt_limiter.available() <= 0:
-            # Log unevaluated tokens (including current) and carry them to next cycle
-            # Current token passed free but hasn't been trade-checked yet
+        # Check DexScreener budget (no waiting, just carry if exhausted)
+        if dex_slots <= 0:
+            # DexScreener budget exhausted - carry remaining tokens
             unevaluated = age_prioritized[idx:]  # Include current token
-            # Remove unprocessed tail from processed_tids (they're being carried)
             unprocessed_tids = [t["tid"] for t in unevaluated]
             processed_tids = [tid for tid in processed_tids if tid not in unprocessed_tids]
             
             if unevaluated:
-                log.info("unevaluated %d ids (dex_slots=%d, gt_available=%d)",
-                         len(unevaluated), dex_slots, gt_limiter.available())
-                # Store for next cycle carry (prepend to shortlist)
+                log.info("DexScreener budget exhausted: carrying %d ids (dex_slots=0)",
+                         len(unevaluated))
                 book.save_carry(unprocessed_tids)
-            break                                # out of budget, not out of ideas
+            break
+        
+        # Check cycle time budget before proceeding (leave headroom for judge/pick)
+        time_remaining = cycle_deadline - time.time()
+        if time_remaining < 60:  # Need at least 60s for judge/pick phase
+            # Time budget exhausted - carry remaining tokens
+            unevaluated = age_prioritized[idx:]  # Include current token
+            unprocessed_tids = [t["tid"] for t in unevaluated]
+            processed_tids = [tid for tid in processed_tids if tid not in unprocessed_tids]
+            
+            if unevaluated:
+                log.info("cycle time budget exhausted: carrying %d ids (%.1fs remaining, need 60s for judge)",
+                         len(unevaluated), time_remaining)
+                book.save_carry(unprocessed_tids)
+            break
         
         # Defer row cleared only after we confirm we're processing this token
         book.forget_defer(t["tid"])
@@ -362,6 +386,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             d = None
             try:
                 d = dossier(t, limiter=gt_limiter)   # pass three: one GeckoTerminal slot (budget-aware)
+                stats["gt_dossier"] += 1  # Track GT dossier call
+                stats["dossiered"] += 1  # Track successfully dossiered tokens
             except DossierRetryNeeded as e:
                 log.info("dossier retry needed for %s (age %.1fm): %s", 
                          t["ticker"], t.get("age_minutes", 0), e)
@@ -383,6 +409,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                             
                             try:
                                 d = dossier(t, limiter=gt_limiter)
+                                stats["gt_retry"] += 1  # Track GT retry attempt
+                                stats["gt_dossier"] += 1  # Also count as dossier call
+                                stats["dossiered"] += 1  # Successfully dossiered
                                 log.info("young token %s dossier succeeded on in-cycle retry after %.1fs wait", 
                                          t["ticker"], wait_needed)
                             except DossierRetryNeeded as retry_e:
@@ -416,6 +445,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                                  t["ticker"], t.get("age_minutes", 0))
                         try:
                             d = dossier(t, limiter=gt_limiter)
+                            stats["gt_retry"] += 1  # Track GT retry attempt
+                            stats["gt_dossier"] += 1  # Also count as dossier call
+                            stats["dossiered"] += 1  # Successfully dossiered
                             log.info("young token %s dossier succeeded on immediate retry", t["ticker"])
                         except DossierRetryNeeded as retry_e:
                             log.info("young token %s dossier failed on immediate retry, deferring: %s", 
@@ -539,8 +571,25 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Clear carry for all processed tokens (any outcome: benched, killed, deferred, evaluated)
     book.clear_carry(processed_tids)
     
-    log.info("cycle: %(seen)s seen, %(benched)s benched, free %(free)s, "
-             "trade %(trade)s, chain %(chain)s, soft %(soft)s, judged %(judged)s, requeued %(requeued)s", stats)
+    # Calculate cycle duration and GT stats
+    cycle_duration = time.time() - cycle_start
+    
+    # Count universe GT calls (from limiter's universe budget usage)
+    stats["gt_universe"] = gt_limiter.universe_calls_used
+    
+    # Get carried count
+    unevaluated_count = len(book.get_carry())
+    
+    # Comprehensive cycle logging
+    log.info("cycle summary: seen=%d benched=%d free_passed=%d dossiered=%d judged=%d requeued=%d carried=%d",
+             stats["seen"], stats["benched"], stats["free_passed"], 
+             stats["dossiered"], stats["judged"], stats["requeued"], unevaluated_count)
+    log.info("cycle GT calls: universe=%d dossier=%d retry=%d 429s=%d wait_time=%.1fs",
+             stats["gt_universe"], stats["gt_dossier"], stats["gt_retry"],
+             gt_limiter.stats_429_count, gt_limiter.stats_wait_time)
+    log.info("cycle breakdown: free %s, trade %s, chain %s, soft %s",
+             stats["free"], stats["trade"], stats["chain"], stats["soft"])
+    log.info("cycle duration: %.1fs / %.1fs budget", cycle_duration, cycle_time_budget)
 
     if not survivors:
         return None, stats
@@ -586,7 +635,10 @@ def main(fomo, judge, desk, shadow=True, once=False):
     # Wire fomo client to desk for health tracking
     desk.fomo_client = fomo
     
+    next_cycle_start = time.time()  # First cycle starts immediately
+    
     while True:
+        cycle_start_actual = time.time()
         try:
             fomo.token()                         # Privy bearer lives ~60 min, refresh it
             order, stats = run_once(fomo, judge, desk, desk.bank(), shadow)
@@ -627,4 +679,16 @@ def main(fomo, judge, desk, shadow=True, once=False):
             })
         if once:
             return
-        time.sleep(CYCLE_SECONDS)
+        
+        # Start-to-start scheduling: next cycle starts CYCLE_SECONDS from this cycle's start
+        next_cycle_start += CYCLE_SECONDS
+        now = time.time()
+        sleep_time = next_cycle_start - now
+        
+        if sleep_time > 0:
+            log.info("sleeping %.1fs until next cycle (start-to-start: %.1fs)", 
+                     sleep_time, CYCLE_SECONDS)
+            time.sleep(sleep_time)
+        else:
+            log.warning("cycle overran by %.1fs, starting next cycle immediately", -sleep_time)
+            next_cycle_start = now  # Reset to avoid drift

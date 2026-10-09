@@ -32,10 +32,13 @@ class GTRateLimiter:
     
     Supports separate budgets for universe scan vs dossiers to prevent bunching.
     
+    Enforces minimum spacing between ALL calls (universe + dossier) to avoid bursts.
+    
     Shared across the entire process, not per-cycle."""
     
     def __init__(self, calls_per_min: int = 8, window_sec: float = 60.0, time_fn=None,
-                 backoff_floor_sec: float = 25.0, backoff_max_sec: float = 120.0):
+                 backoff_floor_sec: float = 25.0, backoff_max_sec: float = 120.0,
+                 min_spacing_sec: float | None = None):
         self.calls_per_min = calls_per_min
         self.window_sec = window_sec
         self.time_fn = time_fn or time.time
@@ -47,10 +50,21 @@ class GTRateLimiter:
         self.consecutive_429s = 0  # track consecutive 429s for adaptive backoff
         self.saturated = False  # window is saturated after a 429
         
+        # Minimum spacing between calls to avoid bursts (default: 60s / calls_per_min)
+        # Configurable via parameter or env var GT_MIN_SPACING_SEC
+        if min_spacing_sec is None:
+            min_spacing_sec = 60.0 / calls_per_min
+        self.min_spacing_sec = min_spacing_sec
+        self.last_call_time = 0.0  # timestamp of last call for spacing enforcement
+        
         # Universe scan budget tracking (separate from dossier budget)
         # Default to unlimited (999999) so tests without set_universe_budget() don't break
         self.universe_budget = 999999  # set via set_universe_budget() per cycle
         self.universe_calls_used = 0  # reset per cycle
+        
+        # Stats for logging
+        self.stats_429_count = 0  # 429s this cycle
+        self.stats_wait_time = 0.0  # time waited for slots this cycle
     
     def available(self) -> int:
         """How many GT calls can be made without waiting."""
@@ -74,6 +88,7 @@ class GTRateLimiter:
         """
         now = self.time_fn()
         self.consecutive_429s += 1
+        self.stats_429_count += 1  # Track for cycle stats
         self.saturated = True  # mark window as saturated
         
         # Apply floor backoff when Retry-After is 0, missing, or unparseable
@@ -92,15 +107,21 @@ class GTRateLimiter:
         
         self.backoff_until = now + backoff_duration
     
+    def reset_cycle_stats(self):
+        """Reset per-cycle statistics. Called at start of each cycle."""
+        self.stats_429_count = 0
+        self.stats_wait_time = 0.0
+    
     def wait_if_needed(self, priority: bool = False):
         """Block until a call can be made within rate limits.
         
         If priority=True (dossier), can use reserved slots.
         If priority=False (universe), cannot use reserved slots.
         
-        Also waits out any 429 backoff period before checking rate limits.
-        Returns immediately if a slot is available and no backoff is active."""
+        Also waits out any 429 backoff period and enforces minimum spacing between calls.
+        Returns immediately if a slot is available, no backoff is active, and spacing is met."""
         now = self.time_fn()
+        wait_start = now
         
         # First, wait out any 429 backoff period
         if self.backoff_until > now:
@@ -109,6 +130,16 @@ class GTRateLimiter:
             time.sleep(wait_sec)
             now = self.time_fn()
         
+        # Second, enforce minimum spacing between calls
+        if self.last_call_time > 0:
+            time_since_last = now - self.last_call_time
+            if time_since_last < self.min_spacing_sec:
+                spacing_wait = self.min_spacing_sec - time_since_last
+                log.debug("GT pacing: waiting %.1fs for min spacing (%.1fs between calls)", 
+                         spacing_wait, self.min_spacing_sec)
+                time.sleep(spacing_wait)
+                now = self.time_fn()
+        
         # Then check rolling window rate limits
         self._expire_old_calls()
         
@@ -116,15 +147,25 @@ class GTRateLimiter:
         effective_limit = self.calls_per_min if priority else (self.calls_per_min - self.reserved)
         
         if len(self.calls) < effective_limit:
+            # Track total wait time for stats
+            total_wait = now - wait_start
+            if total_wait > 0.01:  # Only count waits > 10ms
+                self.stats_wait_time += total_wait
             return
         
         # Wait until the oldest call expires
         wait_until = self.calls[0] + self.window_sec
         wait_sec = max(0, wait_until - now)
         if wait_sec > 0:
-            log.info("GT pace: waited %.1fs", wait_sec)
+            log.info("GT rate limit: waiting %.1fs for slot", wait_sec)
             time.sleep(wait_sec)
             self._expire_old_calls()
+        
+        # Track total wait time for stats
+        now = self.time_fn()
+        total_wait = now - wait_start
+        if total_wait > 0.01:
+            self.stats_wait_time += total_wait
     
     def record_success(self):
         """Record a successful API call. Clears saturated flag and resets consecutive 429 counter."""
@@ -135,13 +176,17 @@ class GTRateLimiter:
         """Try to spend `cost` slots. Returns True if budget available, False otherwise.
         
         Does NOT block - use wait_if_needed() before calling this if you want blocking behavior.
-        This is for backwards compatibility with tests that check budget without waiting."""
+        This is for backwards compatibility with tests that check budget without waiting.
+        
+        Records last_call_time for spacing enforcement."""
         self._expire_old_calls()
         effective_limit = self.calls_per_min if priority else (self.calls_per_min - self.reserved)
         
         if len(self.calls) + cost <= effective_limit:
+            now = self.time_fn()
             for _ in range(cost):
-                self.calls.append(self.time_fn())
+                self.calls.append(now)
+            self.last_call_time = now  # Record for spacing enforcement
             log.debug("GT budget: spent %d, %d available", cost, self.available())
             return True
         log.warning("GT budget exhausted: tried to spend %d, only %d available", cost, self.available())
