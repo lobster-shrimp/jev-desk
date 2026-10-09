@@ -1724,16 +1724,13 @@ def test_universe_uses_limiter():
     requests.get = mock_get
     
     try:
-        # Limiter with only 3 slots (should stop early)
-        fake_time = [0.0]
-        # Add fake sleep to prevent real sleeping
-        limiter = collect.GTRateLimiter(calls_per_min=3, time_fn=lambda: fake_time[0], 
-                                        sleep_fn=lambda d: fake_time.__setitem__(0, fake_time[0] + d))
+        # Universe budget of 3 pages (rolling window will wait, not hard-stop)
+        limiter, _ = _paced_limiter(calls_per_min=10)
+        limiter.set_universe_budget(3)
         ids, gt_cache = collect.universe(nets=("solana",), pages=5, include_trending=True, limiter=limiter)
         
-        # Should have made at most 3 calls (budget exhausted)
+        # Should have made at most 3 calls (universe budget exhausted)
         assert call_count[0] <= 3
-        assert limiter.available() == 0
     finally:
         requests.get = original_get
 
@@ -1763,12 +1760,16 @@ def test_dossier_budget_exhausted_raises_retry():
     
     original_get = requests.get
     call_count = [0]
-    requests.get = lambda *args, **kwargs: (call_count.__setitem__(0, call_count[0] + 1), 
-                                            Mock(status_code=200, json=lambda: {"data": {"attributes": {}}}))
+
+    def fake_get(*args, **kwargs):
+        call_count[0] += 1
+        return Mock(status_code=200, json=lambda: {"data": {"attributes": {}}})
+
+    requests.get = fake_get
     
     try:
-        limiter, fake_time = _paced_limiter(calls_per_min=5)
-        # Exhaust budget
+        # Frozen clock: wait cannot free a slot, so spend fails and GT is not called
+        limiter = collect.GTRateLimiter(calls_per_min=5, time_fn=lambda: 0.0, sleep_fn=lambda d: None)
         for _ in range(5):
             limiter.spend(1, priority=True)
         
