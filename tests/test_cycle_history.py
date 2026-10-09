@@ -79,15 +79,15 @@ def test_record_cycle_persists_required_fields(hist):
     assert c["source"] == "live"
 
 
-def test_gt_429_inferred_from_requeue_reasons(hist):
+def test_gt_defer_separate_from_gt_429(hist):
     stats = _stats(tokens=[
         {"tid": "a:1399811149", "stage": "chain", "reason": "requeued_429_backoff"},
         {"tid": "b:56", "stage": "chain", "reason": "requeued"},
         {"tid": "c:56", "stage": "chain", "reason": "top_wallet"},
-    ], requeued=2)
+    ], requeued=2, gt_429=5)
     hist.on_cycle(stats, now=ts(2026, 10, 9, 8), source="backfill")
     c = hist.cycles_since(0)[0]
-    assert c["gt_429"] == 2
+    assert c["gt_429"] == 5
     assert c["gt_defer"] == 2
 
 
@@ -193,7 +193,7 @@ def test_backfill_parses_cycle_and_soft_lines(hist):
 2026-10-08 10:00:07,007 desk INFO cycle: 12 seen, 3 benched, free {'age': 4}, trade {}, chain {'requeued_429_backoff': 1}, soft {'momentum_already_spent': 1}, judged 0, requeued 1
 """
     n = hist.backfill_text(log_text)
-    assert n == 1
+    assert n["inserted"] == 1
     c = hist.cycles_since(0)[0]
     assert c["seen"] == 12
     assert c["benched"] == 3
@@ -214,6 +214,8 @@ def test_backfill_parses_cycle_and_soft_lines(hist):
     assert len(young) == 1
     assert young[0]["outcome"] == "deferred_429"
     assert young[0]["tid"] == "Young1:1399811149"
+    assert c["gt_429"] == 1
+    assert c["gt_defer"] == 1
 
 
 def test_backfill_script_reads_file(hist, tmp_path, caplog):
@@ -257,6 +259,7 @@ def test_briefing_last_24h_summary(hist):
     assert "Morning briefing" in payload["markdown"]
     assert "Solana" in payload["markdown"]
     assert "JK" in payload["markdown"]
+    assert "## Momentum" in payload["markdown"]
     assert "shadow only" in payload["markdown"].lower()
     assert w["shadow"]["fills"] == 0
     assert "picks are not fills" in w["shadow"]["fills_note"]
@@ -337,19 +340,28 @@ def test_trends_flags_notable_changes(hist):
     assert payload["trends"]["days"][-1]["date"] == "2026-10-08"
 
 
-def test_median_momentum_of_judged(hist):
+def test_median_momentum_includes_soft_and_per_chain(hist):
     hist.on_cycle(
         _stats(tokens=[
-            {"tid": "a:1", "stage": "judged", "soft_scores": {"momentum_already_spent": 0.2}},
-            {"tid": "b:1", "stage": "judged", "soft_scores": {"momentum_already_spent": 0.4}},
-            {"tid": "c:1", "stage": "judged", "soft_scores": {"momentum_already_spent": 0.9}},
-            {"tid": "d:1", "stage": "soft", "reason": "momentum_already_spent",
+            {"tid": "a:1399811149", "stage": "judged", "chain": "solana",
+             "soft_scores": {"momentum_already_spent": 0.2}},
+            {"tid": "b:1399811149", "stage": "judged", "chain": "solana",
+             "soft_scores": {"momentum_already_spent": 0.4}},
+            {"tid": "c:56", "stage": "judged", "chain": "bsc",
+             "soft_scores": {"momentum_already_spent": 0.9}},
+            {"tid": "d:1399811149", "stage": "soft", "chain": "solana",
+             "reason": "momentum_already_spent",
              "soft_noul": 0.99, "soft_scores": {"momentum_already_spent": 0.99}},
         ], judged=3),
         now=ts(2026, 10, 9, 8), source="backfill",
     )
     w = hist.summarize_window(0, ts(2026, 10, 9, 9))
-    assert w["median_momentum"] == pytest.approx(0.4)
+    # judged 0.2/0.4/0.9 plus soft 0.99 → median (0.4+0.9)/2
+    assert w["median_momentum"] == pytest.approx(0.65)
+    assert w["median_momentum_soft"] == pytest.approx(0.99)
+    assert w["median_momentum_solana"] == pytest.approx(0.4)
+    assert w["median_momentum_by_chain"]["solana"] == pytest.approx(0.4)
+    assert w["median_momentum_by_chain"]["bsc"] == pytest.approx(0.9)
 
 
 def test_shadow_pnl_in_briefing(hist, tmp_path, monkeypatch):
@@ -529,10 +541,12 @@ def test_ops_html_has_briefing_and_trends():
     html = resp.text
     assert 'id="briefing-panel"' in html
     assert 'id="trends-panel"' in html
+    assert 'id="briefing-momentum"' in html
     assert "/ops/briefing" in html
     assert "renderBriefing" in html
     assert "renderTrends" in html
     assert "Solana only" in html
+    assert "insufficient history" in html
     assert "Young free-pass" in html or "young free-pass" in html.lower()
 
 
@@ -541,6 +555,9 @@ def test_briefing_payload_empty_store(hist):
     assert payload["last_24h"]["cycles"] == 0
     assert payload["markdown"].startswith("# Morning briefing")
     assert payload["trends"]["days"]
+    assert payload["trends"]["insufficient_history"] is True
+    assert payload["trends"]["flags"] == []
+    assert "insufficient history" in payload["markdown"]
 
 
 def test_no_env_leak_in_briefing_md(hist, monkeypatch):
@@ -551,3 +568,243 @@ def test_no_env_leak_in_briefing_md(hist, monkeypatch):
     assert "ts-should-never-appear" not in md
     assert "desk-secret-should-never-appear" not in md
     assert ".env" not in md
+
+
+# ---------------------------------------------------------------------------
+# Review 1 fixes F1–F6
+# ---------------------------------------------------------------------------
+
+_CYCLE_LINE = (
+    "2026-10-08 11:00:00,000 desk INFO cycle: 12 seen, 3 benched, "
+    "free {'age': 4, 'pass': 8}, trade {}, chain {}, soft {}, judged 0, requeued 0\n"
+)
+
+
+def test_backfill_idempotent_does_not_double_count(hist):
+    first = hist.backfill_text(_CYCLE_LINE)
+    second = hist.backfill_text(_CYCLE_LINE)
+    assert first["inserted"] == 1
+    assert second["inserted"] == 0
+    assert second["skipped"] == 1
+    rows = hist.cycles_since(0)
+    assert len(rows) == 1
+    assert rows[0]["seen"] == 12
+    w = hist.summarize_window(0, ts(2026, 10, 9, 9))
+    assert w["cycles"] == 1
+    assert w["seen"] == 12
+
+
+def test_backfill_skips_live_captured_cycle(hist):
+    live_ts = time.mktime(time.strptime("2026-10-08 11:00:00", "%Y-%m-%d %H:%M:%S"))
+    cid = hist.on_cycle(_stats(seen=99, judged=3), now=live_ts, source="live")
+    assert cid is not None
+    result = hist.backfill_text(_CYCLE_LINE)
+    assert result["inserted"] == 0
+    assert result["skipped"] == 1
+    rows = hist.cycles_since(0)
+    assert len(rows) == 1
+    assert rows[0]["source"] == "live"
+    assert rows[0]["seen"] == 99
+    assert rows[0]["judged"] == 3
+
+
+def test_backfill_parses_ticker_with_spaces(hist):
+    log_text = """
+2026-10-08 10:00:03,003 desk INFO chain tid=Spc1:1399811149 ticker=Hello World reason=top_wallet
+2026-10-08 10:00:04,004 desk INFO soft tid=Spc2:56 ticker=Hello World reason=momentum_already_spent noul=0.68 age_minutes=44 top_10_percent=31 top_wallet_percent=0.02 developer_holding_percentage=3 holder_count=190 rpc_ok=True soft_scores={'momentum_already_spent': 0.68}
+2026-10-08 10:00:07,007 desk INFO cycle: 4 seen, 0 benched, free {}, trade {}, chain {'top_wallet': 1}, soft {'momentum_already_spent': 1}, judged 0, requeued 0
+"""
+    result = hist.backfill_text(log_text)
+    assert result["inserted"] == 1
+    tokens = hist._tokens_since(0)
+    soft = [t for t in tokens if t["kind"] == "soft"]
+    assert len(soft) == 1
+    assert soft[0]["ticker"] == "Hello World"
+    parsed, _meta = hist.parse_run_log(log_text)
+    later = parsed[0]["stats"]["tokens"]
+    chain_rows = [t for t in later if t.get("stage") == "chain"]
+    assert any(t.get("ticker") == "Hello World" for t in chain_rows)
+
+
+def test_backfill_reports_unparsed_lines(hist):
+    log_text = """
+2026-10-08 10:00:04,004 desk INFO soft tid=Broken:56 this line has no ticker= reason= fields
+2026-10-08 10:00:05,005 desk INFO chain tid=Broken2:56 missing ticker field entirely
+2026-10-08 10:00:07,007 desk INFO cycle: 2 seen, 0 benched, free {}, trade {}, chain {}, soft {}, judged 0, requeued 0
+"""
+    result = hist.backfill_text(log_text)
+    assert result["inserted"] == 1
+    assert result["unparsed_soft"] == 1
+    assert result["unparsed_chain"] == 1
+    assert result["unparsed"] == 2
+
+
+def test_kill_mix_excludes_free_pass(hist):
+    hist.on_cycle(
+        _stats(
+            seen=20, benched=0, judged=0,
+            free={"pass": 8, "age": 1},
+            trade={}, chain={}, soft={},
+        ),
+        now=ts(2026, 10, 9, 8), source="backfill",
+    )
+    w = hist.summarize_window(0, ts(2026, 10, 9, 9))
+    assert "pass" not in w["kills"]["free"]
+    assert w["kills"]["free"] == {"age": 1}
+    assert w["kill_mix"]["counts"]["free"] == 1
+    assert w["kill_mix"]["total"] == 1
+    assert w["kill_mix"]["shares"]["free"] == pytest.approx(100.0)
+    md = hist.build_briefing(ts(2026, 10, 9, 9))["markdown"]
+    assert "pass: 8" not in md
+
+
+def test_backfill_gt_429_from_young_hit_429_lines(hist):
+    log_text = """
+2026-10-08 10:00:01,001 desk INFO free tid=Young1:1399811149 reason=pass age_minutes=22.0 liquidity_usd=48000 volume_usd=610000 mcap_usd=300000
+2026-10-08 10:00:02,002 desk INFO young token Hello World (age 22.0m) hit 429, backoff 45.0s > cap 30.0s, deferring
+2026-10-08 10:00:02,500 desk INFO young token Other (age 18.0m) hit 429, backoff 45.0s > cap 30.0s, deferring
+2026-10-08 10:00:03,003 desk INFO chain tid=Young1:1399811149 ticker=Hello World reason=requeued_429_backoff age_minutes=22.0
+2026-10-08 10:00:07,007 desk INFO cycle: 6 seen, 1 benched, free {'pass': 1}, trade {}, chain {'requeued_429_backoff': 1}, soft {}, judged 0, requeued 1
+"""
+    result = hist.backfill_text(log_text)
+    assert result["inserted"] == 1
+    c = hist.cycles_since(0)[0]
+    assert c["gt_429"] == 2
+    assert c["gt_defer"] == 1
+    w = hist.summarize_window(0, ts(2026, 10, 9, 9))
+    assert w["gt_429"] == 2
+    assert w["gt_defer"] == 1
+
+
+def test_limiter_stats_429_count_increments_and_resets():
+    import collect
+    fake_time = [1000.0]
+    limiter = collect.GTRateLimiter(calls_per_min=8, time_fn=lambda: fake_time[0])
+    assert limiter.stats_429_count == 0
+    limiter.record_429(retry_after_sec=1.0)
+    limiter.record_429(retry_after_sec=1.0)
+    assert limiter.stats_429_count == 2
+    limiter.set_universe_budget(5)
+    assert limiter.stats_429_count == 0
+
+
+def test_run_once_records_limiter_gt_429(hist, monkeypatch):
+    import book
+    import collect
+    import main as shift
+
+    book.release()
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+
+    tid = f"LimAddr:{1399811149}"
+    limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: 10_000.0)
+
+    def fake_shortlist(fomo, id_list):
+        return [{
+            "addr": "LimAddr", "net": 1399811149, "tid": tid, "ticker": "LIM",
+            "mcap_usd": 300_000, "liquidity_usd": 48_000, "volume_h24": 610_000,
+            "price_usd": 0.001, "holder_count": 310,
+            "change": {"5m": 0.04, "1h": 0.22, "4h": 0.4, "24h": 0.61},
+            "age_minutes": 42, "chain": "solana",
+        }]
+
+    def fake_judge(question_set, state):
+        if question_set == "market":
+            return {"model": "test", "answers": {
+                "concentration_is_exit_risk": {"type": "noul", "noul": 0.75},
+                "momentum_already_spent": {"type": "noul", "noul": 0.40},
+            }, "usage": {}}
+        return {"model": "test", "answers": {}, "usage": {}}
+
+    def fake_dossier(t, limiter=None):
+        if limiter is not None:
+            limiter.record_429(retry_after_sec=1.0)
+            limiter.record_429(retry_after_sec=1.0)
+        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+                "developer_holding_percentage": 2, "gt_score_details": None,
+                "is_honeypot": None, "mint_authority": None, "freeze_authority": None,
+                "description": "a token", "x_handle": None, "net": 1399811149}
+
+    monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([tid], {}))
+    monkeypatch.setattr(shift, "shortlist", fake_shortlist)
+    monkeypatch.setattr(collect, "shortlist", fake_shortlist)
+    monkeypatch.setattr(shift, "trade_counts", lambda t, gt_txns_cache=None: (
+        {"buys_h1": 540, "sells_h1": 120, "buys_h6": 900, "sells_h6": 400,
+         "trades_h24": 4000}, "ok"))
+    monkeypatch.setattr(shift, "dossier", fake_dossier)
+
+    class Desk:
+        def bank(self): return 1000.0
+        def read_x(self, h): return None
+        def log_shadow(self, o, s, fomo_data=None): pass
+        def report(self, o, s): pass
+        def send_to_seats(self, o): pass
+
+    order, stats = shift.run_once(
+        type("F", (), {"token": lambda self: None})(),
+        fake_judge, Desk(), 1000.0, shadow=True,
+        gt_dossier_reserve=3, gt_limiter=limiter,
+    )
+    assert order is None
+    assert stats["gt_429"] == 2
+    rows = hist.cycles_since(0)
+    assert len(rows) == 1
+    assert rows[0]["gt_429"] == 2
+    assert rows[0]["gt_defer"] == 0
+
+
+def test_trends_suppressed_without_history(hist):
+    for day in (7, 8):
+        hist.on_cycle(
+            _stats(seen=10, benched=0, judged=1, free={"age": 2}, trade={}, chain={}, soft={}),
+            now=ts(2026, 10, day, 0, 30), source="backfill",
+        )
+    hist.on_cycle(
+        _stats(seen=10, benched=0, judged=12, free={"age": 1}, trade={}, chain={}, soft={}),
+        now=ts(2026, 10, 9, 7, 30), source="backfill",
+    )
+    payload = hist.build_briefing(ts(2026, 10, 9, 8, 0))
+    trends = payload["trends"]
+    assert trends["insufficient_history"] is True
+    assert trends["history_days"] == 2
+    assert trends["flags"] == []
+    assert trends["notable"] == []
+    assert "insufficient history" in payload["markdown"]
+    assert "judged_per_day" not in payload["markdown"]
+
+
+def test_trends_flags_after_three_prior_days(hist):
+    for day in (6, 7, 8):
+        hist.on_cycle(
+            _stats(
+                seen=20, benched=0, judged=4,
+                free={"age": 10}, trade={}, chain={}, soft={},
+                tokens=[{
+                    "tid": f"p{day}:1399811149", "ticker": f"P{day}",
+                    "net": 1399811149, "stage": "judged", "age_minutes": 40,
+                    "soft_scores": {"momentum_already_spent": 0.40},
+                }] * 4,
+            ),
+            now=ts(2026, 10, day, 0, 30), source="backfill",
+        )
+    hist.on_cycle(
+        _stats(
+            seen=20, benched=0, judged=12,
+            free={"age": 1}, trade={}, chain={}, soft={},
+            tokens=[{
+                "tid": f"t{i}:56", "ticker": f"T{i}", "net": 56,
+                "stage": "judged", "age_minutes": 20,
+                "soft_scores": {"momentum_already_spent": 0.15},
+            } for i in range(12)],
+        ),
+        now=ts(2026, 10, 9, 7, 30), source="backfill",
+    )
+    payload = hist.build_briefing(ts(2026, 10, 9, 8, 0))
+    trends = payload["trends"]
+    assert trends["insufficient_history"] is False
+    assert trends["history_days"] == 3
+    by_metric = {f["metric"]: f for f in trends["flags"]}
+    assert by_metric["judged_per_day"]["notable"] is True

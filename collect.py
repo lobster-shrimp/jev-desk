@@ -50,6 +50,7 @@ class GTRateLimiter:
         self.backoff_floor_sec = backoff_floor_sec  # minimum backoff for 0/missing Retry-After
         self.backoff_max_sec = backoff_max_sec  # cap on backoff duration
         self.consecutive_429s = 0  # track consecutive 429s for adaptive backoff
+        self.stats_429_count = 0  # per-cycle GT 429s; reset in set_universe_budget
         self.saturated = False  # window is saturated after a 429
         
         # Minimum spacing between calls to avoid bursts (default: 60s / calls_per_min)
@@ -239,6 +240,7 @@ class GTRateLimiter:
         When exhausted, universe scan stops paging instead of waiting."""
         self.universe_budget = budget
         self.universe_calls_used = 0
+        self.stats_429_count = 0
         log.info("GT universe budget: allocated %d calls for this cycle", budget)
     
     def spend_universe(self, cost: int = 1) -> bool:

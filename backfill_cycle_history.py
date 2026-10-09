@@ -4,8 +4,8 @@ One-off backfill: parse existing outbox/run.log into the cycle-history store.
     python backfill_cycle_history.py
     python backfill_cycle_history.py path/to/run.log
 
-Does not print .env or secrets. Safe to re-run; each invocation inserts another
-copy of parsed cycles, so run once per log.
+Does not print .env or secrets. Safe to re-run: already-stored cycles (live or
+backfill) are skipped by timestamp.
 """
 import argparse
 import logging
@@ -27,11 +27,15 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     try:
         import cycle_history
-        n = cycle_history.backfill_log(args.log_path)
+        result = cycle_history.backfill_log(args.log_path)
     except Exception as e:
         log.error("backfill failed: %s", safe_err(e))
         return 1
-    log.info("backfilled %d cycles", n)
+    log.info(
+        "backfilled %d cycles (skipped %d, unparsed soft=%d chain=%d)",
+        result.get("inserted", 0), result.get("skipped", 0),
+        result.get("unparsed_soft", 0), result.get("unparsed_chain", 0),
+    )
     return 0
 
 

@@ -42,7 +42,10 @@ GT_DEFER_REASONS = frozenset({
 CYCLE_SECONDS = 900
 BRIEFING_HOUR_LOCAL = 7
 TREND_DAYS = 7
+TREND_MIN_PRIOR_DAYS = 3
 MOMENTUM_KEY = "momentum_already_spent"
+NON_KILL_REASONS = frozenset({"pass", "free_passed"})
+CYCLE_DEDUP_SEC = 1.5
 
 # Notable-change gates for the trends section (relative or absolute).
 NOTABLE_JUDGED_REL = 0.30
@@ -173,6 +176,11 @@ def _init_schema(db: sqlite3.Connection) -> None:
       payload_json TEXT NOT NULL
     );
     """)
+    cols = {row[1] for row in db.execute("PRAGMA table_info(cycles)")}
+    if "ts_sec" not in cols:
+        db.execute("ALTER TABLE cycles ADD COLUMN ts_sec INTEGER")
+        db.execute("UPDATE cycles SET ts_sec = CAST(ts AS INTEGER) WHERE ts_sec IS NULL")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cycles_ts_sec ON cycles(ts_sec)")
     db.commit()
 
 
@@ -256,27 +264,61 @@ def _median(values: list[float]) -> float | None:
     return (nums[mid - 1] + nums[mid]) / 2.0
 
 
+def _fmt_mom(value) -> str:
+    if value is None:
+        return "—"
+    return f"{float(value):.3f}"
+
+
+def _fmt_mom_map(mapping) -> str:
+    if not mapping:
+        return "—"
+    parts = [f"{name} {_fmt_mom(val)}" for name, val in sorted(mapping.items())]
+    return ", ".join(parts)
+
+
+def _kill_counts(d: dict | None) -> dict:
+    """Kill-reason histogram without pass / other non-kill keys."""
+    out = {}
+    for k, v in (d or {}).items():
+        if k in NON_KILL_REASONS or not isinstance(v, (int, float)):
+            continue
+        out[str(k)] = int(v)
+    return out
+
+
 def _sum_counts(d: dict | None) -> int:
-    if not d:
-        return 0
-    return int(sum(v for v in d.values() if isinstance(v, (int, float))))
+    return int(sum(_kill_counts(d).values()))
 
 
 def infer_gt_counts(stats: dict) -> tuple[int, int]:
-    """GT 429 / defer counts from token rows and optional explicit stats keys."""
+    """gt_429 is explicit (limiter / young-429 lines). gt_defer is separate."""
     tokens = stats.get("tokens") or []
-    inferred = 0
+    inferred_defer = 0
     for row in tokens:
         reason = row.get("reason") or ""
         if reason in GT_DEFER_REASONS or "429" in str(reason):
-            inferred += 1
+            inferred_defer += 1
     gt_429 = stats.get("gt_429")
     gt_defer = stats.get("gt_defer")
     if gt_429 is None:
-        gt_429 = inferred
+        gt_429 = 0
     if gt_defer is None:
-        gt_defer = inferred
+        gt_defer = inferred_defer
     return int(gt_429), int(gt_defer)
+
+
+def cycle_exists(ts: float) -> bool:
+    """True if a live or backfill cycle is already stored at this timestamp."""
+    try:
+        row = _connect().execute(
+            "SELECT 1 FROM cycles WHERE ts_sec = ? OR ABS(ts - ?) < ? LIMIT 1",
+            (int(ts), float(ts), CYCLE_DEDUP_SEC),
+        ).fetchone()
+        return bool(row)
+    except Exception as e:
+        log.warning("cycle exists check failed: %s", safe_err(e))
+        return False
 
 
 def classify_young_outcome(row: dict | None) -> tuple[str, str | None]:
@@ -344,16 +386,20 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
         return None
     now = time.time() if now is None else float(now)
     mode = "shadow" if shadow else "live"
+    if cycle_exists(now):
+        log.info("cycle history: skip duplicate ts=%.3f source=%s", now, source)
+        _pending_soft.clear()
+        return None
     gt_429, gt_defer = infer_gt_counts(stats)
     tokens = list(stats.get("tokens") or [])
     try:
         db = _connect()
         cur = db.execute(
-            """INSERT INTO cycles (
+            """INSERT OR IGNORE INTO cycles (
                  ts, ts_iso, mode, seen, benched, judged, requeued,
                  free_json, trade_json, chain_json, soft_json,
-                 carry, unevaluated, gt_429, gt_defer, source
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 carry, unevaluated, gt_429, gt_defer, source, ts_sec
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 now, _iso(now), mode,
                 int(stats.get("seen") or 0),
@@ -366,9 +412,13 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
                 _json(stats.get("soft") or {}),
                 int(stats.get("carry") or 0),
                 int(stats.get("unevaluated") or 0),
-                gt_429, gt_defer, source,
+                gt_429, gt_defer, source, int(now),
             ),
         )
+        if cur.rowcount == 0 or cur.lastrowid == 0:
+            log.info("cycle history: skip duplicate ts=%.3f source=%s", now, source)
+            _pending_soft.clear()
+            return None
         cycle_id = int(cur.lastrowid)
         written_tids = set()
         for row in _pending_soft:
@@ -557,10 +607,10 @@ def _merge_counts(*dicts: dict) -> dict:
 
 def _kill_mix(free, trade, chain, soft) -> dict:
     parts = {
-        "free": _sum_counts(free),
-        "trade": _sum_counts(trade),
-        "chain": _sum_counts(chain),
-        "soft": _sum_counts(soft),
+        "free": _sum_counts(_kill_counts(free)),
+        "trade": _sum_counts(_kill_counts(trade)),
+        "chain": _sum_counts(_kill_counts(chain)),
+        "soft": _sum_counts(_kill_counts(soft)),
     }
     total = sum(parts.values())
     shares = {k: (v / total * 100.0 if total else 0.0) for k, v in parts.items()}
@@ -703,13 +753,22 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
     young = _young_since(since_ts, until_ts=now)
     judged = [t for t in tokens if t.get("kind") == "judged"]
     soft = [t for t in tokens if t.get("kind") == "soft"]
-    free = _merge_counts(*(c["free"] for c in cycles))
-    trade = _merge_counts(*(c["trade"] for c in cycles))
-    chain = _merge_counts(*(c["chain"] for c in cycles))
-    soft_kills = _merge_counts(*(c["soft"] for c in cycles))
+    free = _kill_counts(_merge_counts(*(c["free"] for c in cycles)))
+    trade = _kill_counts(_merge_counts(*(c["trade"] for c in cycles)))
+    chain = _kill_counts(_merge_counts(*(c["chain"] for c in cycles)))
+    soft_kills = _kill_counts(_merge_counts(*(c["soft"] for c in cycles)))
     mix = _kill_mix(free, trade, chain, soft_kills)
-    momenta = [_momentum(t) for t in judged]
-    momenta = [m for m in momenta if m is not None]
+    scored = judged + soft
+    momenta = [m for m in (_momentum(t) for t in scored) if m is not None]
+    soft_momenta = [m for m in (_momentum(t) for t in soft) if m is not None]
+    mom_by_chain: dict[str, list[float]] = {}
+    for t in scored:
+        m = _momentum(t)
+        if m is None:
+            continue
+        mom_by_chain.setdefault(t.get("chain") or "unknown", []).append(m)
+    median_by_chain = {k: _median(v) for k, v in mom_by_chain.items()}
+    median_solana = _median(mom_by_chain.get("solana") or [])
     young_outcomes: dict[str, int] = {}
     for y in young:
         young_outcomes[y["outcome"]] = young_outcomes.get(y["outcome"], 0) + 1
@@ -726,6 +785,10 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
         "span_hours": ((cycles[-1]["ts"] - cycles[0]["ts"]) / 3600.0) if len(cycles) >= 2 else 0.0,
     }
     per_chain = _per_chain(tokens, young, cycles)
+    for name, b in (per_chain.get("by_chain") or {}).items():
+        b["median_momentum"] = median_by_chain.get(name)
+    if per_chain.get("solana") is not None:
+        per_chain["solana"]["median_momentum"] = median_solana
     return {
         "since_ts": since_ts,
         "until_ts": now,
@@ -743,6 +806,9 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
         "judged_tokens": judged,
         "soft_tokens": soft,
         "median_momentum": _median(momenta),
+        "median_momentum_soft": _median(soft_momenta),
+        "median_momentum_by_chain": median_by_chain,
+        "median_momentum_solana": median_solana,
         "young_free": young,
         "young_outcomes": young_outcomes,
         "young_free_pass_rate": young_rate,
@@ -822,6 +888,16 @@ def _rel_delta(current, baseline) -> float | None:
 def build_trends(today_window: dict, today: str, *, localtime: Callable | None = None) -> dict:
     dates = _prior_dates(today, TREND_DAYS)
     days = daily_aggregates(dates, localtime=localtime)
+    history_days = sum(1 for d in days if (d.get("cycles") or 0) > 0)
+    if history_days < TREND_MIN_PRIOR_DAYS:
+        return {
+            "today": today,
+            "days": days,
+            "flags": [],
+            "notable": [],
+            "insufficient_history": True,
+            "history_days": history_days,
+        }
     baseline_judged = _mean([d["judged"] for d in days])
     baseline_mom = _mean([d["median_momentum"] for d in days])
     baseline_young = _mean([d["young_free_pass_rate"] for d in days])
@@ -901,6 +977,8 @@ def build_trends(today_window: dict, today: str, *, localtime: Callable | None =
         "days": days,
         "flags": flags,
         "notable": [f for f in flags if f["notable"]],
+        "insufficient_history": False,
+        "history_days": history_days,
     }
 
 
@@ -922,6 +1000,12 @@ def render_briefing_md(payload: dict) -> str:
         f"- Carry {w.get('carry', 0)} · unevaluated {w.get('unevaluated', 0)} "
         f"· GT 429s {w.get('gt_429', 0)} · GT defers {w.get('gt_defer', 0)}",
         "",
+        "## Momentum",
+        f"- Median (judged+soft): {_fmt_mom(w.get('median_momentum'))}",
+        f"- Soft-only: {_fmt_mom(w.get('median_momentum_soft'))}",
+        f"- Per chain: {_fmt_mom_map(w.get('median_momentum_by_chain'))}",
+        f"- Solana: {_fmt_mom(w.get('median_momentum_solana'))}",
+        "",
         "## Per chain",
         "",
         "| chain | judged | soft | young free | young 429 | young chain | young soft |",
@@ -942,6 +1026,7 @@ def render_briefing_md(payload: dict) -> str:
         "",
         "## Solana",
         f"- Judged: {sol.get('judged', 0)} · soft: {sol.get('soft', 0)} · young free: {sol.get('young_free', 0)}",
+        f"- Median momentum: {_fmt_mom(w.get('median_momentum_solana') if w.get('median_momentum_solana') is not None else sol.get('median_momentum'))}",
         f"- Young outcomes: {sol.get('young_outcomes') or {}}",
         "",
         "## Kill reasons",
@@ -1006,7 +1091,12 @@ def render_briefing_md(payload: dict) -> str:
     ]
     trends = payload.get("trends") or {}
     notable = trends.get("notable") or []
-    if not notable:
+    if trends.get("insufficient_history"):
+        lines.append(
+            f"insufficient history — need at least {TREND_MIN_PRIOR_DAYS} prior days "
+            f"before trend flags ({trends.get('history_days', 0)} so far)."
+        )
+    elif not notable:
         lines.append("No notable shifts versus the prior 7 daily aggregates.")
     else:
         for f in notable:
@@ -1134,7 +1224,7 @@ CYCLE_RE = re.compile(
     r"chain (\{.*?\}), soft (\{.*?\}), judged (\d+), requeued (\d+)"
 )
 SOFT_RE = re.compile(
-    r"soft tid=(\S+) ticker=(\S+) reason=(\S+) noul=(\S+) age_minutes=(\S+) "
+    r"soft tid=(\S+) ticker=(.+?) reason=(\S+) noul=(\S+) age_minutes=(\S+) "
     r"top_10_percent=(\S+) top_wallet_percent=(\S+) "
     r"developer_holding_percentage=(\S+) holder_count=(\S+) "
     r"rpc_ok=(\S+) soft_scores=(.*)$"
@@ -1142,11 +1232,13 @@ SOFT_RE = re.compile(
 FREE_PASS_RE = re.compile(
     r"free tid=(\S+) reason=pass age_minutes=(\S+)"
 )
-CHAIN_RE = re.compile(r"chain tid=(\S+) ticker=(\S+) reason=(\S+)")
-TRADE_RE = re.compile(r"trade tid=(\S+) ticker=(\S+) reason=(\S+)")
+CHAIN_RE = re.compile(r"chain tid=(\S+) ticker=(.+?) reason=(\S+)")
+TRADE_RE = re.compile(r"trade tid=(\S+) ticker=(.+?) reason=(\S+)")
 YOUNG_429_RE = re.compile(
-    r"young token (\S+) \(age ([0-9.]+)m\) hit 429"
+    r"young token (.+?) \(age ([0-9.]+)m\) hit 429"
 )
+SOFT_HINT_RE = re.compile(r"soft tid=")
+CHAIN_HINT_RE = re.compile(r"chain tid=")
 UNEVAL_RE = re.compile(r"unevaluated (\d+) ids")
 CARRY_RE = re.compile(r"carrying (\d+) of (\d+) unevaluated ids")
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
@@ -1169,7 +1261,7 @@ def _literal(text: str, default=None):
         return {} if default is None else default
 
 
-def parse_run_log(text: str) -> list[dict]:
+def parse_run_log(text: str) -> tuple[list[dict], dict]:
     """Parse run.log into cycle dicts ready for on_cycle / on_soft_token.
 
     Soft / free-pass / 429 lines that appear before a `cycle:` line belong to
@@ -1181,10 +1273,14 @@ def parse_run_log(text: str) -> list[dict]:
     pending_later: dict[str, dict] = {}
     carry = 0
     unevaluated = 0
+    pending_gt_429 = 0
+    unparsed_soft = 0
+    unparsed_chain = 0
     last_ts = None
 
     def flush_cycle(stats, ts, shadow=True):
         nonlocal pending_soft, pending_young, pending_later, carry, unevaluated
+        nonlocal pending_gt_429
         young = []
         for tid, y in pending_young.items():
             later = pending_later.get(tid)
@@ -1210,6 +1306,8 @@ def parse_run_log(text: str) -> list[dict]:
         stats["young_free"] = list(pending_young.values())
         stats["carry"] = carry
         stats["unevaluated"] = unevaluated
+        stats["gt_429"] = pending_gt_429
+        stats["gt_defer"] = infer_gt_counts({"tokens": tokens, "gt_429": 0})[1]
         cycles.append({
             "ts": ts,
             "stats": stats,
@@ -1221,6 +1319,7 @@ def parse_run_log(text: str) -> list[dict]:
         pending_later = {}
         carry = 0
         unevaluated = 0
+        pending_gt_429 = 0
 
     for raw in text.splitlines():
         line = raw.strip()
@@ -1296,6 +1395,7 @@ def parse_run_log(text: str) -> list[dict]:
 
         m = YOUNG_429_RE.search(line)
         if m:
+            pending_gt_429 += 1
             # Outcome hint; tid may only be known via later chain/trade lines.
             # We record a later-row keyed by ticker if we can match a young tid.
             ticker = m.group(1)
@@ -1345,14 +1445,28 @@ def parse_run_log(text: str) -> list[dict]:
             carry = int(m.group(2))
             continue
 
-    return cycles
+        if SOFT_HINT_RE.search(line) and not SOFT_RE.search(line):
+            unparsed_soft += 1
+        elif CHAIN_HINT_RE.search(line) and not CHAIN_RE.search(line):
+            unparsed_chain += 1
+
+    return cycles, {
+        "unparsed_soft": unparsed_soft,
+        "unparsed_chain": unparsed_chain,
+        "unparsed": unparsed_soft + unparsed_chain,
+    }
 
 
-def backfill_text(text: str, *, source: str = "backfill") -> int:
-    """Write parsed log cycles into the store. Returns cycles inserted."""
-    parsed = parse_run_log(text)
-    n = 0
+def backfill_text(text: str, *, source: str = "backfill") -> dict:
+    """Write parsed log cycles into the store. Idempotent. Returns a summary dict."""
+    parsed, meta = parse_run_log(text)
+    inserted = 0
+    skipped = 0
     for item in parsed:
+        if cycle_exists(item["ts"]):
+            skipped += 1
+            _pending_soft.clear()
+            continue
         for s in item["soft"]:
             on_soft_token(
                 tid=s.get("tid"), ticker=s.get("ticker"), net=s.get("chain_id"),
@@ -1369,13 +1483,25 @@ def backfill_text(text: str, *, source: str = "backfill") -> int:
             item["stats"], shadow=True, now=item["ts"], source=source,
         )
         if cid is not None:
-            n += 1
-    return n
+            inserted += 1
+        else:
+            skipped += 1
+    return {
+        "inserted": inserted,
+        "skipped": skipped,
+        "parsed_cycles": len(parsed),
+        "unparsed": meta["unparsed"],
+        "unparsed_soft": meta["unparsed_soft"],
+        "unparsed_chain": meta["unparsed_chain"],
+    }
 
 
-def backfill_log(path=None) -> int:
+def backfill_log(path=None) -> dict:
     log_path = pathlib.Path(path) if path else outbox_dir() / "run.log"
     if not log_path.exists():
         log.warning("backfill: %s not found", log_path)
-        return 0
+        return {
+            "inserted": 0, "skipped": 0, "parsed_cycles": 0,
+            "unparsed": 0, "unparsed_soft": 0, "unparsed_chain": 0,
+        }
     return backfill_text(log_path.read_text(errors="replace"))

@@ -611,6 +611,8 @@ tr:hover td { background: #151515; }
   <div class="solana-box" id="briefing-solana"></div>
   <div class="section-title">Kill reasons (24h)</div>
   <div id="briefing-kills" class="histogram"></div>
+  <div class="section-title">Momentum (judged + soft)</div>
+  <div id="briefing-momentum"></div>
   <div class="section-title">Judged tokens (24h)</div>
   <div id="briefing-judged"></div>
   <div class="section-title">Young free-pass outcomes</div>
@@ -1787,7 +1789,8 @@ function renderBriefing(data) {
      <div class="age-stat"><span class="age-stat-label">Young free</span><span class="age-stat-value">${sol.young_free||0}</span></div>
      <div class="age-stat"><span class="age-stat-label">deferred on 429</span><span class="age-stat-value">${syo.deferred_429||0}</span></div>
      <div class="age-stat"><span class="age-stat-label">chain kill</span><span class="age-stat-value">${syo.chain||0}</span></div>
-     <div class="age-stat"><span class="age-stat-label">soft</span><span class="age-stat-value">${syo.soft||0}</span></div>`;
+     <div class="age-stat"><span class="age-stat-label">soft</span><span class="age-stat-value">${syo.soft||0}</span></div>
+     <div class="age-stat"><span class="age-stat-label">Median momentum</span><span class="age-stat-value">${w.median_momentum_solana == null ? '—' : Number(w.median_momentum_solana).toFixed(3)}</span></div>`;
 
   const kills = w.kills || {};
   const killDiv = document.getElementById('briefing-kills');
@@ -1823,6 +1826,22 @@ function renderBriefing(data) {
         <td>${age}</td><td>${mom == null ? '—' : Number(mom).toFixed(3)}</td><td>${esc(compact||'—')}</td></tr>`;
     }).join('')}</tbody></table>`;
   }
+
+  const momBy = w.median_momentum_by_chain || {};
+  const momNames = Object.keys(momBy).sort();
+  const momLine = momNames.length
+    ? momNames.map(n => `${esc(n)} ${Number(momBy[n]).toFixed(3)}`).join(', ')
+    : '—';
+  document.getElementById('briefing-momentum').innerHTML = `<div class="pnl-grid">
+      <div class="pnl-stat"><div class="pnl-label">Median (judged+soft)</div>
+        <div class="pnl-value">${w.median_momentum == null ? '—' : Number(w.median_momentum).toFixed(3)}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Soft-only</div>
+        <div class="pnl-value">${w.median_momentum_soft == null ? '—' : Number(w.median_momentum_soft).toFixed(3)}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Per chain</div>
+        <div class="pnl-value" style="font-size:13px">${momLine}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Solana</div>
+        <div class="pnl-value">${w.median_momentum_solana == null ? '—' : Number(w.median_momentum_solana).toFixed(3)}</div></div>
+    </div>`;
 
   const yo = w.young_outcomes || {};
   const labels = {deferred_429:'deferred on 429', chain:'chain kill', soft:'soft',
@@ -1860,7 +1879,9 @@ function renderTrends(trends) {
   const chartsDiv = document.getElementById('trends-charts');
   const flags = trends.flags || [];
   const notable = flags.filter(f => f.notable);
-  if (!notable.length) {
+  if (trends.insufficient_history) {
+    flagsDiv.innerHTML = `<div class="trend-flag">insufficient history — need at least 3 prior days before trend flags (${trends.history_days||0} so far).</div>`;
+  } else if (!notable.length) {
     flagsDiv.innerHTML = '<div class="trend-flag">No notable shifts versus the prior 7 daily aggregates.</div>';
   } else {
     flagsDiv.innerHTML = notable.map(f => {

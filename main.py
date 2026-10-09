@@ -689,7 +689,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
              gt_limiter.stats_429_count, gt_limiter.stats_wait_time)
     log.info("cycle duration: %.1fs / %.1fs budget", cycle_duration, cycle_time_budget)
     stats["unevaluated"] = unevaluated_count
-    stats["gt_429"] = gt_limiter.stats_429_count
+    stats["gt_429"] = int(getattr(gt_limiter, "stats_429_count", stats.get("gt_429") or 0))
     _history_hook("cycle", stats=stats, shadow=shadow)
 
     if not survivors:
