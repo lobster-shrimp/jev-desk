@@ -16,9 +16,14 @@ sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("DESK_SECRET", "test-secret-for-cycle-history")
 os.environ.setdefault("JUDGE_MOCK", "1")
+os.environ.setdefault("DESK_OUTBOX", str(ROOT / "tests" / "_outbox"))
 os.environ["TZ"] = "UTC"
 if hasattr(time, "tzset"):
     time.tzset()
+
+# Pin server.OUTBOX to the suite outbox before any tmp-path fixture remaps
+# DESK_OUTBOX. Otherwise GET /api/state in test_desk looks at a deleted dir.
+import server as _server_pin  # noqa: F401
 
 
 def ts(y, m, d, hh=12, mm=0, ss=0) -> float:
