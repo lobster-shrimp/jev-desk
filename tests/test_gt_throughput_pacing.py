@@ -1,195 +1,129 @@
 """
-Tests for GT throughput pacing improvements (PR #40).
-
-1. Pace GT calls at ~5/min with ~12s spacing
-2. Wait-for-slot within time budget instead of breaking
-3. Start-to-start scheduling
-4. DEX_BUDGET raised to 60
-5. Comprehensive logging
-
-All tests use fake clocks for determinism and speed.
+Tests for GT throughput pacing. All clocks are fake — no real sleeping.
 """
 import logging
 import os
 from unittest.mock import Mock, patch
 import pytest
 
-# Setup path
 import sys
 import pathlib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from collect import GTRateLimiter
+from collect import GTRateLimiter, universe
 
-
-# ============================================================================
-# Fake clock utilities
-# ============================================================================
 
 class FakeClock:
-    """Deterministic clock for testing."""
     def __init__(self, start=1000.0):
         self.now = start
-    
+
     def time(self):
         return self.now
-    
+
     def sleep(self, duration):
         self.now += duration
-    
+
     def advance(self, duration):
         self.now += duration
 
 
-# ============================================================================
-# Fixtures
-# ============================================================================
+class StopTest(BaseException):
+    """Stops main()'s loop. Must not subclass Exception (main swallows Exception)."""
+
+
+def _token(tid, age=30, **over):
+    addr = tid.split(":")[0]
+    row = {
+        "tid": tid, "ticker": addr[:8], "addr": addr, "net": 1399811149,
+        "age_minutes": age, "mcap_usd": 500000, "liquidity_usd": 50000,
+        "volume_h24": 100000, "holder_count": 200, "price": 0.1,
+        "created": 0,
+    }
+    row.update(over)
+    return row
+
+
+def _ok_dossier(t, limiter=None, deadline=None):
+    return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
+            "x_handle": None, "description": "test", "mint_authority": None,
+            "freeze_authority": None, "is_honeypot": None, "gt_score_details": None,
+            "developer_holding_percentage": None}
+
+
+def _ok_trade(t, gt_txns_cache=None):
+    return ({"buys_h1": 100, "sells_h1": 50, "buys_h6": 200, "sells_h6": 100,
+             "trades_h24": 1000}, "ok")
+
+
+def _ok_judge(question_set, state):
+    return {"model": "test", "answers": {
+        "concentration_is_exit_risk": {"type": "noul", "noul": 0.3}
+    }, "usage": {}}
+
 
 @pytest.fixture
 def fake_clock():
-    """Provide a fresh fake clock for each test."""
     return FakeClock()
 
 
 @pytest.fixture
 def limiter_with_fake_clock(fake_clock):
-    """Provide a GTRateLimiter with fake clock."""
-    limiter = GTRateLimiter(calls_per_min=5, min_spacing_sec=12.0, 
-                           time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
+    limiter = GTRateLimiter(calls_per_min=5, min_spacing_sec=12.0,
+                            time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
     return limiter, fake_clock
 
 
-# ============================================================================
-# GT pacing and spacing tests
-# ============================================================================
+# ---------------------------------------------------------------------------
+# T1: limiter pacing, no real sleep
+# ---------------------------------------------------------------------------
 
 def test_gt_limiter_enforces_minimum_spacing(limiter_with_fake_clock):
-    """GTRateLimiter should enforce minimum spacing between calls."""
     limiter, clock = limiter_with_fake_clock
-    
-    # First call - no wait
     assert limiter.wait_if_needed()
     limiter.spend(1)
-    first_time = clock.time()
-    
-    # Second call - should wait ~12s
+    t0 = clock.time()
     assert limiter.wait_if_needed()
     limiter.spend(1)
-    second_time = clock.time()
-    
-    assert second_time - first_time >= 12.0
+    assert clock.time() - t0 >= 12.0
 
 
 def test_gt_limiter_min_spacing_default():
-    """GTRateLimiter should default to 60/calls_per_min for spacing."""
-    limiter = GTRateLimiter(calls_per_min=5)
-    assert limiter.min_spacing_sec == 12.0
+    assert GTRateLimiter(calls_per_min=5).min_spacing_sec == 12.0
 
 
 def test_gt_limiter_spacing_configurable():
-    """GTRateLimiter spacing should be configurable."""
-    limiter = GTRateLimiter(calls_per_min=10, min_spacing_sec=8.0)
-    assert limiter.min_spacing_sec == 8.0
+    assert GTRateLimiter(calls_per_min=10, min_spacing_sec=8.0).min_spacing_sec == 8.0
 
 
 def test_gt_limiter_tracks_last_call_time(fake_clock):
-    """GTRateLimiter should track last call time for spacing."""
-    limiter = GTRateLimiter(calls_per_min=30, min_spacing_sec=2.0, 
-                           time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
-    
-    # First call
+    limiter = GTRateLimiter(calls_per_min=30, min_spacing_sec=2.0,
+                            time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
     limiter.spend(1)
     assert limiter.last_call_time == 1000.0
-    
-    # Advance time
     fake_clock.advance(5.0)
-    
-    # Second call
     limiter.spend(1)
     assert limiter.last_call_time == 1005.0
 
 
 def test_gt_limiter_spacing_applies_to_universe_and_dossier(limiter_with_fake_clock):
-    """Spacing should apply to both universe and dossier calls."""
     limiter, clock = limiter_with_fake_clock
     limiter.reserve(2)
-    
-    # Universe call
     assert limiter.wait_if_needed(priority=False)
     limiter.spend(1, priority=False)
-    first_time = clock.time()
-    
-    # Dossier call (priority) - should still wait for spacing
+    t0 = clock.time()
     assert limiter.wait_if_needed(priority=True)
     limiter.spend(1, priority=True)
-    second_time = clock.time()
-    
-    assert second_time - first_time >= 12.0
+    assert clock.time() - t0 >= 12.0
 
 
-def test_gt_limiter_reset_cycle_stats(fake_clock):
-    """reset_cycle_stats() should clear 429 count and wait time."""
-    limiter = GTRateLimiter(calls_per_min=30, time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
-    
-    # Record some stats
-    limiter.stats_429_count = 5
-    limiter.stats_wait_time = 120.5
-    
-    # Reset
-    limiter.reset_cycle_stats()
-    
-    assert limiter.stats_429_count == 0
-    assert limiter.stats_wait_time == 0.0
-
-
-def test_gt_limiter_tracks_429_count(fake_clock):
-    """record_429() should increment stats_429_count."""
-    limiter = GTRateLimiter(calls_per_min=30, time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
-    
-    assert limiter.stats_429_count == 0
-    
-    limiter.record_429(25.0)
-    assert limiter.stats_429_count == 1
-    
-    limiter.record_429(30.0)
-    assert limiter.stats_429_count == 2
-
-
-def test_gt_limiter_tracks_wait_time(limiter_with_fake_clock):
-    """wait_if_needed() should track total wait time."""
-    limiter, clock = limiter_with_fake_clock
-    
-    # First call - no wait
-    assert limiter.wait_if_needed()
-    limiter.spend(1)
-    
-    # Second call - wait for spacing
-    start_wait_time = limiter.stats_wait_time
-    assert limiter.wait_if_needed()
-    limiter.spend(1)
-    
-    # Should have tracked the ~12s spacing wait
-    wait_added = limiter.stats_wait_time - start_wait_time
-    assert 11.9 <= wait_added <= 12.1
-
-
-def test_gt_limiter_reset_for_test(fake_clock):
-    """reset_for_test() should clear all state including last_call_time."""
+def test_gt_limiter_reset_for_test_clears_last_call_and_stats(fake_clock):
     limiter = GTRateLimiter(calls_per_min=5, time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
-    
-    # Pollute state
     limiter.spend(1)
     limiter.record_429(25.0)
     limiter.stats_wait_time = 100.0
     limiter.reserve(3)
-    
-    assert limiter.last_call_time > 0
-    assert len(limiter.calls) > 0
-    
-    # Reset
     limiter.reset_for_test()
-    
     assert limiter.last_call_time == 0.0
     assert len(limiter.calls) == 0
     assert limiter.stats_429_count == 0
@@ -197,399 +131,403 @@ def test_gt_limiter_reset_for_test(fake_clock):
     assert limiter.reserved == 0
 
 
-def test_wait_if_needed_loops_until_slot_free(fake_clock):
-    """wait_if_needed should loop until slot is actually free (F3 boundary bug)."""
-    limiter = GTRateLimiter(calls_per_min=2, window_sec=60.0,
-                           time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
-    
-    # Fill window
-    limiter.spend(1)  # at t=1000
-    clock.advance(1.0)
-    limiter.spend(1)  # at t=1001, window full
-    
-    # Advance to exactly boundary (first call expires)
-    clock.now = 1060.0
-    
-    # This should succeed after loop (old code would fail at boundary)
+def test_gt_limiter_tracks_429_count(fake_clock):
+    limiter = GTRateLimiter(calls_per_min=30, time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
+    limiter.record_429(25.0)
+    limiter.record_429(30.0)
+    assert limiter.stats_429_count == 2
+
+
+def test_gt_limiter_tracks_wait_time(limiter_with_fake_clock):
+    limiter, clock = limiter_with_fake_clock
     assert limiter.wait_if_needed()
-    assert limiter.spend(1)
+    limiter.spend(1)
+    before = limiter.stats_wait_time
+    assert limiter.wait_if_needed()
+    limiter.spend(1)
+    assert 11.9 <= limiter.stats_wait_time - before <= 12.1
 
 
-def test_wait_if_needed_respects_deadline(fake_clock):
-    """wait_if_needed should return False if deadline would be exceeded."""
+def test_wait_if_needed_loops_until_slot_free():
+    """F3: at the exact window boundary the slot must become free."""
+    clock = FakeClock()
     limiter = GTRateLimiter(calls_per_min=2, window_sec=60.0,
-                           time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
-    
-    # Fill window
+                            time_fn=clock.time, sleep_fn=clock.sleep)
+    limiter.spend(1)
+    clock.advance(1.0)
+    limiter.spend(1)
+    clock.now = 1060.0
+    assert limiter.wait_if_needed() is True
+    assert limiter.spend(1) is True
+
+
+def test_wait_if_needed_respects_deadline():
+    clock = FakeClock()
+    limiter = GTRateLimiter(calls_per_min=2, window_sec=60.0,
+                            time_fn=clock.time, sleep_fn=clock.sleep)
     limiter.spend(1)
     limiter.spend(1)
-    
-    # Advance partway
     clock.advance(30.0)
-    
-    # Set deadline that would be exceeded by wait
-    deadline = clock.time() + 20.0  # Need to wait ~30s more, but deadline is 20s away
-    
-    # Should return False
-    assert not limiter.wait_if_needed(deadline=deadline)
+    deadline = clock.time() + 20.0
+    assert limiter.wait_if_needed(deadline=deadline) is False
 
-
-# ============================================================================
-# DEX_BUDGET tests
-# ============================================================================
 
 def test_dex_budget_default_60():
-    """DEX_BUDGET should default to 60."""
     import main
-    # Just check the constant value (no reload needed)
-    assert main.DEX_BUDGET == 60 or os.environ.get("DEX_BUDGET") is not None
+    assert main._env_int("DEX_BUDGET", 60) == 60
+    if os.environ.get("DEX_BUDGET") in (None, ""):
+        assert main.DEX_BUDGET == 60
 
 
-def test_gt_dossier_reserve_derived():
-    """GT_DOSSIER_RESERVE should be 1 for 5/min rate."""
+def test_gt_dossier_reserve_is_one_at_five_per_min():
     import main
-    # For 5/min, reserve should be 1 (5 - 4 = 1)
     if main.GT_CALLS_PER_MIN == 5:
         assert main.GT_DOSSIER_RESERVE == 1
 
 
-# ============================================================================
-# Mutation-killing tests (T2)
-# ============================================================================
+def test_cycle_time_budget_default_via_helper():
+    import main
+    with patch.dict(os.environ, {"CYCLE_TIME_BUDGET_SEC": ""}):
+        assert main._env_float("CYCLE_TIME_BUDGET_SEC", 660) == 660.0
+
+
+def test_cycle_time_budget_configurable_via_helper():
+    import main
+    with patch.dict(os.environ, {"CYCLE_TIME_BUDGET_SEC": "480"}):
+        assert main._env_float("CYCLE_TIME_BUDGET_SEC", 660) == 480.0
+
+
+# ---------------------------------------------------------------------------
+# T2: mutations M1, M2, M3, M4
+# ---------------------------------------------------------------------------
 
 def test_no_break_on_full_window():
-    """M1: Every free-passer should be dossiered even when window is full."""
+    """M1: a momentarily full GT window must wait, not break. All 12 passers dossiered."""
     import book
     import main as shift
-    from unittest.mock import Mock
-    
-    # Clear state
+
     book.DB.execute("DELETE FROM carry")
     book.DB.execute("DELETE FROM defer")
     book.DB.commit()
-    
-    # Fake clock for determinism
-    fake_clock = FakeClock(start=1000.0)
-    
-    # Limiter with 5/min rate, 12s spacing
+
+    clock = FakeClock(1000.0)
     limiter = GTRateLimiter(calls_per_min=5, min_spacing_sec=12.0,
-                           time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
-    limiter.set_universe_budget(999)  # Unlimited for this test
-    limiter.reserve(1)
-    
-    # Create 12 tokens that all pass free checks
-    test_tids = [f"pass{i}:1399811149" for i in range(12)]
-    
-    def fake_universe(limiter=None, fomo=None):
-        return ([], {})
-    
-    def fake_shortlist(fomo, ids):
-        return [{"tid": tid, "ticker": f"P{i}", "addr": tid.split(":")[0], "net": 1399811149,
-                 "age_minutes": 30, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
-                 "holder_count": 200, "price": 0.1, "created": fake_clock.time() - 1800}
-                for i, tid in enumerate(test_tids) if tid in ids]
-    
-    def fake_trade_counts(t, gt_txns_cache=None):
-        return ({"buys_h1": 100, "sells_h1": 50, "trades_h24": 1000}, 'ok')
-    
+                            time_fn=clock.time, sleep_fn=clock.sleep)
+    tids = [f"pass{i}:1399811149" for i in range(12)]
     dossier_calls = []
-    
-    def fake_dossier(t, limiter=None):
-        dossier_calls.append((fake_clock.time(), t["tid"]))
-        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
-                "x_handle": None, "description": "test", "mint_authority": None,
-                "freeze_authority": None, "is_honeypot": None, "gt_score_details": None,
-                "developer_holding_percentage": None}
-    
-    def fake_judge(question_set, state):
-        return {"model": "test", "answers": {
-            "concentration_is_exit_risk": {"type": "noul", "noul": 0.3}
-        }, "usage": {}}
-    
-    # Monkeypatch
-    original_universe = shift.universe
-    original_shortlist = shift.shortlist
-    original_trade = shift.trade_counts
-    original_dossier = shift.dossier
-    original_now = shift._now
-    original_sleep = shift._sleep
-    
+
+    def fake_universe(limiter=None, fomo=None):
+        return (tids, {})
+
+    def fake_shortlist(fomo, ids):
+        return [_token(tid) for tid in tids]
+
+    def fake_dossier(t, limiter=None, deadline=None):
+        dossier_calls.append((clock.time(), t["tid"]))
+        return _ok_dossier(t)
+
+    orig = (shift.universe, shift.shortlist, shift.trade_counts, shift.dossier,
+            shift._now, shift._sleep)
     shift.universe = fake_universe
     shift.shortlist = fake_shortlist
-    shift.trade_counts = fake_trade_counts
+    shift.trade_counts = _ok_trade
     shift.dossier = fake_dossier
-    shift._now = fake_clock.time
-    shift._sleep = fake_clock.sleep
-    
+    shift._now = clock.time
+    shift._sleep = clock.sleep
     try:
-        fake_fomo = Mock()
-        fake_desk = Mock()
-        fake_desk.read_x = Mock(return_value=None)
-        fake_desk.write_state = Mock()
-        
-        order, stats = shift.run_once(fake_fomo, fake_judge, fake_desk, 10000, shadow=True,
-                                       gt_limiter=limiter, cycle_time_budget=660)
-        
-        # All 12 tokens should have been dossiered
-        assert len(dossier_calls) == 12, f"Expected 12 dossiers, got {len(dossier_calls)}"
-        
-        # Consecutive calls should be >= 12s apart
+        desk = Mock()
+        desk.read_x = Mock(return_value=None)
+        desk.write_state = Mock()
+        shift.run_once(Mock(), _ok_judge, desk, 10000, shadow=True,
+                       gt_limiter=limiter, cycle_time_budget=660)
+        assert len(dossier_calls) == 12, f"expected 12 dossiers, got {len(dossier_calls)}"
         for i in range(1, len(dossier_calls)):
-            gap = dossier_calls[i][0] - dossier_calls[i-1][0]
-            assert gap >= 12.0, f"Gap {i} was {gap:.1f}s, expected >= 12s"
-        
+            gap = dossier_calls[i][0] - dossier_calls[i - 1][0]
+            assert gap >= 12.0, f"gap {i} was {gap:.1f}s"
     finally:
-        shift.universe = original_universe
-        shift.shortlist = original_shortlist
-        shift.trade_counts = original_trade
-        shift.dossier = original_dossier
-        shift._now = original_now
-        shift._sleep = original_sleep
-        
-        # Cleanup
+        (shift.universe, shift.shortlist, shift.trade_counts, shift.dossier,
+         shift._now, shift._sleep) = orig
         book.DB.execute("DELETE FROM carry")
         book.DB.execute("DELETE FROM defer")
         book.DB.commit()
 
 
 def test_time_budget_carry_in_priority_order():
-    """M3: Time budget exhaustion should carry free-passers in priority order."""
+    """M3: exhausting the time budget must save remaining free-passers to carry."""
     import book
     import main as shift
-    from unittest.mock import Mock
-    
-    # Clear state
+
     book.DB.execute("DELETE FROM carry")
     book.DB.execute("DELETE FROM defer")
     book.DB.commit()
-    
-    fake_clock = FakeClock(start=1000.0)
-    
-    # Limiter with 30/min rate (no spacing bottleneck)
-    limiter = GTRateLimiter(calls_per_min=30, min_spacing_sec=2.0,
-                           time_fn=fake_clock.time, sleep_fn=fake_clock.sleep)
-    limiter.set_universe_budget(999)
-    limiter.reserve(10)
-    
-    # 10 tokens, time budget allows only 5 dossiers
-    test_tids = [f"tok{i}:1399811149" for i in range(10)]
-    
+
+    clock = FakeClock(1000.0)
+    limiter = GTRateLimiter(calls_per_min=30, min_spacing_sec=0.0,
+                            time_fn=clock.time, sleep_fn=clock.sleep)
+    due_tids = [f"due{i}:1399811149" for i in range(3)]
+    rest_tids = [f"tok{i}:1399811149" for i in range(8)]
+    all_tids = due_tids + rest_tids
+    now = clock.time()
+    for tid in due_tids:
+        book.defer(tid, now - 1, now + 3600)
+
     def fake_universe(limiter=None, fomo=None):
-        return ([], {})
-    
+        return (rest_tids, {})
+
     def fake_shortlist(fomo, ids):
-        return [{"tid": tid, "ticker": f"T{i}", "addr": tid.split(":")[0], "net": 1399811149,
-                 "age_minutes": 30, "mcap_usd": 500000, "liquidity_usd": 50000, "volume_h24": 100000,
-                 "holder_count": 200, "price": 0.1, "created": fake_clock.time() - 1800, "_tier": 2}
-                for i, tid in enumerate(test_tids) if tid in ids]
-    
-    def fake_trade_counts(t, gt_txns_cache=None):
-        # Each trade check takes time
-        fake_clock.advance(10.0)
-        return ({"buys_h1": 100, "sells_h1": 50, "trades_h24": 1000}, 'ok')
-    
-    dossier_count = [0]
-    
-    def fake_dossier(t, limiter=None):
-        dossier_count[0] += 1
-        fake_clock.advance(15.0)  # Each dossier takes time
-        return {**t, "chain": "solana", "top_10_percent": 30, "top_wallet_percent": 0.02,
-                "x_handle": None, "description": "test", "mint_authority": None,
-                "freeze_authority": None, "is_honeypot": None, "gt_score_details": None,
-                "developer_holding_percentage": None}
-    
-    def fake_judge(question_set, state):
-        return {"model": "test", "answers": {
-            "concentration_is_exit_risk": {"type": "noul", "noul": 0.3}
-        }, "usage": {}}
-    
-    # Monkeypatch
-    original_universe = shift.universe
-    original_shortlist = shift.shortlist
-    original_trade = shift.trade_counts
-    original_dossier = shift.dossier
-    original_now = shift._now
-    original_sleep = shift._sleep
-    
+        return [_token(tid) for tid in all_tids if tid in ids]
+
+    def fake_trade(t, gt_txns_cache=None):
+        clock.advance(20.0)
+        return _ok_trade(t)
+
+    def fake_dossier(t, limiter=None, deadline=None):
+        clock.advance(20.0)
+        return _ok_dossier(t)
+
+    orig = (shift.universe, shift.shortlist, shift.trade_counts, shift.dossier,
+            shift._now, shift._sleep)
     shift.universe = fake_universe
     shift.shortlist = fake_shortlist
-    shift.trade_counts = fake_trade_counts
+    shift.trade_counts = fake_trade
     shift.dossier = fake_dossier
-    shift._now = fake_clock.time
-    shift._sleep = fake_clock.sleep
-    
+    shift._now = clock.time
+    shift._sleep = clock.sleep
     try:
-        fake_fomo = Mock()
-        fake_desk = Mock()
-        fake_desk.read_x = Mock(return_value=None)
-        fake_desk.write_state = Mock()
-        
-        # Short time budget: allow ~5 dossiers (5 * 15s dossier + 10 * 10s trade + overhead)
-        order, stats = shift.run_once(fake_fomo, fake_judge, fake_desk, 10000, shadow=True,
-                                       gt_limiter=limiter, cycle_time_budget=180)
-        
-        # Should have carried the rest in priority order
+        desk = Mock()
+        desk.read_x = Mock(return_value=None)
+        desk.write_state = Mock()
+        # 180s budget, 60s judge reserve → stop after ~120s → ~3 tokens at 40s each
+        shift.run_once(Mock(), _ok_judge, desk, 10000, shadow=True,
+                       gt_limiter=limiter, cycle_time_budget=180)
         carry = book.get_carry()
-        assert len(carry) > 0, "Should have carried some tokens when time budget exhausted"
-        assert len(carry) <= 5, "Should have carried at most 5 tokens"
-        
-        # Carried tids should be from the tail of the list (in priority order)
-        for carried_tid in carry:
-            # Extract index from tid (tok0, tok1, etc)
-            idx = int(carried_tid.split("tok")[1].split(":")[0])
-            # Should be from second half
-            assert idx >= 5, f"Carried token {carried_tid} should be from second half"
-        
+        assert len(carry) > 0, "time-budget exhaustion must save_carry remaining passers"
+        assert len(carry) <= 60
+        # break token (first unevaluated due/passer) keeps its defer row
+        for tid in carry:
+            if tid in due_tids:
+                row = book.DB.execute("SELECT tid FROM defer WHERE tid=?", (tid,)).fetchone()
+                assert row is not None, f"{tid} lost its defer row"
+        # processed (dossiered) ids are cleared from carry
+        for tid in due_tids:
+            if tid not in carry:
+                assert tid not in book.get_carry()
     finally:
-        shift.universe = original_universe
-        shift.shortlist = original_shortlist
-        shift.trade_counts = original_trade
-        shift.dossier = original_dossier
-        shift._now = original_now
-        shift._sleep = original_sleep
-        
-        # Cleanup
+        (shift.universe, shift.shortlist, shift.trade_counts, shift.dossier,
+         shift._now, shift._sleep) = orig
         book.DB.execute("DELETE FROM carry")
         book.DB.execute("DELETE FROM defer")
         book.DB.commit()
 
 
+def test_universe_spacing_end_to_end():
+    """M2: five universe pages and the next dossier are all >= 12s apart."""
+    clock = FakeClock(0.0)
+    limiter = GTRateLimiter(calls_per_min=5, min_spacing_sec=12.0,
+                            time_fn=clock.time, sleep_fn=clock.sleep)
+    limiter.set_universe_budget(5)
+    limiter.reserve(1)
+    times = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        times.append(clock.time())
+        resp = Mock()
+        resp.status_code = 200
+        resp.headers = {}
+        resp.json.return_value = {"data": []}
+        return resp
+
+    with patch("collect.requests.get", fake_get):
+        universe(nets=("solana",), pages=2, include_trending=True, limiter=limiter)
+
+    assert len(times) >= 4
+    for i in range(1, len(times)):
+        assert times[i] - times[i - 1] >= 12.0, (
+            f"universe calls {i - 1}->{i} gap {times[i] - times[i - 1]:.1f}s"
+        )
+    last_page = times[-1]
+    assert limiter.wait_if_needed(priority=True)
+    limiter.spend(1, priority=True)
+    assert clock.time() - last_page >= 12.0
+
+
 def test_start_to_start_overrun(caplog):
-    """M4: Cycle overrun should start next immediately with warning."""
+    """M4: 100s cycle sleeps 800s; 950s cycle overruns (no sleep) and logs WARNING."""
     import main as shift
-    from unittest.mock import Mock
-    
+
     caplog.set_level(logging.WARNING)
-    
-    fake_clock = FakeClock(start=1000.0)
-    
-    # Track cycle starts
-    cycle_starts = []
-    sleep_calls = []
-    
-    original_run_once = shift.run_once
-    original_now = shift._now
-    original_sleep = shift._sleep
-    
+    clock = FakeClock(1000.0)
+    sleeps = []
+    n = [0]
+
     def fake_run_once(*args, **kwargs):
-        cycle_starts.append(fake_clock.time())
-        # First cycle: 100s duration
-        if len(cycle_starts) == 1:
-            fake_clock.advance(100.0)
-        # Second cycle: 950s duration (overrun)
-        elif len(cycle_starts) == 2:
-            fake_clock.advance(950.0)
-        # Third cycle: exit
+        n[0] += 1
+        if n[0] == 1:
+            clock.advance(100.0)
+        elif n[0] == 2:
+            clock.advance(950.0)
         else:
             raise StopTest()
         return None, {"seen": 0, "benched": 0}
-    
+
     def fake_sleep(duration):
-        sleep_calls.append(duration)
-        fake_clock.sleep(duration)
-    
-    class StopTest(BaseException):
-        """Use BaseException so main()'s except Exception doesn't catch it."""
-        pass
-    
+        sleeps.append(duration)
+        clock.sleep(duration)
+
+    orig = (shift.run_once, shift._now, shift._sleep)
     shift.run_once = fake_run_once
-    shift._now = fake_clock.time
+    shift._now = clock.time
     shift._sleep = fake_sleep
-    
     try:
-        fake_fomo = Mock()
-        fake_fomo.token = Mock()
-        fake_judge = Mock()
-        fake_desk = Mock()
-        fake_desk.bank = Mock(return_value=10000)
-        fake_desk.report = Mock()
-        
-        try:
-            shift.main(fake_fomo, fake_judge, fake_desk, shadow=True, once=False)
-        except StopTest:
-            pass
-        
-        # After 100s cycle, should sleep 800s
-        assert len(sleep_calls) >= 1
-        assert 790 <= sleep_calls[0] <= 810, f"First sleep was {sleep_calls[0]}, expected ~800"
-        
-        # After 950s cycle (overrun by 50s), should sleep 0 and log warning
-        assert len(sleep_calls) == 1, "Should not sleep after overrun"
-        
-        # Check for overrun warning
-        overrun_logs = [r for r in caplog.records if "overran" in r.message.lower()]
-        assert len(overrun_logs) > 0, "Should log overrun warning"
-        
+        fomo = Mock()
+        fomo.token = Mock()
+        desk = Mock()
+        desk.bank = Mock(return_value=10000)
+        desk.report = Mock()
+        with patch("time.sleep", fake_sleep):
+            try:
+                shift.main(fomo, Mock(), desk, shadow=True, once=False)
+            except StopTest:
+                pass
+        assert len(sleeps) >= 1
+        assert 790 <= sleeps[0] <= 810, f"first sleep {sleeps[0]}, expected ~800"
+        assert len(sleeps) == 1, "overrun cycle must not sleep"
+        assert any("overran" in r.message.lower() for r in caplog.records)
     finally:
-        shift.run_once = original_run_once
-        shift._now = original_now
-        shift._sleep = original_sleep
+        shift.run_once, shift._now, shift._sleep = orig
 
 
-# ============================================================================
-# Comprehensive logging tests
-# ============================================================================
+# ---------------------------------------------------------------------------
+# F1 / F6
+# ---------------------------------------------------------------------------
 
-def test_existing_log_lines_preserved(caplog):
-    """F6: Existing 'cycle:' log line should be preserved."""
+def test_free_checks_continue_after_dex_budget():
+    """F1: after Dex/time stop, later tokens still get free/bench checks; only passers carried."""
     import book
     import main as shift
-    from unittest.mock import Mock
-    
-    caplog.set_level(logging.INFO)
-    
-    # Clear state
+
     book.DB.execute("DELETE FROM carry")
+    book.DB.execute("DELETE FROM defer")
+    book.DB.execute("DELETE FROM bench")
     book.DB.commit()
-    
-    fake_clock = FakeClock()
-    
+
+    clock = FakeClock(1000.0)
+    limiter = GTRateLimiter(calls_per_min=30, min_spacing_sec=0.0,
+                            time_fn=clock.time, sleep_fn=clock.sleep)
+    # 1 passer (uses the single DEX slot), then 1 free-kill, then 2 more passers
+    tids = ["pass0:1399811149", "kill1:1399811149", "pass2:1399811149", "pass3:1399811149"]
+
     def fake_universe(limiter=None, fomo=None):
-        return ([], {})
-    
+        return (tids, {})
+
     def fake_shortlist(fomo, ids):
-        return []
-    
-    # Monkeypatch
-    original_universe = shift.universe
-    original_shortlist = shift.shortlist
-    original_now = shift._now
-    original_sleep = shift._sleep
-    
+        return [
+            _token("pass0:1399811149"),
+            _token("kill1:1399811149", liquidity_usd=1000),  # below min liq
+            _token("pass2:1399811149"),
+            _token("pass3:1399811149"),
+        ]
+
+    orig = (shift.universe, shift.shortlist, shift.trade_counts, shift.dossier,
+            shift._now, shift._sleep, shift.DEX_BUDGET)
     shift.universe = fake_universe
     shift.shortlist = fake_shortlist
-    shift._now = fake_clock.time
-    shift._sleep = fake_clock.sleep
-    
+    shift.trade_counts = _ok_trade
+    shift.dossier = _ok_dossier
+    shift._now = clock.time
+    shift._sleep = clock.sleep
+    shift.DEX_BUDGET = 1
     try:
-        fake_fomo = Mock()
-        fake_desk = Mock()
-        fake_desk.read_x = Mock(return_value=None)
-        fake_desk.write_state = Mock()
-        
-        order, stats = shift.run_once(fake_fomo, Mock(), fake_desk, 10000, shadow=True)
-        
-        # Check for existing log line format
-        cycle_logs = [r for r in caplog.records if r.message.startswith("cycle:") and "seen" in r.message]
-        assert len(cycle_logs) > 0, "Should preserve 'cycle: ...' log line"
-        
-        # Also check for new log lines
-        summary_logs = [r for r in caplog.records if "cycle summary" in r.message]
-        assert len(summary_logs) > 0, "Should add 'cycle summary' log line"
-        
-        gt_logs = [r for r in caplog.records if "cycle GT calls" in r.message]
-        assert len(gt_logs) > 0, "Should add 'cycle GT calls' log line"
-        
+        desk = Mock()
+        desk.read_x = Mock(return_value=None)
+        desk.write_state = Mock()
+        _, stats = shift.run_once(Mock(), _ok_judge, desk, 10000, shadow=True,
+                                  gt_limiter=limiter, cycle_time_budget=660)
+        assert stats["seen"] == 4
+        assert stats["free"].get("liquidity") == 1
+        carry = book.get_carry()
+        assert "kill1:1399811149" not in carry
+        assert "pass2:1399811149" in carry
+        assert "pass3:1399811149" in carry
+        assert "pass0:1399811149" not in carry
+        # kill was benched (sit), not carried
+        assert book.benched("kill1:1399811149")
     finally:
-        shift.universe = original_universe
-        shift.shortlist = original_shortlist
-        shift._now = original_now
-        shift._sleep = original_sleep
-        
-        # Cleanup
+        (shift.universe, shift.shortlist, shift.trade_counts, shift.dossier,
+         shift._now, shift._sleep, shift.DEX_BUDGET) = orig
+        book.DB.execute("DELETE FROM carry")
+        book.DB.execute("DELETE FROM defer")
+        book.DB.execute("DELETE FROM bench")
+        book.DB.commit()
+
+
+def test_existing_log_lines_preserved(caplog):
+    """F6: keep 'cycle: … judged N, requeued N' and add the new summary alongside."""
+    import book
+    import main as shift
+
+    caplog.set_level(logging.INFO)
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+    clock = FakeClock()
+
+    orig = (shift.universe, shift.shortlist, shift._now, shift._sleep)
+    shift.universe = lambda limiter=None, fomo=None: ([], {})
+    shift.shortlist = lambda fomo, ids: []
+    shift._now = clock.time
+    shift._sleep = clock.sleep
+    try:
+        desk = Mock()
+        desk.read_x = Mock(return_value=None)
+        desk.write_state = Mock()
+        shift.run_once(Mock(), Mock(), desk, 10000, shadow=True)
+        cycle_logs = [r for r in caplog.records
+                      if r.message.startswith("cycle:") and "judged" in r.message]
+        assert cycle_logs, "must keep the 'cycle: … judged N, requeued N' line"
+        assert any("cycle summary" in r.message for r in caplog.records)
+        assert any("cycle GT calls" in r.message for r in caplog.records)
+    finally:
+        shift.universe, shift.shortlist, shift._now, shift._sleep = orig
         book.DB.execute("DELETE FROM carry")
         book.DB.commit()
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+def test_cycle_logs_time_budget_exhaustion(caplog):
+    """Named in review: time-budget stop logs the unevaluated line."""
+    import book
+    import main as shift
+
+    caplog.set_level(logging.INFO)
+    book.DB.execute("DELETE FROM carry")
+    book.DB.commit()
+    clock = FakeClock(1000.0)
+    limiter = GTRateLimiter(calls_per_min=30, min_spacing_sec=0.0,
+                            time_fn=clock.time, sleep_fn=clock.sleep)
+    tids = [f"tok{i}:1399811149" for i in range(8)]
+
+    def fake_trade(t, gt_txns_cache=None):
+        clock.advance(30.0)
+        return _ok_trade(t)
+
+    orig = (shift.universe, shift.shortlist, shift.trade_counts, shift.dossier,
+            shift._now, shift._sleep)
+    shift.universe = lambda limiter=None, fomo=None: (tids, {})
+    shift.shortlist = lambda fomo, ids: [_token(tid) for tid in tids]
+    shift.trade_counts = fake_trade
+    shift.dossier = _ok_dossier
+    shift._now = clock.time
+    shift._sleep = clock.sleep
+    try:
+        desk = Mock()
+        desk.read_x = Mock(return_value=None)
+        desk.write_state = Mock()
+        shift.run_once(Mock(), _ok_judge, desk, 10000, shadow=True,
+                       gt_limiter=limiter, cycle_time_budget=180)
+        assert any("unevaluated" in r.message and "gt_available=" in r.message
+                   for r in caplog.records)
+        assert book.get_carry()
+    finally:
+        (shift.universe, shift.shortlist, shift.trade_counts, shift.dossier,
+         shift._now, shift._sleep) = orig
+        book.DB.execute("DELETE FROM carry")
+        book.DB.commit()

@@ -42,7 +42,8 @@ class GTRateLimiter:
         self.calls_per_min = calls_per_min
         self.window_sec = window_sec
         self.time_fn = time_fn or time.time
-        self.sleep_fn = sleep_fn or time.sleep
+        # None means resolve time.sleep at call time so tests can monkeypatch it
+        self.sleep_fn = sleep_fn
         self.calls = deque()  # timestamps of calls in the window
         self.reserved = 0     # slots reserved for dossiers
         self.backoff_until = 0.0  # timestamp until which we must wait due to 429
@@ -57,6 +58,7 @@ class GTRateLimiter:
             min_spacing_sec = 60.0 / calls_per_min
         self.min_spacing_sec = min_spacing_sec
         self.last_call_time = 0.0  # timestamp of last call for spacing enforcement
+        self.cycle_deadline = None  # optional per-cycle wait deadline (F5)
         
         # Universe scan budget tracking (separate from dossier budget)
         # Default to unlimited (999999) so tests without set_universe_budget() don't break
@@ -121,11 +123,16 @@ class GTRateLimiter:
         self.consecutive_429s = 0
         self.saturated = False
         self.last_call_time = 0.0
+        self.cycle_deadline = None
         self.universe_budget = 999999
         self.universe_calls_used = 0
         self.stats_429_count = 0
         self.stats_wait_time = 0.0
     
+    def _do_sleep(self, sec: float):
+        """Sleep via injectable sleep_fn, or time.sleep looked up at call time."""
+        (self.sleep_fn or time.sleep)(sec)
+
     def wait_if_needed(self, priority: bool = False, deadline: float | None = None):
         """Block until a call can be made within rate limits.
         
@@ -145,7 +152,7 @@ class GTRateLimiter:
             if deadline is not None and (now + wait_sec) > deadline:
                 return False
             log.info("GT 429 backoff: waiting %.1fs before retry", wait_sec)
-            self.sleep_fn(wait_sec)
+            self._do_sleep(wait_sec)
             now = self.time_fn()
         
         # Second, enforce minimum spacing between calls
@@ -158,7 +165,7 @@ class GTRateLimiter:
                     return False
                 log.debug("GT pacing: waiting %.1fs for min spacing (%.1fs between calls)", 
                          spacing_wait, self.min_spacing_sec)
-                self.sleep_fn(spacing_wait)
+                self._do_sleep(spacing_wait)
                 now = self.time_fn()
         
         # Then check rolling window rate limits - loop until slot is free
@@ -176,9 +183,13 @@ class GTRateLimiter:
                 if deadline is not None and (now + wait_sec) > deadline:
                     return False
                 log.info("GT rate limit: waiting %.1fs for slot", wait_sec)
-                self.sleep_fn(wait_sec)
+                prev = now
+                self._do_sleep(wait_sec)
                 now = self.time_fn()
                 self._expire_old_calls()
+                # Frozen test clock that does not advance: stop looping, let spend() fail
+                if now <= prev:
+                    break
         
         # Track total wait time for stats
         total_wait = now - wait_start
@@ -261,6 +272,11 @@ DEX_CHAIN_ID = {1399811149: "solana", 56: "bsc", 8453: "base", 4663: "robinhood"
 # Special marker for dossier failures that should trigger retry
 class DossierRetryNeeded(Exception):
     """Dossier failed due to rate limit / transient error and should be retried."""
+    pass
+
+
+class DossierDeadlineExceeded(DossierRetryNeeded):
+    """Dossier wait would cross the per-cycle deadline; caller should carry the token."""
     pass
 
 
@@ -876,11 +892,27 @@ def _normalize_authority(raw_value) -> tuple[bool | None, str | None]:
     return (None, str(raw_value))
 
 
-def dossier(t: dict, limiter: GTRateLimiter | None = None) -> dict:
+def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | None = None) -> dict:
     """One GT call per token. Fills what the chain actually has, null where it does not.
     
-    Note: caller is responsible for rate limiting (wait_if_needed + spend).
+    If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
+    If waiting for a slot would cross deadline, raises DossierDeadlineExceeded.
     On GT 429, records the backoff with the limiter and raises DossierRetryNeeded."""
+    if limiter:
+        # Wait for any 429 backoff BEFORE spending a slot (order matters!)
+        wait_start = limiter.time_fn()
+        if deadline is None:
+            deadline = getattr(limiter, "cycle_deadline", None)
+        if not limiter.wait_if_needed(priority=True, deadline=deadline):
+            raise DossierDeadlineExceeded(f"GT deadline exceeded for {t['ticker']}")
+        wait_duration = limiter.time_fn() - wait_start
+        if wait_duration >= 0.1:
+            log.info("dossier for %s waited %.1fs for GT rate limit/429 backoff",
+                     t["ticker"], wait_duration)
+        if not limiter.spend(1, priority=True):
+            log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
+            raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
+    
     net = GT_NET[t["net"]]
     resp = requests.get(f"{GT}/networks/{net}/tokens/{t['addr']}/info", headers=UA, timeout=20)
     if resp.status_code == 429:

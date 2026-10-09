@@ -39,17 +39,32 @@ def reset_state():
     yield
 
 
+def _paced_limiter(calls_per_min=10, start=0.0, **kw):
+    """GTRateLimiter whose sleep advances a fake clock (no real sleeping)."""
+    box = [start]
+    limiter = collect.GTRateLimiter(
+        calls_per_min=calls_per_min,
+        time_fn=lambda: box[0],
+        sleep_fn=lambda d: box.__setitem__(0, box[0] + d),
+        **kw,
+    )
+    return limiter, box
+
+
 @pytest.fixture(autouse=True)
 def reset_gt_limiter():
     """Reset the global GT rate limiter before each test to ensure isolation.
     
-    Without this, tests that use the default gt_limiter (via run_once without
-    explicit gt_limiter parameter) share state, causing budget exhaustion and
-    test failures when dossier() calls wait_if_needed() before spend()."""
-    shift._gt_limiter.calls.clear()
-    shift._gt_limiter.reserved = 0
-    shift._gt_limiter.backoff_until = 0.0
+    Also installs a fake clock/sleep so spacing and window waits never real-sleep.
+    Resets last_call_time and cycle stats (review T1)."""
+    clock = [time.time()]
+    shift._gt_limiter.reset_for_test()
+    shift._gt_limiter.time_fn = lambda: clock[0]
+    shift._gt_limiter.sleep_fn = lambda d: clock.__setitem__(0, clock[0] + d)
     yield
+    shift._gt_limiter.reset_for_test()
+    shift._gt_limiter.time_fn = time.time
+    shift._gt_limiter.sleep_fn = None
 
 
 def tok(i, net=1399811149, **over):
@@ -1572,8 +1587,7 @@ def test_rate_limiter_trending_before_new_pools():
     requests.get = mock_get
     
     try:
-        fake_time = [0.0]
-        limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
+        limiter, fake_time = _paced_limiter(calls_per_min=10)
         collect.universe(nets=("solana", "bsc"), pages=2, include_trending=True, limiter=limiter)
         
         # Order: sol_new p1, sol_new p2, sol_trending p1, sol_trending p2, bsc_trending, bsc_new...
@@ -1608,8 +1622,7 @@ def test_rate_limiter_429_retry_with_backoff():
     requests.get = mock_get
     
     try:
-        fake_time = [0.0]
-        limiter = collect.GTRateLimiter(calls_per_min=10, time_fn=lambda: fake_time[0])
+        limiter, fake_time = _paced_limiter(calls_per_min=10)
         collect.universe(nets=("solana",), pages=1, include_trending=True, limiter=limiter)
         
         # Should have retried (2 calls total for solana trending: 429 + retry)
@@ -1648,8 +1661,7 @@ def test_universe_budget_5_three_networks(caplog):
     requests.get = mock_get
     
     try:
-        fake_time = [0.0]
-        limiter = collect.GTRateLimiter(calls_per_min=30, time_fn=lambda: fake_time[0])
+        limiter, fake_time = _paced_limiter(calls_per_min=30)
         limiter.set_universe_budget(5)  # Default budget
         
         ids, _ = collect.universe(nets=("solana", "bsc", "robinhood"), pages=2, include_trending=True, limiter=limiter)
@@ -1755,8 +1767,7 @@ def test_dossier_budget_exhausted_raises_retry():
                                             Mock(status_code=200, json=lambda: {"data": {"attributes": {}}}))
     
     try:
-        fake_time = [0.0]
-        limiter = collect.GTRateLimiter(calls_per_min=5, time_fn=lambda: fake_time[0])
+        limiter, fake_time = _paced_limiter(calls_per_min=5)
         # Exhaust budget
         for _ in range(5):
             limiter.spend(1, priority=True)
@@ -2896,10 +2907,10 @@ def test_young_token_429_gets_in_cycle_retry(monkeypatch):
                 "description": "a token", "x_handle": None}
     
     original_wait = collect.GTRateLimiter.wait_if_needed
-    def fake_wait_if_needed(self, priority=False):
+    def fake_wait_if_needed(self, priority=False, deadline=None):
         if priority:
             wait_called[0] = True
-        return original_wait(self, priority)
+        return original_wait(self, priority, deadline=deadline)
     
     monkeypatch.setattr(shift, "universe", lambda limiter=None, fomo=None: ([young_tid], {}))
     monkeypatch.setattr(shift, "shortlist", fake_shortlist)
