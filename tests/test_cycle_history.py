@@ -458,6 +458,9 @@ def test_cycle_and_soft_log_format_unchanged():
         'top_10_percent=%s top_wallet_percent=%s developer_holding_percentage=%s '
         'holder_count=%s rpc_ok=%s soft_scores=%s"'
     ) in src
+    assert (
+        'log.info("unevaluated %d ids (dex_slots=%d, gt_available=%d)",'
+    ) in src
 
 
 def test_run_once_writes_history_and_keeps_log_lines(hist, monkeypatch, caplog):
@@ -569,6 +572,10 @@ def test_ops_html_has_briefing_and_trends():
     assert "Reached judge" in html
     assert "Passed judge/picks" in html
     assert "No tokens passed judge/picks" in html
+    assert 'id="briefing-regime"' in html
+    assert 'id="trends-regime"' in html
+    assert "Market regime (log-only)" in html
+    assert "regime / day" in html
 
 
 def test_briefing_payload_empty_store(hist):
@@ -579,6 +586,8 @@ def test_briefing_payload_empty_store(hist):
     assert payload["trends"]["insufficient_history"] is True
     assert payload["trends"]["flags"] == []
     assert "insufficient history" in payload["markdown"]
+    assert "## Market regime (log-only)" in payload["markdown"]
+    assert "does not affect filtering or judging" in payload["markdown"]
 
 
 def test_no_env_leak_in_briefing_md(hist, monkeypatch):
