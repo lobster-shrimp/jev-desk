@@ -457,6 +457,7 @@ def test_briefing_labels_reached_vs_passed(tmp_path, monkeypatch):
     cycle_history.reset()
     empty = cycle_history.build_briefing()
     assert "reached judge 0" in empty["markdown"]
+    assert "- passed judge/picks: 0" in empty["markdown"]
     assert "No tokens passed judge/picks in the window." in empty["markdown"]
     assert "No tokens judged in the window." not in empty["markdown"]
     assert "## Passed judge/picks" in empty["markdown"]

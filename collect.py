@@ -17,8 +17,21 @@ import requests
 
 from fomo_api import Fomo                      # Privy bearer out of Chrome over CDP
 from secret_utils import safe_err
+import gt_info_cache
 
 log = logging.getLogger("collect")
+
+# Per-cycle GT /info accounting. attempts/ok count real HTTP /info calls only.
+# Cache hits skip the call and the limiter spend; concentration kills never look up.
+_gt_info_cycle = {"attempts": 0, "ok": 0, "hits": 0, "misses": 0}
+
+
+def reset_gt_info_cycle_stats() -> None:
+    _gt_info_cycle.update(attempts=0, ok=0, hits=0, misses=0)
+
+
+def gt_info_cycle_stats() -> dict:
+    return dict(_gt_info_cycle)
 
 
 class GTRateLimiter:
@@ -1009,63 +1022,8 @@ def apply_wallet_concentration(t: dict) -> dict:
     return t
 
 
-def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | None = None) -> dict:
-    """Wallet-concentration first, then one GT /info call if that does not kill.
-
-    Cheap Solana RPC / EVM holder checks run before any GT spend so a top_wallet
-    (or EVM unverified / pending) kill does not burn a rate-limit slot.
-    holder_count, authority and honeypot still come from GT /info.
-
-    If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
-    If waiting for a slot would cross deadline, raises DossierDeadlineExceeded.
-    On GT 429, records the backoff with the limiter and raises DossierRetryNeeded."""
-    from filter import concentration_kill
-
-    d = apply_wallet_concentration(t)
-    if concentration_kill(d):
-        return d
-
-    if limiter:
-        # Wait for any 429 backoff BEFORE spending a slot (order matters!)
-        wait_start = limiter.time_fn()
-        if deadline is None:
-            deadline = getattr(limiter, "cycle_deadline", None)
-        if not limiter.wait_if_needed(priority=True, deadline=deadline):
-            raise DossierDeadlineExceeded(f"GT deadline exceeded for {t['ticker']}")
-        wait_duration = limiter.time_fn() - wait_start
-        if wait_duration >= 0.1:
-            _dossier_wait_log(t["ticker"], wait_duration, limiter)
-        if not limiter.spend(1, priority=True):
-            log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
-            raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
-    
-    net = GT_NET[t["net"]]
-    resp = requests.get(f"{GT}/networks/{net}/tokens/{t['addr']}/info", headers=UA, timeout=20)
-    if resp.status_code == 429:
-        # Extract Retry-After header if present
-        retry_after_sec = None
-        if hasattr(resp, 'headers') and resp.headers:
-            retry_after = resp.headers.get("Retry-After")
-            if retry_after and isinstance(retry_after, (str, int, float)):
-                try:
-                    retry_after_sec = float(retry_after)
-                except (ValueError, TypeError):
-                    retry_after_sec = None
-        
-        # Record the 429 with the limiter so it enforces backoff
-        if limiter:
-            limiter.record_429(retry_after_sec)
-        
-        log.warning("GeckoTerminal 429 on dossier for %s (Retry-After: %s), will retry next cycle", 
-                    t["ticker"], retry_after_sec if retry_after_sec is not None else "missing/0")
-        raise DossierRetryNeeded(f"GT 429 for {t['ticker']}")
-    
-    if limiter:
-        limiter.record_success()  # clear saturated flag on success
-    
-    a = resp.json()["data"]["attributes"]
-
-    # Normalize authority fields for Solana tokens
+def _apply_gt_info_attributes(d: dict, t: dict, net: str, a: dict) -> dict:
+    """Merge a GT /info attributes object onto the token. Used for live and cache."""
     mint_auth_normalized, mint_auth_raw = _normalize_authority(a.get("mint_authority"))
     freeze_auth_normalized, freeze_auth_raw = _normalize_authority(a.get("freeze_authority"))
 
@@ -1090,8 +1048,82 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | Non
         d["top_wallet_percent"] = preserved_top_wallet
     if preserved_top_10 is not None:
         d["top_10_percent"] = preserved_top_10
-
     return d
+
+
+def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | None = None) -> dict:
+    """Wallet-concentration first, then cached or live GT /info if that does not kill.
+
+    Cheap Solana RPC / EVM holder checks run before any GT spend so a top_wallet
+    (or EVM unverified / pending) kill does not burn a rate-limit slot.
+    holder_count, authority and honeypot still come from GT /info (or its cache).
+
+    A fresh cache hit skips the GT call and the limiter spend. Entries older than
+    GT_INFO_CACHE_TTL_MIN are treated as a miss so filter fields are not stale.
+
+    If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
+    If waiting for a slot would cross deadline, raises DossierDeadlineExceeded.
+    On GT 429, records the backoff with the limiter and raises DossierRetryNeeded.
+    429s and errors are never written to the cache."""
+    from filter import concentration_kill
+
+    d = apply_wallet_concentration(t)
+    if concentration_kill(d):
+        return d
+
+    net = GT_NET[t["net"]]
+    cached = gt_info_cache.get(net, t["addr"])
+    if cached is not None:
+        _gt_info_cycle["hits"] += 1
+        return _apply_gt_info_attributes(d, t, net, cached)
+
+    _gt_info_cycle["misses"] += 1
+
+    if limiter:
+        # Wait for any 429 backoff BEFORE spending a slot (order matters!)
+        wait_start = limiter.time_fn()
+        if deadline is None:
+            deadline = getattr(limiter, "cycle_deadline", None)
+        if not limiter.wait_if_needed(priority=True, deadline=deadline):
+            raise DossierDeadlineExceeded(f"GT deadline exceeded for {t['ticker']}")
+        wait_duration = limiter.time_fn() - wait_start
+        if wait_duration >= 0.1:
+            _dossier_wait_log(t["ticker"], wait_duration, limiter)
+        if not limiter.spend(1, priority=True):
+            log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
+            raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
+
+    _gt_info_cycle["attempts"] += 1
+    resp = requests.get(f"{GT}/networks/{net}/tokens/{t['addr']}/info", headers=UA, timeout=20)
+    if resp.status_code == 429:
+        # Extract Retry-After header if present
+        retry_after_sec = None
+        if hasattr(resp, 'headers') and resp.headers:
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after and isinstance(retry_after, (str, int, float)):
+                try:
+                    retry_after_sec = float(retry_after)
+                except (ValueError, TypeError):
+                    retry_after_sec = None
+
+        # Record the 429 with the limiter so it enforces backoff
+        if limiter:
+            limiter.record_429(retry_after_sec)
+
+        log.warning("GeckoTerminal 429 on dossier for %s (Retry-After: %s), will retry next cycle",
+                    t["ticker"], retry_after_sec if retry_after_sec is not None else "missing/0")
+        raise DossierRetryNeeded(f"GT 429 for {t['ticker']}")
+
+    if limiter:
+        limiter.record_success()  # clear saturated flag on success
+
+    a = resp.json()["data"]["attributes"]
+    if not gt_info_cache.is_complete_attributes(a):
+        raise ValueError("GT /info attributes missing")
+
+    gt_info_cache.put(net, t["addr"], a)
+    _gt_info_cycle["ok"] += 1
+    return _apply_gt_info_attributes(d, t, net, a)
 
 
 def clean_handle(h):
