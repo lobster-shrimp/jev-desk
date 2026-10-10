@@ -1064,7 +1064,7 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | Non
     If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
     If waiting for a slot would cross deadline, raises DossierDeadlineExceeded.
     On GT 429, records the backoff with the limiter and raises DossierRetryNeeded.
-    429s and errors are never written to the cache."""
+    Only HTTP 200 responses with holder_count are written to the cache."""
     from filter import concentration_kill
 
     d = apply_wallet_concentration(t)
@@ -1118,10 +1118,13 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | Non
         limiter.record_success()  # clear saturated flag on success
 
     a = resp.json()["data"]["attributes"]
-    if not gt_info_cache.is_complete_attributes(a):
+    if not gt_info_cache.is_attributes_object(a):
         raise ValueError("GT /info attributes missing")
 
-    gt_info_cache.put(net, t["addr"], a)
+    # Only 200 + complete holder data is cached. Incomplete holders (common
+    # on young tokens) and non-200 bodies are applied live but not stored.
+    if resp.status_code == 200:
+        gt_info_cache.put(net, t["addr"], a, status_code=resp.status_code)
     _gt_info_cycle["ok"] += 1
     return _apply_gt_info_attributes(d, t, net, a)
 
