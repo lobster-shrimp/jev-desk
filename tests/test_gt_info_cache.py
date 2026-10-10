@@ -131,6 +131,14 @@ def test_expired_cache_refetches(fresh_stats, monkeypatch):
     gt_info_cache.set_time_fn(clock.time)
     limiter = GTRateLimiter(calls_per_min=8, time_fn=clock.time, sleep_fn=lambda d: None)
     gt_info = []
+    spends = []
+    real_spend = limiter.spend
+
+    def spy_spend(*args, **kwargs):
+        spends.append(limiter.time_fn())
+        return real_spend(*args, **kwargs)
+
+    limiter.spend = spy_spend
 
     def fake_get(url, **kwargs):
         gt_info.append(url)
@@ -144,7 +152,7 @@ def test_expired_cache_refetches(fresh_stats, monkeypatch):
     assert first["holder_count"] == 51
     assert second["holder_count"] == 52
     assert len(gt_info) == 2
-    assert len(limiter.calls) == 2
+    assert len(spends) == 2
     stats = collect.gt_info_cycle_stats()
     assert stats["attempts"] == 2
     assert stats["ok"] == 2
