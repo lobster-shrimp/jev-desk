@@ -145,7 +145,9 @@ class RateLimiter:
         """Record 429 and set backoff."""
         backoff = retry_after if retry_after else 60
         self.backoff_until = time.time() + backoff
-        log.warning("429 received, backing off %ds", backoff)
+        # Next callers see is_in_backoff() and return rate_limited immediately.
+        # No sleep here (TOKEN_TIMEOUT is 20s; a 60s sleep would blow the budget).
+        log.warning("429 received, skipping source for %ds (no sleep)", backoff)
 
 
 def _get_limiter(name: str, rate: float) -> RateLimiter:

@@ -261,6 +261,9 @@ def test_briefing_last_24h_summary(hist):
     assert "JK" in payload["markdown"]
     assert "## Momentum" in payload["markdown"]
     assert "shadow only" in payload["markdown"].lower()
+    assert "reached judge 1" in payload["markdown"]
+    assert "## Passed judge/picks" in payload["markdown"]
+    assert "No tokens judged in the window." not in payload["markdown"]
     assert w["shadow"]["fills"] == 0
     assert "picks are not fills" in w["shadow"]["fills_note"]
 
@@ -548,6 +551,9 @@ def test_ops_html_has_briefing_and_trends():
     assert "Solana only" in html
     assert "insufficient history" in html
     assert "Young free-pass" in html or "young free-pass" in html.lower()
+    assert "Reached judge" in html
+    assert "Passed judge/picks" in html
+    assert "No tokens passed judge/picks" in html
 
 
 def test_briefing_payload_empty_store(hist):
@@ -656,6 +662,9 @@ def test_kill_mix_excludes_free_pass(hist):
     assert w["kill_mix"]["shares"]["free"] == pytest.approx(100.0)
     md = hist.build_briefing(ts(2026, 10, 9, 9))["markdown"]
     assert "pass: 8" not in md
+    assert "reached judge 0" in md
+    assert "No tokens passed judge/picks in the window." in md
+    assert "No tokens judged in the window." not in md
 
 
 def test_backfill_gt_429_from_young_hit_429_lines(hist):

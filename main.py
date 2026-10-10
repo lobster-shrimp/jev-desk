@@ -63,6 +63,9 @@ def _history_hook(kind, **kwargs):
         log.warning("cycle history: %s", safe_err(e))
 
 
+# Judge question-set router. 8453 (Base) shares the bsc seat on purpose
+# (questions.CHAIN_BSC). Holder APIs must use t["net"] (8453), never this map —
+# mapping Base to "bsc" here must not send Honeypot/GoPlus/RPC to chain id 56.
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
 CYCLE_SECONDS = 900
 GT_CALLS_PER_MIN = _env_int("GT_CALLS_PER_MIN", 5)  # ~5/min for keyless GT
@@ -588,6 +591,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                 stats["chain"][k] = stats["chain"].get(k, 0) + 1
                 record(d, "chain", k)
                 continue
+
+            if d.get("chain") != "solana" and d.get("evm_holder_source"):
+                log.info("chain tid=%s ticker=%s reason=pass evm_source=%s top_10_percent=%s top_wallet_percent=%s holder_count=%s",
+                         d.get("tid"), d.get("ticker", "?"), d.get("evm_holder_source"),
+                         d.get("top_10_percent"), d.get("top_wallet_percent"), d.get("holder_count"))
 
             d["intended_ticket_usd"] = bank * 0.06   # the most SIZE could ever allow
             d["x_account"] = desk.read_x(d["x_handle"]) if d["x_handle"] else None

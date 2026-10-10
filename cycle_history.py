@@ -995,7 +995,7 @@ def render_briefing_md(payload: dict) -> str:
         "## Overall",
         f"- Cycles: {w.get('cycles', 0)} "
         f"(uptime {up.get('uptime_pct', 0):.1f}% vs {up.get('expected_cycles', 0)} expected at 15 min)",
-        f"- Seen {w.get('seen', 0)} · benched {w.get('benched', 0)} · judged {w.get('judged', 0)} "
+        f"- Seen {w.get('seen', 0)} · benched {w.get('benched', 0)} · reached judge {w.get('judged', 0)} "
         f"· requeued {w.get('requeued', 0)}",
         f"- Carry {w.get('carry', 0)} · unevaluated {w.get('unevaluated', 0)} "
         f"· GT 429s {w.get('gt_429', 0)} · GT defers {w.get('gt_defer', 0)}",
@@ -1008,7 +1008,7 @@ def render_briefing_md(payload: dict) -> str:
         "",
         "## Per chain",
         "",
-        "| chain | judged | soft | young free | young 429 | young chain | young soft |",
+        "| chain | reached judge | soft | young free | young 429 | young chain | young soft |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     by_chain = (w.get("per_chain") or {}).get("by_chain") or {}
@@ -1025,7 +1025,7 @@ def render_briefing_md(payload: dict) -> str:
     lines += [
         "",
         "## Solana",
-        f"- Judged: {sol.get('judged', 0)} · soft: {sol.get('soft', 0)} · young free: {sol.get('young_free', 0)}",
+        f"- Reached judge: {sol.get('judged', 0)} · soft: {sol.get('soft', 0)} · young free: {sol.get('young_free', 0)}",
         f"- Median momentum: {_fmt_mom(w.get('median_momentum_solana') if w.get('median_momentum_solana') is not None else sol.get('median_momentum'))}",
         f"- Young outcomes: {sol.get('young_outcomes') or {}}",
         "",
@@ -1039,10 +1039,10 @@ def render_briefing_md(payload: dict) -> str:
             continue
         for reason, count in sorted(bag.items(), key=lambda kv: (-kv[1], kv[0])):
             lines.append(f"- {reason}: {count}")
-    lines += ["", "## Judged tokens", ""]
+    lines += ["", "## Passed judge/picks", ""]
     judged = w.get("judged_tokens") or []
     if not judged:
-        lines.append("No tokens judged in the window.")
+        lines.append("No tokens passed judge/picks in the window.")
     else:
         lines.append("| ticker | chain | age min | momentum | scores |")
         lines.append("| --- | --- | ---: | ---: | --- |")
@@ -1068,7 +1068,7 @@ def render_briefing_md(payload: dict) -> str:
                     "deferred_429": "deferred on 429",
                     "chain": "chain kill",
                     "soft": "soft",
-                    "judged": "judged",
+                    "judged": "passed judge/picks",
                     "trade": "trade",
                     "unevaluated": "unevaluated",
                     "other": "other",
