@@ -385,6 +385,8 @@ def classify_young_outcome(row: dict | None) -> tuple[str, str | None]:
         return "soft", reason
     if stage == "judged":
         return "judged", reason
+    if stage == "judge_error":
+        return "judge_error", reason
     if stage == "trade":
         return "trade", reason
     if stage:
@@ -486,7 +488,7 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
             stage = row.get("stage")
             if stage == "soft" and row.get("tid") in written_tids:
                 continue
-            if stage not in ("judged", "soft"):
+            if stage not in ("judged", "soft", "judge_error"):
                 continue
             _insert_token(db, cycle_id, _token_from_stats_row(row, now, stage))
         later_by_tid = {r.get("tid"): r for r in tokens if r.get("tid")}
@@ -931,6 +933,7 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
     tokens = _tokens_since(since_ts, until_ts=now)
     young = _young_since(since_ts, until_ts=now)
     judged = [t for t in tokens if t.get("kind") == "judged"]
+    judge_errors = [t for t in tokens if t.get("kind") == "judge_error"]
     soft = [t for t in tokens if t.get("kind") == "soft"]
     free = _kill_counts(_merge_counts(*(c["free"] for c in cycles)))
     trade = _kill_counts(_merge_counts(*(c["trade"] for c in cycles)))
@@ -987,6 +990,7 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
         "kills": {"free": free, "trade": trade, "chain": chain, "soft": soft_kills},
         "kill_mix": mix,
         "judged_tokens": judged,
+        "judge_error_tokens": judge_errors,
         "soft_tokens": soft,
         "median_momentum": _median(momenta),
         "median_momentum_soft": _median(soft_momenta),
@@ -1292,12 +1296,13 @@ def render_briefing_md(payload: dict) -> str:
                 f"| {t.get('ticker') or '—'} | {t.get('chain') or '—'} | {age_s} | {mom_s} | {compact or '—'} |"
             )
     lines += ["", "## Judge verdicts", ""]
-    if not judged:
+    verdict_rows = list(judged) + list(w.get("judge_error_tokens") or [])
+    if not verdict_rows:
         lines.append("No judge verdicts in the window.")
     else:
         lines.append("| ticker | chain | verdict | score | conf | reason | scores |")
         lines.append("| --- | --- | --- | ---: | ---: | --- | --- |")
-        for t in judged:
+        for t in verdict_rows:
             scores = t.get("soft_scores") or {}
             compact = ", ".join(
                 f"{k}={v:.3f}" if isinstance(v, (int, float)) else f"{k}={v}"
@@ -1510,7 +1515,7 @@ YOUNG_429_RE = re.compile(
 SOFT_HINT_RE = re.compile(r"soft tid=")
 CHAIN_HINT_RE = re.compile(r"chain tid=")
 JUDGE_RE = re.compile(
-    r"judge tid=(\S+) ticker=(\S+) verdict=(\S+) score=(\S+) "
+    r"judge tid=(\S+) ticker=(.+?) verdict=(\S+) score=(\S+) "
     r"confidence=(\S+) reason=(.*) mode=(\S+)\s*$"
 )
 UNEVAL_RE = re.compile(r"unevaluated (\d+) ids")
@@ -1718,7 +1723,8 @@ def parse_run_log(text: str) -> tuple[list[dict], dict]:
                 continue
             pending_later[tid] = {
                 **existing,
-                "tid": tid, "ticker": ticker, "stage": "judged",
+                "tid": tid, "ticker": ticker,
+                "stage": "judge_error" if jverdict == "error" else "judged",
                 "reason": existing.get("reason"),
                 "verdict": existing.get("verdict") or "PASS",
                 "net": chain_id_of(tid=tid),

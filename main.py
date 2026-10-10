@@ -127,20 +127,31 @@ def _truncate_judge_reason(text, n=JUDGE_REASON_MAX) -> str:
     return s[: n - 3] + "..."
 
 
-def _collect_soft_scores(ans: dict) -> dict:
+def _as_dict(obj):
+    return obj if isinstance(obj, dict) else {}
+
+
+def _as_number(obj):
+    if isinstance(obj, bool) or not isinstance(obj, (int, float)):
+        return None
+    return obj
+
+
+def _collect_soft_scores(ans) -> dict:
     soft_scores = {}
     for name in SOFT.keys():
-        a = (ans or {}).get(name)
-        if a:
+        a = _as_dict(ans).get(name)
+        if isinstance(a, dict):
             v = a.get("noul", a.get("score"))
             if v is not None:
                 soft_scores[name] = v
     return soft_scores
 
 
-def _compact_answers_reason(ans: dict) -> str:
+def _compact_answers_reason(ans) -> str:
     bits = []
-    shape = (ans or {}).get("shape") or {}
+    ans = _as_dict(ans)
+    shape = _as_dict(ans.get("shape"))
     if shape.get("choice"):
         bits.append(f"shape={shape['choice']}")
     for name in (
@@ -148,7 +159,9 @@ def _compact_answers_reason(ans: dict) -> str:
         "concentration_is_exit_risk", "authority_risk", "sell_side_risk",
         "data_coverage", "worth_trading_at_all",
     ):
-        a = (ans or {}).get(name) or {}
+        a = ans.get(name)
+        if not isinstance(a, dict):
+            continue
         if a.get("noul") is not None:
             bits.append(f"{name}={a['noul']}")
         elif a.get("choice") is not None:
@@ -176,21 +189,25 @@ def _token_judge_reason(d, ans, extra=None) -> str:
 def _score_and_confidence(ans, pick_answers=None, order=None, ticker=None):
     score = None
     confidence = None
-    if order and (order.get("token") or {}).get("ticker") == ticker:
-        score = ((pick_answers or {}).get("worth_trading_at_all") or {}).get("noul")
-        confidence = order.get("confidence")
+    order = _as_dict(order)
+    token = _as_dict(order.get("token"))
+    pick_answers = _as_dict(pick_answers)
+    ans = _as_dict(ans)
+    if order and token.get("ticker") == ticker:
+        score = _as_number(_as_dict(pick_answers.get("worth_trading_at_all")).get("noul"))
+        confidence = _as_number(order.get("confidence"))
         return score, confidence
     if pick_answers:
-        score = (pick_answers.get("worth_trading_at_all") or {}).get("noul")
-        best = pick_answers.get("best") or {}
-        confidence = best.get("confidence")
-        probs = best.get("probabilities") or {}
-        if ticker in probs:
-            confidence = probs[ticker]
-    if score is None and ans:
-        score = (ans.get("liquidity_fits_ticket") or {}).get("noul")
-    if confidence is None and ans:
-        confidence = (ans.get("shape") or {}).get("confidence")
+        score = _as_number(_as_dict(pick_answers.get("worth_trading_at_all")).get("noul"))
+        best = _as_dict(pick_answers.get("best"))
+        confidence = _as_number(best.get("confidence"))
+        probs = best.get("probabilities")
+        if isinstance(probs, dict) and ticker in probs:
+            confidence = _as_number(probs.get(ticker))
+    if score is None:
+        score = _as_number(_as_dict(ans.get("liquidity_fits_ticket")).get("noul"))
+    if confidence is None:
+        confidence = _as_number(_as_dict(ans.get("shape")).get("confidence"))
     return score, confidence
 
 
@@ -207,35 +224,46 @@ def _pick_verdict_extra(order, pick_answers, pick_error, ticker):
     """LOG-ONLY. Maps the already-made pick decision to a short extra + verdict."""
     if pick_error:
         return "error", pick_error
-    if order and (order.get("token") or {}).get("ticker") == ticker:
+    order = _as_dict(order)
+    token = _as_dict(order.get("token"))
+    if order and token.get("ticker") == ticker:
         return "pick", f"picked {ticker}"
+    pick_answers = _as_dict(pick_answers)
     if pick_answers:
-        worth = (pick_answers.get("worth_trading_at_all") or {}).get("noul")
-        best = pick_answers.get("best") or {}
-        conf = best.get("confidence")
+        worth = _as_number(_as_dict(pick_answers.get("worth_trading_at_all")).get("noul"))
+        best = _as_dict(pick_answers.get("best"))
+        conf = _as_number(best.get("confidence"))
         choice = best.get("choice")
         if worth is not None and worth < PICK_MIN_WORTH:
             return "pass", f"worth_trading_at_all={worth} below {PICK_MIN_WORTH}"
         if conf is not None and conf < PICK_MIN_CONF:
             return "pass", f"confidence={conf} below {PICK_MIN_CONF}"
         if choice and choice != ticker:
-            probs = best.get("probabilities") or {}
             extra = f"not chosen (pick={choice})"
-            if ticker in probs:
-                extra += f" p={probs[ticker]}"
+            probs = best.get("probabilities")
+            if isinstance(probs, dict) and ticker in probs:
+                extra += f" p={probs.get(ticker)}"
             return "pass", extra
         if not choice:
             return "pass", "pick declined"
     if order:
-        other = (order.get("token") or {}).get("ticker")
+        other = token.get("ticker")
         return "pass", f"not chosen (pick={other})" if other else "not chosen"
     return "pass", "no pick"
 
 
 def _apply_judge_verdicts(stats, survivors, order, pick_answers, pick_error):
     """Annotate judged token rows and emit one judge tid= line each. Log-only."""
-    by_tid = {d.get("tid"): (d, ans) for d, ans in (survivors or [])}
+    by_tid = {}
+    for item in survivors or []:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+        d, ans = item[0], item[1]
+        if isinstance(d, dict) and d.get("tid"):
+            by_tid[d.get("tid")] = (d, ans)
     for row in stats.get("tokens") or []:
+        if not isinstance(row, dict):
+            continue
         if row.get("stage") != "judged":
             continue
         if row.get("judge_verdict") == "error":
@@ -243,7 +271,7 @@ def _apply_judge_verdicts(stats, survivors, order, pick_answers, pick_error):
         tid = row.get("tid")
         pair = by_tid.get(tid)
         d, ans = pair if pair else ({}, {})
-        ticker = row.get("ticker") or d.get("ticker")
+        ticker = row.get("ticker") or _as_dict(d).get("ticker")
         verdict, extra = _pick_verdict_extra(order, pick_answers, pick_error, ticker)
         if verdict == "error":
             reason = _truncate_judge_reason(extra)
@@ -774,13 +802,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                 )
                 raise JudgeDown(str(e))
             except Exception as e:
-                log.warning("judge failed %s: %s", d["ticker"], e)
+                log.warning("judge failed %s: %s", d["ticker"], safe_err(e))
                 err = safe_err(e)
                 _log_judge_line(
                     tid=d.get("tid"), ticker=d.get("ticker"), verdict="error",
                     score=None, confidence=None, reason=err,
                 )
-                record(d, "judged", None, judge_verdict="error", judge_reason=err)
+                record(d, "judge_error", None, judge_verdict="error", judge_reason=err)
                 continue                             # no bench: the token is not at fault
 
             soft_result = soft_kill(ans, age_minutes=d.get("age_minutes"))
@@ -887,11 +915,15 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             log.warning("pick failed (NO PICK): %s", safe_err(e))
             captured.setdefault("error", safe_err(e))
             order = None  # Failed pick means no order this cycle
-        _apply_judge_verdicts(
-            stats, survivors, order,
-            (captured.get("r") or {}).get("answers"),
-            captured.get("error"),
-        )
+        pick_r = captured.get("r") if isinstance(captured.get("r"), dict) else {}
+        try:
+            _apply_judge_verdicts(
+                stats, survivors, order,
+                pick_r.get("answers"),
+                captured.get("error"),
+            )
+        except Exception as e:
+            log.warning("judge verdicts: %s", safe_err(e))
 
     _history_hook("cycle", stats=stats, shadow=shadow)
 

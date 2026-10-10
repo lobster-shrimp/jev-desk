@@ -323,9 +323,23 @@ def test_run_once_logs_error_with_safe_err(hist, monkeypatch, caplog):
     assert "mode=" in lines[0]
     judged = [t for t in stats["tokens"] if t.get("judge_verdict") == "error"]
     assert len(judged) == 1
+    assert judged[0]["stage"] == "judge_error"
     assert "SUPERSECRET123" not in (judged[0].get("judge_reason") or "")
-    stored = [t for t in hist._tokens_since(0) if t.get("judge_verdict") == "error"]
+    stored = [t for t in hist._tokens_since(0) if t.get("kind") == "judge_error"]
     assert len(stored) == 1
+    assert stored[0]["judge_verdict"] == "error"
+    w = hist.summarize_window(0, time.time() + 10)
+    assert w["judged_tokens"] == []
+    assert w["judge_error_tokens"][0]["ticker"] == "ERR"
+    md = hist.build_briefing(time.time() + 10)["markdown"]
+    passed = md.split("## Passed judge/picks")[1].split("## Judge verdicts")[0]
+    verdicts = md.split("## Judge verdicts")[1]
+    assert "ERR" not in passed
+    assert "ERR" in verdicts
+    warn = [r.message for r in caplog.records if "judge failed" in r.message]
+    assert warn
+    assert "SUPERSECRET123" not in warn[0]
+    assert "REDACTED" in warn[0] or "timeout" in warn[0]
 
 
 def test_pick_judge_error_is_verdict_error(hist, monkeypatch, caplog):
@@ -389,6 +403,8 @@ def test_existing_log_lines_unchanged_in_source():
         'holder_count=%s rpc_ok=%s soft_scores=%s"'
     ) in src
     assert 'log.info("unevaluated %d ids (dex_slots=%d, gt_available=%d)",' in src
+    assert 'log.warning("judge failed %s: %s", d["ticker"], safe_err(e))' in src
+    assert 'ticker=(.+?) verdict=' in (ROOT / "cycle_history.py").read_text()
 
 
 def test_backfill_parses_judge_line(hist):
@@ -405,6 +421,133 @@ def test_backfill_parses_judge_line(hist):
     assert "worth_trading_at_all=0.2 below 0.6" in (judged[0]["judge_reason"] or "")
     assert judged[0]["judge_score"] == pytest.approx(0.2)
     assert judged[0]["judge_confidence"] == pytest.approx(0.9)
+
+
+def test_backfill_judge_ticker_with_spaces(hist):
+    log_text = """
+2026-10-10 09:33:01,001 desk INFO judge tid=Spc:1399811149 ticker=Hello World verdict=pass score=0.2 confidence=0.9 reason=ok mode=live
+2026-10-10 09:33:02,002 desk INFO cycle: 1 seen, 0 benched, free {}, trade {}, chain {}, soft {}, judged 1, requeued 0
+"""
+    n = hist.backfill_text(log_text)
+    assert n["inserted"] == 1
+    judged = [t for t in hist._tokens_since(0) if t["kind"] == "judged"]
+    assert judged[0]["ticker"] == "Hello World"
+
+
+def test_judge_error_not_in_passed_judge_table(hist):
+    hist.on_cycle({
+        "seen": 2, "benched": 0, "judged": 1, "requeued": 0,
+        "free": {}, "trade": {}, "chain": {}, "soft": {},
+        "carry": 0, "unevaluated": 0,
+        "tokens": [{
+            "tid": "ok:1399811149", "ticker": "OKT", "net": 1399811149,
+            "stage": "judged", "age_minutes": 40,
+            "soft_scores": {"momentum_already_spent": 0.2},
+            "judge_verdict": "pass", "judge_reason": "no pick",
+        }, {
+            "tid": "bad:1399811149", "ticker": "BAD", "net": 1399811149,
+            "stage": "judge_error", "age_minutes": 22,
+            "judge_verdict": "error", "judge_reason": "TimeoutError: timeout",
+        }],
+    }, now=ts(2026, 10, 10, 9, 33), source="backfill")
+    w = hist.summarize_window(0, ts(2026, 10, 10, 10))
+    assert [t["ticker"] for t in w["judged_tokens"]] == ["OKT"]
+    assert [t["ticker"] for t in w["judge_error_tokens"]] == ["BAD"]
+    md = hist.build_briefing(ts(2026, 10, 10, 10))["markdown"]
+    passed = md.split("## Passed judge/picks")[1].split("## Judge verdicts")[0]
+    assert "OKT" in passed
+    assert "BAD" not in passed
+    assert "BAD" in md.split("## Judge verdicts")[1]
+
+
+def test_helpers_tolerate_malformed_pick_answers():
+    import main as shift
+    cases = [
+        {"best": "A", "worth_trading_at_all": {"noul": 0.2}},
+        {"best": {"choice": "PPR", "confidence": 0.9, "probabilities": {"PPR": 0.9}},
+         "worth_trading_at_all": "x"},
+        {"best": {"choice": "PPR", "confidence": 0.9, "probabilities": ["A"]},
+         "worth_trading_at_all": {"noul": 0.2}},
+        {"best": {"choice": "PPR", "confidence": "high", "probabilities": {"PPR": 0.9}},
+         "worth_trading_at_all": {"noul": 0.75}},
+    ]
+    for answers in cases:
+        verdict, extra = shift._pick_verdict_extra(None, answers, None, "PPR")
+        assert verdict in ("pass", "error")
+        score, conf = shift._score_and_confidence({}, answers, None, "PPR")
+        assert score is None or isinstance(score, (int, float))
+        assert conf is None or isinstance(conf, (int, float))
+
+
+@pytest.mark.parametrize("pick_answers", [
+    {"best": "A", "worth_trading_at_all": {"type": "noul", "noul": 0.2}},
+    {"best": {"type": "choice", "choice": "PPR", "confidence": 0.9,
+              "probabilities": {"PPR": 0.9}},
+     "worth_trading_at_all": "x"},
+    {"best": {"type": "choice", "choice": "PPR", "confidence": 0.9,
+              "probabilities": ["A"]},
+     "worth_trading_at_all": {"type": "noul", "noul": 0.2}},
+    {"best": {"type": "choice", "choice": "PPR", "confidence": "high",
+              "probabilities": {"PPR": 0.9}},
+     "worth_trading_at_all": {"type": "noul", "noul": 0.75}},
+], ids=["best_str", "worth_str", "probs_list", "conf_text"])
+def test_malformed_pick_answers_no_pick_and_writes_history(
+    hist, monkeypatch, caplog, pick_answers,
+):
+    token = _solana_token(ticker="PPR")
+
+    def fake_judge(question_set, state):
+        if question_set == "market":
+            return {"model": "test", "answers": _pass_soft_answers(), "usage": {}}
+        if question_set == "pick":
+            return {"model": "test", "answers": pick_answers, "usage": {}}
+        return {"model": "test", "answers": {}, "usage": {}}
+
+    shift = _wire_one_token(monkeypatch, token, fake_judge)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(
+            type("F", (), {"token": lambda self: None})(),
+            fake_judge, _Desk(), 1000.0, shadow=True, gt_dossier_reserve=3,
+        )
+    assert order is None
+    assert stats["judged"] == 1
+    rows = hist.cycles_since(0)
+    assert len(rows) == 1
+    stored = hist._tokens_since(0)
+    assert any(t.get("kind") == "judged" for t in stored)
+
+
+def test_apply_judge_verdicts_crash_still_writes_history(hist, monkeypatch, caplog):
+    token = _solana_token(ticker="PPR")
+
+    def fake_judge(question_set, state):
+        if question_set == "market":
+            return {"model": "test", "answers": _pass_soft_answers(), "usage": {}}
+        if question_set == "pick":
+            return {"model": "test", "answers": {
+                "best": {"type": "choice", "choice": "PPR", "confidence": 0.9,
+                         "probabilities": {"PPR": 0.9}},
+                "worth_trading_at_all": {"type": "noul", "noul": 0.2},
+            }, "usage": {}}
+        return {"model": "test", "answers": {}, "usage": {}}
+
+    shift = _wire_one_token(monkeypatch, token, fake_judge)
+
+    def boom(*_a, **_k):
+        raise TypeError("boom api-key=SECRET999")
+
+    monkeypatch.setattr(shift, "_apply_judge_verdicts", boom)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        order, stats = shift.run_once(
+            type("F", (), {"token": lambda self: None})(),
+            fake_judge, _Desk(), 1000.0, shadow=True, gt_dossier_reserve=3,
+        )
+    assert order is None
+    assert hist.cycles_since(0)
+    assert any("judge verdicts:" in r.message for r in caplog.records)
+    assert "SECRET999" not in caplog.text
 
 
 def test_no_env_in_judge_reason(monkeypatch):

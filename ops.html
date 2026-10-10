@@ -1538,7 +1538,7 @@ function renderShadowLedger(ledger) {
 function renderJudgeVerdicts(tokens) {
   const section = document.getElementById('judge-verdicts-section');
   if (!section) return;
-  const rows = (tokens || []).filter(t => t.stage === 'judged' || t.judge_verdict);
+  const rows = (tokens || []).filter(t => t.stage === 'judged' || t.stage === 'judge_error' || t.judge_verdict);
   if (!rows.length) {
     section.innerHTML = '<div class="empty">No tokens reached the judge this cycle</div>';
     return;
@@ -1901,12 +1901,13 @@ function renderBriefing(data) {
   }
 
   const verdictsEl = document.getElementById('briefing-judge-verdicts');
-  if (!judged.length) {
+  const verdictRows = judged.concat(w.judge_error_tokens || []);
+  if (!verdictRows.length) {
     verdictsEl.innerHTML = '<div class="empty">No judge verdicts in the window</div>';
   } else {
     verdictsEl.innerHTML = `<table><thead><tr>
       <th>Ticker</th><th>Chain</th><th>Verdict</th><th>Score</th><th>Conf</th><th>Reason</th><th>Scores</th>
-    </tr></thead><tbody>${judged.map(t => {
+    </tr></thead><tbody>${verdictRows.map(t => {
       const scores = t.soft_scores || {};
       const compact = Object.keys(scores).sort().map(k => `${k}=${Number(scores[k]).toFixed(3)}`).join(', ');
       const score = t.judge_score;
