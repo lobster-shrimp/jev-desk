@@ -30,11 +30,11 @@ from collect import (
 )
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from fomo_api import FomoAuthError
-from pick import pick, size_factor_for
+from pick import pick, size_factor_for, summary
 from secret_utils import safe_err
 import shadow_ledger
 import collect  # For fallback access
-from thresholds import HARD, SOFT
+from thresholds import HARD, SOFT, PICK_MIN_WORTH, PICK_MIN_CONF
 
 def _env_int(name, default):
     """Parse an int env var; missing/empty uses default. Tests call this instead of reloading main."""
@@ -108,6 +108,158 @@ def _fmt_evm_exclusions(excluded: list[tuple[str, float, str]]) -> str:
     return ", ".join(f"{addr[:6]}...{reason}:{pct:.1f}%" for addr, pct, reason in excluded)
 
 
+JUDGE_REASON_MAX = 300
+
+
+def _judge_mode() -> str:
+    return "mock" if os.environ.get("JUDGE_MOCK") == "1" else "live"
+
+
+def _truncate_judge_reason(text, n=JUDGE_REASON_MAX) -> str:
+    """Single-line judge reason, truncated to ~300 chars. Never raises."""
+    if text is None:
+        return ""
+    s = " ".join(str(text).split())
+    if len(s) <= n:
+        return s
+    if n <= 3:
+        return s[:n]
+    return s[: n - 3] + "..."
+
+
+def _collect_soft_scores(ans: dict) -> dict:
+    soft_scores = {}
+    for name in SOFT.keys():
+        a = (ans or {}).get(name)
+        if a:
+            v = a.get("noul", a.get("score"))
+            if v is not None:
+                soft_scores[name] = v
+    return soft_scores
+
+
+def _compact_answers_reason(ans: dict) -> str:
+    bits = []
+    shape = (ans or {}).get("shape") or {}
+    if shape.get("choice"):
+        bits.append(f"shape={shape['choice']}")
+    for name in (
+        "liquidity_fits_ticket", "momentum_already_spent",
+        "concentration_is_exit_risk", "authority_risk", "sell_side_risk",
+        "data_coverage", "worth_trading_at_all",
+    ):
+        a = (ans or {}).get(name) or {}
+        if a.get("noul") is not None:
+            bits.append(f"{name}={a['noul']}")
+        elif a.get("choice") is not None:
+            bits.append(f"{name}={a['choice']}")
+        elif a.get("score") is not None:
+            bits.append(f"{name}={a['score']}")
+    return "; ".join(bits)
+
+
+def _token_judge_reason(d, ans, extra=None) -> str:
+    bits = []
+    if extra:
+        bits.append(extra)
+    try:
+        bits.append(summary(d, ans or {}))
+    except Exception:
+        compact = _compact_answers_reason(ans or {})
+        if compact:
+            bits.append(compact)
+    if not bits:
+        bits.append("judged")
+    return _truncate_judge_reason("; ".join(bits))
+
+
+def _score_and_confidence(ans, pick_answers=None, order=None, ticker=None):
+    score = None
+    confidence = None
+    if order and (order.get("token") or {}).get("ticker") == ticker:
+        score = ((pick_answers or {}).get("worth_trading_at_all") or {}).get("noul")
+        confidence = order.get("confidence")
+        return score, confidence
+    if pick_answers:
+        score = (pick_answers.get("worth_trading_at_all") or {}).get("noul")
+        best = pick_answers.get("best") or {}
+        confidence = best.get("confidence")
+        probs = best.get("probabilities") or {}
+        if ticker in probs:
+            confidence = probs[ticker]
+    if score is None and ans:
+        score = (ans.get("liquidity_fits_ticket") or {}).get("noul")
+    if confidence is None and ans:
+        confidence = (ans.get("shape") or {}).get("confidence")
+    return score, confidence
+
+
+def _log_judge_line(*, tid, ticker, verdict, score, confidence, reason):
+    """One INFO line per token that reached the judge. key=value, no secrets."""
+    log.info(
+        "judge tid=%s ticker=%s verdict=%s score=%s confidence=%s reason=%s mode=%s",
+        tid, ticker or "?", verdict, score, confidence,
+        _truncate_judge_reason(reason), _judge_mode(),
+    )
+
+
+def _pick_verdict_extra(order, pick_answers, pick_error, ticker):
+    """LOG-ONLY. Maps the already-made pick decision to a short extra + verdict."""
+    if pick_error:
+        return "error", pick_error
+    if order and (order.get("token") or {}).get("ticker") == ticker:
+        return "pick", f"picked {ticker}"
+    if pick_answers:
+        worth = (pick_answers.get("worth_trading_at_all") or {}).get("noul")
+        best = pick_answers.get("best") or {}
+        conf = best.get("confidence")
+        choice = best.get("choice")
+        if worth is not None and worth < PICK_MIN_WORTH:
+            return "pass", f"worth_trading_at_all={worth} below {PICK_MIN_WORTH}"
+        if conf is not None and conf < PICK_MIN_CONF:
+            return "pass", f"confidence={conf} below {PICK_MIN_CONF}"
+        if choice and choice != ticker:
+            probs = best.get("probabilities") or {}
+            extra = f"not chosen (pick={choice})"
+            if ticker in probs:
+                extra += f" p={probs[ticker]}"
+            return "pass", extra
+        if not choice:
+            return "pass", "pick declined"
+    if order:
+        other = (order.get("token") or {}).get("ticker")
+        return "pass", f"not chosen (pick={other})" if other else "not chosen"
+    return "pass", "no pick"
+
+
+def _apply_judge_verdicts(stats, survivors, order, pick_answers, pick_error):
+    """Annotate judged token rows and emit one judge tid= line each. Log-only."""
+    by_tid = {d.get("tid"): (d, ans) for d, ans in (survivors or [])}
+    for row in stats.get("tokens") or []:
+        if row.get("stage") != "judged":
+            continue
+        if row.get("judge_verdict") == "error":
+            continue
+        tid = row.get("tid")
+        pair = by_tid.get(tid)
+        d, ans = pair if pair else ({}, {})
+        ticker = row.get("ticker") or d.get("ticker")
+        verdict, extra = _pick_verdict_extra(order, pick_answers, pick_error, ticker)
+        if verdict == "error":
+            reason = _truncate_judge_reason(extra)
+        else:
+            reason = _token_judge_reason(d or row, ans, extra)
+        score, confidence = _score_and_confidence(ans, pick_answers, order, ticker)
+        row["judge_verdict"] = verdict
+        row["judge_reason"] = reason
+        row["judge_score"] = score
+        row["judge_confidence"] = confidence
+        _log_judge_line(
+            tid=tid, ticker=ticker, verdict=verdict,
+            score=score, confidence=confidence, reason=reason,
+        )
+
+
 def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER_RESERVE, 
              gt_limiter=None, gt_universe_budget=GT_UNIVERSE_BUDGET, cycle_time_budget=CYCLE_TIME_BUDGET_SEC):
     mode_str = "SHADOW" if shadow else "LIVE"
@@ -166,7 +318,9 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Reserve slots for dossiers (logged inside reserve())
     gt_limiter.reserve(gt_dossier_reserve)
 
-    def record(t, stage, reason=None, soft_noul=None, soft_scores=None):
+    def record(t, stage, reason=None, soft_noul=None, soft_scores=None,
+               judge_verdict=None, judge_reason=None, judge_score=None,
+               judge_confidence=None):
         """One row per token for the log and the ops panel: where it stopped and why."""
         row = {
             "tid": t.get("tid"), "ticker": t.get("ticker"), "chain": t.get("chain"),
@@ -179,6 +333,14 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             row["soft_noul"] = soft_noul
         if soft_scores:
             row["soft_scores"] = soft_scores
+        if judge_verdict is not None:
+            row["judge_verdict"] = judge_verdict
+        if judge_reason is not None:
+            row["judge_reason"] = _truncate_judge_reason(judge_reason)
+        if judge_score is not None:
+            row["judge_score"] = judge_score
+        if judge_confidence is not None:
+            row["judge_confidence"] = judge_confidence
         for k in ("net", "top_10_percent", "top_wallet_percent",
                   "developer_holding_percentage", "holder_count"):
             if t.get(k) is not None:
@@ -606,22 +768,26 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                 stats["judged"] += 1
             except RuntimeError as e:                # 422: the question is wrong and stays wrong
                 log.error("malformed question set, stopping cycle: %s", e)
+                _log_judge_line(
+                    tid=d.get("tid"), ticker=d.get("ticker"), verdict="error",
+                    score=None, confidence=None, reason=safe_err(e),
+                )
                 raise JudgeDown(str(e))
             except Exception as e:
                 log.warning("judge failed %s: %s", d["ticker"], e)
+                err = safe_err(e)
+                _log_judge_line(
+                    tid=d.get("tid"), ticker=d.get("ticker"), verdict="error",
+                    score=None, confidence=None, reason=err,
+                )
+                record(d, "judged", None, judge_verdict="error", judge_reason=err)
                 continue                             # no bench: the token is not at fault
 
             soft_result = soft_kill(ans, age_minutes=d.get("age_minutes"))
             if soft_result:
                 reason, noul = soft_result
                 # Collect all SOFT scores that were asked (compact one-line summary)
-                soft_scores = {}
-                for name in SOFT.keys():
-                    a = ans.get(name)
-                    if a:
-                        v = a.get("noul", a.get("score"))
-                        if v is not None:
-                            soft_scores[name] = v
+                soft_scores = _collect_soft_scores(ans)
                 # Log detailed soft kill with noul and age
                 log.info("soft tid=%s ticker=%s reason=%s noul=%s age_minutes=%s top_10_percent=%s top_wallet_percent=%s developer_holding_percentage=%s holder_count=%s rpc_ok=%s soft_scores=%s",
                          d.get("tid"), d.get("ticker"), reason, noul, d.get("age_minutes"),
@@ -646,13 +812,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                 record(d, "soft", reason, soft_noul=noul, soft_scores=soft_scores)
                 continue
 
-            judged_scores = {}
-            for name in SOFT.keys():
-                a = ans.get(name)
-                if a:
-                    v = a.get("noul", a.get("score"))
-                    if v is not None:
-                        judged_scores[name] = v
+            judged_scores = _collect_soft_scores(ans)
             record(d, "judged", None, soft_scores=judged_scores or None)
             survivors.append((d, ans))
         finally:
@@ -705,18 +865,38 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         stats["gt_429"] = int(raw_429)
     except (TypeError, ValueError):
         stats["gt_429"] = int(stats.get("gt_429") or 0)
+
+    # All survivors (including single survivor) go through pick gates.
+    # History is written after pick so judged rows carry the pick/pass/error verdict.
+    order = None
+    if survivors:
+        captured = {}
+        def _capturing_judge(qs, state):
+            try:
+                r = judge(qs, state)
+            except Exception as e:
+                if qs == "pick":
+                    captured["error"] = safe_err(e)
+                raise
+            if qs == "pick":
+                captured["r"] = r
+            return r
+        try:
+            order = pick(_capturing_judge, survivors)
+        except Exception as e:
+            log.warning("pick failed (NO PICK): %s", safe_err(e))
+            captured.setdefault("error", safe_err(e))
+            order = None  # Failed pick means no order this cycle
+        _apply_judge_verdicts(
+            stats, survivors, order,
+            (captured.get("r") or {}).get("answers"),
+            captured.get("error"),
+        )
+
     _history_hook("cycle", stats=stats, shadow=shadow)
 
     if not survivors:
         return None, stats
-    
-    # All survivors (including single survivor) go through pick gates
-    try:
-        order = pick(judge, survivors)
-    except Exception as e:
-        log.warning("pick failed (NO PICK): %s", safe_err(e))
-        order = None  # Failed pick means no order this cycle
-
     if order is None:
         return None, stats
     order["order_id"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
