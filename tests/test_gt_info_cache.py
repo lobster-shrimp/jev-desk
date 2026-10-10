@@ -3,6 +3,7 @@
 Deterministic: fake clocks, no network, no real sleeps.
 """
 import logging
+import sqlite3
 import time
 from unittest.mock import Mock, patch
 
@@ -339,6 +340,109 @@ def test_run_once_counts_only_real_gt_calls(fresh_stats, monkeypatch, caplog, tm
     assert rows[-1]["gt_cache_misses"] == 0
     assert rows[-1]["gt_dossier_attempts"] == 0
     cycle_history.reset()
+
+
+def test_cache_key_includes_chain():
+    """Same address on two chains must not collide. Fails if chain is dropped."""
+    addr = "0xcccccccccccccccccccccccccccccccccccccccc"
+    bsc = {"holders": {"count": 111}, "is_honeypot": False}
+    base = {"holders": {"count": 222}, "is_honeypot": True}
+    assert gt_info_cache.normalize_key("bsc", addr)[0] == "bsc"
+    assert gt_info_cache.normalize_key("base", addr)[0] == "base"
+    assert gt_info_cache.normalize_key("bsc", addr) != gt_info_cache.normalize_key("base", addr)
+    assert gt_info_cache.put("bsc", addr, bsc)
+    assert gt_info_cache.put("base", addr, base)
+    got_bsc = gt_info_cache.get("bsc", addr)
+    got_base = gt_info_cache.get("base", addr)
+    assert got_bsc is not None and got_bsc["holders"]["count"] == 111
+    assert got_base is not None and got_base["holders"]["count"] == 222
+    assert gt_info_cache.get("robinhood", addr) is None
+
+
+def test_non_200_with_body_is_not_cached(fresh_stats):
+    """A 500 that still has data.attributes must not be written to the cache."""
+    gt_info = []
+
+    def http_500(url, **kwargs):
+        gt_info.append(url)
+        return Mock(status_code=500, json=lambda: {"data": {"attributes": {
+            "holders": {"count": 150},
+            "mint_authority": "no",
+            "freeze_authority": "no",
+        }}})
+
+    with patch("collect.requests.get", side_effect=http_500):
+        first = collect.dossier(_sol_token(addr="err1", tid="err1:1399811149"))
+        collect.dossier(_sol_token(addr="err1", tid="err1:1399811149"))
+
+    assert first["holder_count"] == 150
+    assert gt_info_cache.get("solana", "err1") is None
+    assert gt_info_cache.put("solana", "err1", {"holders": {"count": 150}}, status_code=500) is False
+    assert len(gt_info) == 2
+    stats = collect.gt_info_cycle_stats()
+    assert stats["hits"] == 0
+    assert stats["misses"] == 2
+
+
+def test_null_holders_not_cached(fresh_stats):
+    """Null / missing holder_count is applied live but not frozen for the TTL."""
+    assert gt_info_cache.is_complete_attributes({"holders": None}) is False
+    assert gt_info_cache.is_complete_attributes({"holders": {}}) is False
+    assert gt_info_cache.is_complete_attributes({"holders": {"count": None}}) is False
+    assert gt_info_cache.is_complete_attributes({"holders": {"count": 80}}) is True
+    assert gt_info_cache.put("solana", "young1", {"holders": None}) is False
+    assert gt_info_cache.put("solana", "young1", {"holders": {"count": None}}) is False
+
+    gt_info = []
+
+    def null_holders(url, **kwargs):
+        gt_info.append(url)
+        return Mock(status_code=200, json=lambda: {"data": {"attributes": {
+            "holders": None,
+            "mint_authority": "no",
+            "freeze_authority": "no",
+        }}})
+
+    young = _sol_token(addr="young1", tid="young1:1399811149", age_minutes=12, holder_count=40)
+    with patch("collect.requests.get", side_effect=null_holders):
+        first = collect.dossier(young)
+        collect.dossier(_sol_token(addr="young1", tid="young1:1399811149", age_minutes=12, holder_count=40))
+
+    assert first["holder_count"] == 40  # FOMO fallback, not a cached null
+    assert gt_info_cache.get("solana", "young1") is None
+    assert len(gt_info) == 2
+
+
+def test_locked_db_fails_open_to_live_call(fresh_stats):
+    """A locked cache must not stall ~5s; get fails open and dossier calls GT."""
+    complete = {"holders": {"count": 180}, "mint_authority": "no", "freeze_authority": "no"}
+    assert gt_info_cache.put("solana", "solmint", complete)
+    assert gt_info_cache.get("solana", "solmint") is not None
+
+    locker = sqlite3.connect(str(gt_info_cache.db_path()), timeout=0)
+    locker.isolation_level = None
+    locker.execute("BEGIN EXCLUSIVE")
+    gt_info = []
+    try:
+        t0 = time.monotonic()
+        assert gt_info_cache.get("solana", "solmint") is None
+        assert time.monotonic() - t0 < 1.0
+
+        def fake_get(url, **kwargs):
+            gt_info.append(url)
+            return _gt_info_ok(holder_count=99)
+
+        limiter = GTRateLimiter(calls_per_min=8, time_fn=lambda: 1_000.0, sleep_fn=lambda d: None)
+        with patch("collect.requests.get", side_effect=fake_get):
+            d = collect.dossier(_sol_token(), limiter=limiter)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0
+        assert len(gt_info) == 1
+        assert d["holder_count"] == 99
+        assert len(limiter.calls) == 1
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
 
 
 def test_briefing_picks_line_not_young_reached_judge(tmp_path, monkeypatch):

@@ -1,8 +1,10 @@
 """SQLite cache for GeckoTerminal /tokens/{addr}/info payloads.
 
-Lives under outbox/ (default outbox/gt_info_cache.db, gitignored). Only successful
-complete responses are stored. 429s and errors are never written. Keyed by
-chain + address. TTL is GT_INFO_CACHE_TTL_MIN minutes, default 90, clamped 60–120.
+Lives under outbox/ (default outbox/gt_info_cache.db, gitignored). Only HTTP 200
+responses with complete holder data are stored. 429s, other errors, and null
+holders are never written. Keyed by chain + address. TTL is
+GT_INFO_CACHE_TTL_MIN minutes, default 90, clamped 60–120. Lock waits are
+capped at LOCK_TIMEOUT_SEC and fail open to a live call.
 
 Exceptions are routed through safe_err; this module never prints .env or secrets.
 """
@@ -22,6 +24,8 @@ log = logging.getLogger("gt_info_cache")
 DEFAULT_TTL_MIN = 90
 TTL_MIN_FLOOR = 60
 TTL_MIN_CEILING = 120
+# sqlite default is 5s; a locked cache must fail open well under 1s.
+LOCK_TIMEOUT_SEC = 0.2
 
 _conn: sqlite3.Connection | None = None
 _conn_path: str | None = None
@@ -98,7 +102,7 @@ def _connect() -> sqlite3.Connection:
         except Exception:
             pass
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _conn = sqlite3.connect(path, check_same_thread=False)
+    _conn = sqlite3.connect(path, check_same_thread=False, timeout=LOCK_TIMEOUT_SEC)
     _conn.row_factory = sqlite3.Row
     _init_schema(_conn)
     _conn_path = path
@@ -118,9 +122,34 @@ def _init_schema(db: sqlite3.Connection) -> None:
     db.commit()
 
 
-def is_complete_attributes(attrs) -> bool:
-    """True when a GT /info body yielded a usable attributes object."""
+def holder_count_of(attrs) -> int | None:
+    """holder_count from GT holders.count. None if missing — filters need this."""
+    if not isinstance(attrs, dict):
+        return None
+    holders = attrs.get("holders")
+    if not isinstance(holders, dict):
+        return None
+    count = holders.get("count")
+    if count is None:
+        return None
+    try:
+        return int(count)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_attributes_object(attrs) -> bool:
+    """True when the /info envelope yielded an attributes dict (fields may be null)."""
     return isinstance(attrs, dict)
+
+
+def is_complete_attributes(attrs) -> bool:
+    """True when attributes are safe to cache for the full TTL.
+
+    Filters read holder_count (and will not invent it). A null holders block,
+    especially on young tokens, must not be frozen for 60–120 minutes.
+    """
+    return is_attributes_object(attrs) and holder_count_of(attrs) is not None
 
 
 def get(chain: str, address: str, now: float | None = None) -> dict | None:
@@ -149,8 +178,19 @@ def get(chain: str, address: str, now: float | None = None) -> dict | None:
         return None
 
 
-def put(chain: str, address: str, attrs: dict, now: float | None = None) -> bool:
-    """Store a successful complete attributes object. Returns True on write."""
+def put(chain: str, address: str, attrs: dict, now: float | None = None,
+        status_code: int = 200) -> bool:
+    """Store a successful complete attributes object. Returns True on write.
+
+    Only HTTP 200 + complete holder data is written. Non-200 (including a
+    404/500 that still has a data body) and null holders are refused.
+    """
+    try:
+        code = int(status_code)
+    except (TypeError, ValueError):
+        return False
+    if code != 200:
+        return False
     if not is_complete_attributes(attrs):
         return False
     chain_key, addr = normalize_key(chain, address)
