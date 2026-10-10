@@ -9,23 +9,32 @@ because the Grok Bots run in xAI's cloud and the book (desk.db) lives on this ma
   GET  /book/held      {"held": {...}|null}
   POST /book/release   RISK calls this the moment a close is filled. Nothing else does.
   GET  /ops            ops panel HTML
+  GET  /ops/briefing   last-24h briefing + 7-day trends
   GET  /api/state      outbox/state.json for ops panel
 """
 import json
+import logging
 import os
 import pathlib
 
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
+log = logging.getLogger("desk.ops")
+
 import book
 import shadow_ledger
 from fomo_api import activate_fomo_tab
 from judge import app, DESK_SECRET
+from secret_utils import safe_err
 
 HERE = pathlib.Path(__file__).parent
-OUTBOX = pathlib.Path(os.environ.get("DESK_OUTBOX", "outbox"))
 router = APIRouter(prefix="/book")
+
+
+def _outbox() -> pathlib.Path:
+    """Resolve at call time so tests (and ops) follow the current DESK_OUTBOX."""
+    return pathlib.Path(os.environ.get("DESK_OUTBOX", "outbox"))
 
 
 def _auth(authorization: str):
@@ -60,10 +69,26 @@ async def ops_panel():
     return html_path.read_text()
 
 
+@app.get("/ops/briefing")
+async def ops_briefing():
+    """Last-24h morning briefing plus 7-day trends. Local-only (bind 127.0.0.1)."""
+    try:
+        import cycle_history
+        return JSONResponse(cycle_history.briefing_payload())
+    except Exception as e:
+        log.warning("ops briefing: %s", safe_err(e))
+        return JSONResponse({
+            "error": "briefing unavailable",
+            "last_24h": {},
+            "trends": {"days": [], "flags": [], "notable": []},
+            "markdown": "",
+        })
+
+
 @app.get("/api/state")
 async def api_state():
     """Serve outbox/state.json for the ops panel."""
-    state_path = OUTBOX / "state.json"
+    state_path = _outbox() / "state.json"
     if not state_path.exists():
         return JSONResponse({"demo": False, "tokens": [], "cycle": None}, status_code=404)
     return JSONResponse(json.loads(state_path.read_text()))
@@ -89,7 +114,7 @@ async def api_fomo_status():
     Safe for ops panel display.
     """
     # Try to get FOMO health from the most recent state.json
-    state_path = OUTBOX / "state.json"
+    state_path = _outbox() / "state.json"
     if state_path.exists():
         try:
             state = json.loads(state_path.read_text())

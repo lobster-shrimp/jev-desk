@@ -51,6 +51,18 @@ def _env_float(name, default):
     return float(raw)
 
 
+def _history_hook(kind, **kwargs):
+    """Shadow history capture. Never raise into the cycle; never log secrets."""
+    try:
+        import cycle_history
+        if kind == "soft":
+            cycle_history.on_soft_token(**kwargs)
+        elif kind == "cycle":
+            cycle_history.on_cycle(**kwargs)
+    except Exception as e:
+        log.warning("cycle history: %s", safe_err(e))
+
+
 CHAIN_SET     = {1399811149: "solana", 56: "bsc", 8453: "bsc", 4663: "robinhood"}
 CYCLE_SECONDS = 900
 GT_CALLS_PER_MIN = _env_int("GT_CALLS_PER_MIN", 5)  # ~5/min for keyless GT
@@ -161,6 +173,10 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
             row["soft_noul"] = soft_noul
         if soft_scores:
             row["soft_scores"] = soft_scores
+        for k in ("net", "top_10_percent", "top_wallet_percent",
+                  "developer_holding_percentage", "holder_count"):
+            if t.get(k) is not None:
+                row[k] = t.get(k)
         stats["tokens"].append(row)
 
     ids, gt_txns_cache = universe(limiter=gt_limiter, fomo=fomo)  # fresh + trending pools + FOMO feeds, budget-aware
@@ -170,6 +186,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     # Age carry every cycle (including ids that shortlist drops), then retrieve
     book.age_carry()
     carry = book.get_carry()                     # unevaluated ids from previous cycle
+    stats["carry"] = len(carry)
     
     # Cap carry admission per cycle: leave room for due ids
     # Due ids get highest priority, so reserve budget for them
@@ -282,6 +299,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         
         # Track free passers for circuit breaker and stats
         free_passers.append(t)
+        if (t.get("age_minutes") or 0) < 60:
+            stats.setdefault("young_free", []).append({
+                "tid": t.get("tid"), "ticker": t.get("ticker"),
+                "net": t.get("net"), "age_minutes": t.get("age_minutes"),
+                "chain": t.get("chain"),
+            })
+
         stats["free_passed"] += 1
 
         # If budget exhausted, collect for carry and continue with next token
@@ -599,6 +623,17 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                          d.get("top_10_percent"), d.get("top_wallet_percent"), d.get("developer_holding_percentage"),
                          d.get("holder_count"), d.get("rpc_ok"),
                          {k: round(v, 3) for k, v in soft_scores.items()})
+                _history_hook(
+                    "soft",
+                    tid=d.get("tid"), ticker=d.get("ticker"), net=d.get("net"),
+                    chain=d.get("chain"), reason=reason, noul=noul,
+                    age_minutes=d.get("age_minutes"),
+                    top_10_percent=d.get("top_10_percent"),
+                    top_wallet_percent=d.get("top_wallet_percent"),
+                    developer_holding_percentage=d.get("developer_holding_percentage"),
+                    holder_count=d.get("holder_count"),
+                    soft_scores=soft_scores,
+                )
                 book.sit(t["tid"], reason, age_minutes=t.get("age_minutes"))
                 log.info("defer outcome tid=%s reason=%s", t["tid"], reason)
                 book.forget_defer(t["tid"])
@@ -606,7 +641,14 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                 record(d, "soft", reason, soft_noul=noul, soft_scores=soft_scores)
                 continue
 
-            record(d, "judged", None)
+            judged_scores = {}
+            for name in SOFT.keys():
+                a = ans.get(name)
+                if a:
+                    v = a.get("noul", a.get("score"))
+                    if v is not None:
+                        judged_scores[name] = v
+            record(d, "judged", None, soft_scores=judged_scores or None)
             survivors.append((d, ans))
         finally:
             # Remove from young_pending_dossier on any exit path (success, defer, bench, exception)
@@ -646,6 +688,13 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
              stats["gt_universe"], stats["gt_dossier_attempts"], stats["gt_dossier_ok"], stats["gt_retry"],
              gt_limiter.stats_429_count, gt_limiter.stats_wait_time)
     log.info("cycle duration: %.1fs / %.1fs budget", cycle_duration, cycle_time_budget)
+    stats["unevaluated"] = unevaluated_count
+    raw_429 = getattr(gt_limiter, "stats_429_count", None)
+    try:
+        stats["gt_429"] = int(raw_429)
+    except (TypeError, ValueError):
+        stats["gt_429"] = int(stats.get("gt_429") or 0)
+    _history_hook("cycle", stats=stats, shadow=shadow)
 
     if not survivors:
         return None, stats
