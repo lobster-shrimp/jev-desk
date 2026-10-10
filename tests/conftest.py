@@ -10,6 +10,19 @@ import sqlite3
 
 
 @pytest.fixture(autouse=True)
+def isolate_coinalyze(monkeypatch):
+    """No real Coinalyze key or HTTP. Any accidental get() fails the test."""
+    monkeypatch.delenv("COINALYZE_API_KEY", raising=False)
+    import coinalyze
+    coinalyze.reset()
+    def _no_network(*_a, **_k):
+        raise AssertionError("coinalyze tests must not use the network")
+    coinalyze.set_get_fn(_no_network)
+    yield
+    coinalyze.reset()
+
+
+@pytest.fixture(autouse=True)
 def isolate_gt_info_cache(tmp_path, monkeypatch):
     """Point the GT /info cache at a per-test SQLite file. No leftover hits."""
     monkeypatch.setenv("GT_INFO_CACHE_DB", str(tmp_path / "gt_info_cache.db"))
