@@ -69,6 +69,7 @@ class GTRateLimiter:
         # Stats for logging
         self.stats_429_count = 0  # 429s this cycle
         self.stats_wait_time = 0.0  # time waited for slots this cycle
+        self.last_wait_reasons = []  # "429_backoff" | "pacing" | "rate_limit" from last wait_if_needed
     
     def available(self) -> int:
         """How many GT calls can be made without waiting."""
@@ -115,6 +116,7 @@ class GTRateLimiter:
         """Reset per-cycle statistics. Called at start of each cycle."""
         self.stats_429_count = 0
         self.stats_wait_time = 0.0
+        self.last_wait_reasons = []
     
     def reset_for_test(self):
         """Reset limiter state for test isolation. Clears calls, stats, and last_call_time."""
@@ -129,6 +131,7 @@ class GTRateLimiter:
         self.universe_calls_used = 0
         self.stats_429_count = 0
         self.stats_wait_time = 0.0
+        self.last_wait_reasons = []
     
     def _do_sleep(self, sec: float):
         """Sleep via injectable sleep_fn, or time.sleep looked up at call time."""
@@ -145,6 +148,7 @@ class GTRateLimiter:
         Returns True if a slot was acquired, False if deadline would be exceeded."""
         now = self.time_fn()
         wait_start = now
+        self.last_wait_reasons = []
         
         # First, wait out any 429 backoff period
         if self.backoff_until > now:
@@ -153,6 +157,7 @@ class GTRateLimiter:
             if deadline is not None and (now + wait_sec) > deadline:
                 return False
             log.info("GT 429 backoff: waiting %.1fs before retry", wait_sec)
+            self.last_wait_reasons.append("429_backoff")
             self._do_sleep(wait_sec)
             now = self.time_fn()
         
@@ -166,6 +171,7 @@ class GTRateLimiter:
                     return False
                 log.debug("GT pacing: waiting %.1fs for min spacing (%.1fs between calls)", 
                          spacing_wait, self.min_spacing_sec)
+                self.last_wait_reasons.append("pacing")
                 self._do_sleep(spacing_wait)
                 now = self.time_fn()
         
@@ -184,6 +190,7 @@ class GTRateLimiter:
                 if deadline is not None and (now + wait_sec) > deadline:
                     return False
                 log.info("GT rate limit: waiting %.1fs for slot", wait_sec)
+                self.last_wait_reasons.append("rate_limit")
                 prev = now
                 self._do_sleep(wait_sec)
                 now = self.time_fn()
@@ -894,12 +901,130 @@ def _normalize_authority(raw_value) -> tuple[bool | None, str | None]:
     return (None, str(raw_value))
 
 
+def _dossier_wait_log(ticker: str, wait_duration: float, limiter: "GTRateLimiter") -> None:
+    """Log a dossier wait, distinguishing pacing from a real 429 backoff."""
+    reasons = getattr(limiter, "last_wait_reasons", None) or []
+    parts = []
+    if "429_backoff" in reasons:
+        parts.append("429 backoff")
+    if "pacing" in reasons:
+        parts.append("pacing")
+    if "rate_limit" in reasons:
+        parts.append("rate limit")
+    label = " + ".join(parts) if parts else "pacing"
+    log.info("dossier for %s waited %.1fs for GT %s", ticker, wait_duration, label)
+
+
+def apply_wallet_concentration(t: dict) -> dict:
+    """Fill top_wallet / top_10 from Solana RPC or EVM sources. No GT call.
+
+    Uses t['net'] (56 / 8453 / 4663 / 1399811149), never CHAIN_SET's judge-seat
+    name, so Base tokens query chain 8453 rather than BSC 56.
+
+    Idempotent within a token dict (young in-cycle retry must not re-hit RPC).
+    Mutates and returns t.
+    """
+    if t.get("_wallet_concentration_done"):
+        return t
+    t["_wallet_concentration_done"] = True
+
+    # GT_NET is the on-chain name (8453 -> base). CHAIN_SET maps 8453 -> bsc
+    # only for the judge question set; do not use it here.
+    if t.get("net") in GT_NET:
+        t["chain"] = GT_NET[t["net"]]
+
+    if t["net"] == 1399811149:
+        # Solana: pool-aware top wallet and top_10, free, off SOLANA_RPC_URL
+        try:
+            holder_data, rpc_ok, rpc_error = sol_top_wallet(t["addr"])
+            t["top_wallet_percent"] = holder_data.get("top_wallet")
+            t["pools_excluded"] = holder_data.get("pools_excluded", False)
+            rpc_top_10 = holder_data.get("top_10")
+            if rpc_top_10 is not None:
+                t["top_10_percent"] = rpc_top_10 * 100  # fraction -> percent
+            t["rpc_ok"] = rpc_ok
+            t["rpc_error"] = rpc_error
+            if rpc_error:
+                log.warning("solana rpc failed for %s: %s", t["ticker"], rpc_error)
+        except Exception as e:
+            safe_msg = safe_err(e)
+            log.warning("solana rpc failed for %s: %s", t["ticker"], safe_msg)
+            t["top_wallet_percent"] = None
+            t["pools_excluded"] = False
+            t["rpc_ok"] = False
+            t["rpc_error"] = safe_msg
+        return t
+
+    # EVM: Honeypot / GoPlus / Robinhood fold / Multicall. chain_id is t["net"].
+    import evm_holders
+    import book
+
+    pair_addrs = []
+    if "pair_address" in t:
+        pair_addrs = [t["pair_address"]]
+
+    result = evm_holders.evm_holder_concentration(
+        chain_id=t["net"],
+        token=t["addr"],
+        pair_addrs=pair_addrs,
+        age_min=t.get("age_minutes", 0),
+        db=book.DB
+    )
+
+    if result.ok:
+        t["top_wallet_percent"] = result.top_wallet  # 0-1 fraction
+        t["top_10_percent"] = result.top_10  # 0-100 percent
+        t["evm_holder_source"] = result.source
+        t["evm_holder_excluded"] = result.excluded
+        t["evm_holder_raw_top_wallet"] = result.raw_top_wallet
+        t["evm_holder_raw_top_10"] = result.raw_top_10
+
+        if result.top_wallet is not None and result.top_wallet > 0.05:
+            exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
+            log.info("EVM top_wallet KILL for %s: raw %.1f%%, post-exclusion %.1f%% (source: %s, excluded: %s)",
+                    t["ticker"],
+                    (result.raw_top_wallet * 100) if result.raw_top_wallet else 0,
+                    result.top_wallet * 100,
+                    result.source,
+                    exclusion_reasons or "none")
+        elif result.source:
+            log.info("EVM holder check pass for %s: top_wallet=%s top_10=%s evm_source=%s",
+                     t["ticker"], result.top_wallet, result.top_10, result.source)
+        if result.top_10 is not None and result.top_10 > 60:
+            exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
+            log.info("EVM top_10 KILL for %s: raw %.1f%%, post-exclusion %.1f%% (source: %s, excluded: %s)",
+                    t["ticker"],
+                    result.raw_top_10 if result.raw_top_10 else 0,
+                    result.top_10,
+                    result.source,
+                    exclusion_reasons or "none")
+    else:
+        t["top_wallet_percent"] = None
+        t["top_10_percent"] = None
+        t["evm_holder_source"] = result.source
+        t["evm_holder_error"] = result.error
+        t["evm_holder_transient"] = result.is_transient
+        log.info("EVM holder check unavailable for %s: %s (source: %s, transient: %s)",
+                t["ticker"], result.error, result.source, result.is_transient)
+    return t
+
+
 def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | None = None) -> dict:
-    """One GT call per token. Fills what the chain actually has, null where it does not.
-    
+    """Wallet-concentration first, then one GT /info call if that does not kill.
+
+    Cheap Solana RPC / EVM holder checks run before any GT spend so a top_wallet
+    (or EVM unverified / pending) kill does not burn a rate-limit slot.
+    holder_count, authority and honeypot still come from GT /info.
+
     If limiter is provided and budget is exhausted, raises DossierRetryNeeded.
     If waiting for a slot would cross deadline, raises DossierDeadlineExceeded.
     On GT 429, records the backoff with the limiter and raises DossierRetryNeeded."""
+    from filter import concentration_kill
+
+    d = apply_wallet_concentration(t)
+    if concentration_kill(d):
+        return d
+
     if limiter:
         # Wait for any 429 backoff BEFORE spending a slot (order matters!)
         wait_start = limiter.time_fn()
@@ -909,8 +1034,7 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | Non
             raise DossierDeadlineExceeded(f"GT deadline exceeded for {t['ticker']}")
         wait_duration = limiter.time_fn() - wait_start
         if wait_duration >= 0.1:
-            log.info("dossier for %s waited %.1fs for GT rate limit/429 backoff",
-                     t["ticker"], wait_duration)
+            _dossier_wait_log(t["ticker"], wait_duration, limiter)
         if not limiter.spend(1, priority=True):
             log.warning("GT budget exhausted, dossier for %s cannot run this cycle", t["ticker"])
             raise DossierRetryNeeded(f"GT budget exhausted for {t['ticker']}")
@@ -946,9 +1070,12 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | Non
     freeze_auth_normalized, freeze_auth_raw = _normalize_authority(a.get("freeze_authority"))
 
     holders = a.get("holders") or {}
-    d = {**t, "chain": net,
+    # Preserve RPC/EVM concentration — GT must not overwrite a real top_10 / top_wallet.
+    preserved_top_wallet = d.get("top_wallet_percent")
+    preserved_top_10 = d.get("top_10_percent")
+    d = {**d, "chain": net,
          # GT first, FOMO as the fallback. On Robinhood GT is null and FOMO is all you get.
-         "holder_count": holders.get("count") or t["holder_count"],
+         "holder_count": holders.get("count") or t.get("holder_count"),
          "top_10_percent": (holders.get("distribution_percentage") or {}).get("top_10"),
          "developer_holding_percentage": a.get("developer_holding_percentage"),
          "gt_score_details": a.get("gt_score_details"),
@@ -959,88 +1086,10 @@ def dossier(t: dict, limiter: GTRateLimiter | None = None, deadline: float | Non
          "freeze_authority_raw": freeze_auth_raw,
          "description": a.get("description"),
          "x_handle": clean_handle(a.get("twitter_handle"))}
-
-    # Chain-specific holder checks
-    if t["net"] == 1399811149:
-        # Solana: pool-aware top wallet and top_10, free, off the public RPC
-        try:
-            holder_data, rpc_ok, rpc_error = sol_top_wallet(t["addr"])
-            # top_wallet_percent: RPC returns fraction (0-1), store as-is
-            d["top_wallet_percent"] = holder_data.get("top_wallet")
-            d["pools_excluded"] = holder_data.get("pools_excluded", False)
-            # top_10_percent: RPC returns fraction (0-1), multiply by 100 to get percent
-            # filter.py expects whole number percent (0-100)
-            rpc_top_10 = holder_data.get("top_10")
-            if rpc_top_10 is not None:
-                d["top_10_percent"] = rpc_top_10 * 100  # Convert fraction to percent
-            d["rpc_ok"] = rpc_ok
-            d["rpc_error"] = rpc_error
-            if rpc_error:
-                log.warning("solana rpc failed for %s: %s", t["ticker"], rpc_error)
-        except Exception as e:
-            safe_msg = safe_err(e)
-            log.warning("solana rpc failed for %s: %s", t["ticker"], safe_msg)
-            d["top_wallet_percent"] = None
-            d["pools_excluded"] = False
-            d["rpc_ok"] = False
-            d["rpc_error"] = safe_msg
-    else:
-        # EVM chains: compute real holder concentration
-        # Import here to avoid circular dependency
-        import evm_holders
-        import book
-        
-        # Get pair addresses from DexScreener pairAddress (passed through trade stage)
-        pair_addrs = []
-        if "pair_address" in t:
-            pair_addrs = [t["pair_address"]]
-        
-        result = evm_holders.evm_holder_concentration(
-            chain_id=t["net"],
-            token=t["addr"],
-            pair_addrs=pair_addrs,
-            age_min=t.get("age_minutes", 0),
-            db=book.DB
-        )
-        
-        if result.ok:
-            # Store computed values
-            d["top_wallet_percent"] = result.top_wallet  # 0-1 fraction
-            d["top_10_percent"] = result.top_10  # 0-100 percent
-            d["evm_holder_source"] = result.source
-            d["evm_holder_excluded"] = result.excluded
-            d["evm_holder_raw_top_wallet"] = result.raw_top_wallet
-            d["evm_holder_raw_top_10"] = result.raw_top_10
-            
-            # Log kills with raw values, post-exclusion values, and exclusion reasons
-            if result.top_wallet is not None and result.top_wallet > 0.05:
-                exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
-                log.info("EVM top_wallet KILL for %s: raw %.1f%%, post-exclusion %.1f%% (source: %s, excluded: %s)",
-                        t["ticker"], 
-                        (result.raw_top_wallet * 100) if result.raw_top_wallet else 0,
-                        result.top_wallet * 100, 
-                        result.source, 
-                        exclusion_reasons or "none")
-            if result.top_10 is not None and result.top_10 > 60:
-                exclusion_reasons = ", ".join(set(reason for _, _, reason in result.excluded[:5]))
-                log.info("EVM top_10 KILL for %s: raw %.1f%%, post-exclusion %.1f%% (source: %s, excluded: %s)",
-                        t["ticker"],
-                        result.raw_top_10 if result.raw_top_10 else 0,
-                        result.top_10,
-                        result.source,
-                        exclusion_reasons or "none")
-        else:
-            # Fail closed: no top_wallet_percent -> top_wallet_unverified or holders_pending in filter
-            d["top_wallet_percent"] = None
-            d["top_10_percent"] = None
-            d["evm_holder_source"] = result.source
-            d["evm_holder_error"] = result.error
-            
-            # Item #6: Use structured is_transient field
-            d["evm_holder_transient"] = result.is_transient
-            
-            log.info("EVM holder check unavailable for %s: %s (source: %s, transient: %s)",
-                    t["ticker"], result.error, result.source, result.is_transient)
+    if preserved_top_wallet is not None:
+        d["top_wallet_percent"] = preserved_top_wallet
+    if preserved_top_10 is not None:
+        d["top_10_percent"] = preserved_top_10
 
     return d
 

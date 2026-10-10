@@ -613,7 +613,7 @@ tr:hover td { background: #151515; }
   <div id="briefing-kills" class="histogram"></div>
   <div class="section-title">Momentum (judged + soft)</div>
   <div id="briefing-momentum"></div>
-  <div class="section-title">Judged tokens (24h)</div>
+  <div class="section-title">Passed judge/picks (24h)</div>
   <div id="briefing-judged"></div>
   <div class="section-title">Young free-pass outcomes</div>
   <div id="briefing-young"></div>
@@ -1754,7 +1754,7 @@ function renderBriefing(data) {
   const stats = [
     ['Seen', w.seen || 0],
     ['Benched', w.benched || 0],
-    ['Judged', w.judged || 0],
+    ['Reached judge', w.judged || 0],
     ['Requeued', w.requeued || 0],
     ['GT 429s', w.gt_429 || 0],
     ['GT defers', w.gt_defer || 0],
@@ -1772,7 +1772,7 @@ function renderBriefing(data) {
     document.getElementById('briefing-chains').innerHTML = '<div class="empty">No per-chain rows</div>';
   } else {
     document.getElementById('briefing-chains').innerHTML = `<table><thead><tr>
-      <th>Chain</th><th>Judged</th><th>Soft</th><th>Young free</th><th>Young 429</th><th>Young chain</th><th>Young soft</th>
+      <th>Chain</th><th>Reached judge</th><th>Soft</th><th>Young free</th><th>Young 429</th><th>Young chain</th><th>Young soft</th>
     </tr></thead><tbody>${names.map(n => {
       const b = by[n]; const yo = b.young_outcomes || {};
       return `<tr><td>${esc(n)}</td><td>${b.judged||0}</td><td>${b.soft||0}</td>
@@ -1784,7 +1784,7 @@ function renderBriefing(data) {
   const syo = sol.young_outcomes || {};
   document.getElementById('briefing-solana').innerHTML =
     `<div class="age-title">Solana only</div>
-     <div class="age-stat"><span class="age-stat-label">Judged</span><span class="age-stat-value">${sol.judged||0}</span></div>
+     <div class="age-stat"><span class="age-stat-label">Reached judge</span><span class="age-stat-value">${sol.judged||0}</span></div>
      <div class="age-stat"><span class="age-stat-label">Soft</span><span class="age-stat-value">${sol.soft||0}</span></div>
      <div class="age-stat"><span class="age-stat-label">Young free</span><span class="age-stat-value">${sol.young_free||0}</span></div>
      <div class="age-stat"><span class="age-stat-label">deferred on 429</span><span class="age-stat-value">${syo.deferred_429||0}</span></div>
@@ -1813,7 +1813,7 @@ function renderBriefing(data) {
 
   const judged = w.judged_tokens || [];
   if (!judged.length) {
-    document.getElementById('briefing-judged').innerHTML = '<div class="empty">No judged tokens</div>';
+    document.getElementById('briefing-judged').innerHTML = '<div class="empty">No tokens passed judge/picks</div>';
   } else {
     document.getElementById('briefing-judged').innerHTML = `<table><thead><tr>
       <th>Ticker</th><th>Chain</th><th>Age min</th><th>Momentum</th><th>Scores</th>
@@ -1845,7 +1845,7 @@ function renderBriefing(data) {
 
   const yo = w.young_outcomes || {};
   const labels = {deferred_429:'deferred on 429', chain:'chain kill', soft:'soft',
-                  judged:'judged', trade:'trade', unevaluated:'unevaluated', other:'other'};
+                  judged:'passed judge/picks', trade:'trade', unevaluated:'unevaluated', other:'other'};
   const yoKeys = Object.keys(yo);
   if (!yoKeys.length) {
     document.getElementById('briefing-young').innerHTML = '<div class="empty">No young free-passers</div>';

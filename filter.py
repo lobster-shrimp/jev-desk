@@ -3,7 +3,11 @@ THE FILTER — the order the kills fire in. The order is the whole point.
 
 free_kill  touches no network, runs on hundreds.
 trade_kill costs one DexScreener call, runs on tens.
-chain_kill costs one of your three GeckoTerminal slots.
+concentration_kill is the cheap chain subset (top_wallet / top_10 / EVM
+               unverified). It runs before the GT /info dossier so a whale
+               does not spend a rate-limit slot. holder_count, authority and
+               honeypot stay in chain_kill after GT.
+chain_kill the rest of the on-chain facts, after the dossier.
 soft_kill  costs a judgement, runs on a handful.
 
 Facts kill before judgements do, which is why authority_open and honeypot are
@@ -66,8 +70,13 @@ def trade_kill(t) -> str | None:
     return None
 
 
-def chain_kill(d) -> str | None:
-    """After the dossier, still free. Facts, not judgements."""
+def concentration_kill(d) -> str | None:
+    """Wallet-concentration subset of chain_kill. Same thresholds and reasons.
+
+    Safe to run before the GT /info dossier: it only reads top_wallet_percent,
+    top_10_percent, and the EVM fail-closed flags. holder_count, authority and
+    honeypot stay in chain_kill, which needs GT fields.
+    """
     # EVM chains: fail closed without top_wallet verification
     # Bug #12: Use holders_pending for transient failures, top_wallet_unverified for definitive
     chain = d.get("chain")
@@ -78,13 +87,20 @@ def chain_kill(d) -> str | None:
                 return "holders_pending"  # 15 min bench for retry
             else:
                 return "top_wallet_unverified"  # 6h bench for definitive failure
-    
+
     if d.get("top_wallet_percent") is not None and \
        d["top_wallet_percent"] > HARD["max_top_wallet"]:
         return "top_wallet"
     if d.get("top_10_percent") is not None and \
        float(d["top_10_percent"]) / 100 > HARD["max_top_10"]:
         return "top_10"
+    return None
+
+
+def chain_kill(d) -> str | None:
+    """After the dossier, still free. Facts, not judgements."""
+    if (k := concentration_kill(d)):
+        return k
     if d.get("holder_count") is not None and d["holder_count"] < HARD["min_holders"]:
         return "holders"
     

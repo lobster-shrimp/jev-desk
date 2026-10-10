@@ -76,6 +76,11 @@ def tok(i, net=1399811149, **over):
     return t
 
 
+def _pass_sol_wallet(mint):
+    """Deterministic Solana concentration pass. No network."""
+    return {"top_wallet": 0.02, "top_10": 0.30, "pools_excluded": True}, True, None
+
+
 # ---- fomo_api parsing ---------------------------------------------------------
 def test_filter_tokens_parses_bare_list():
     """_filter_tokens should handle a bare list response."""
@@ -1737,9 +1742,10 @@ def test_universe_uses_limiter():
         requests.get = original_get
 
 
-def test_dossier_429_raises_retry_needed():
+def test_dossier_429_raises_retry_needed(monkeypatch):
     """dossier on GT 429 should raise DossierRetryNeeded, not RuntimeError."""
     import requests
+    monkeypatch.setattr(collect, "sol_top_wallet", _pass_sol_wallet)
     
     original_get = requests.get
     mock_resp = Mock(status_code=429)
@@ -1756,9 +1762,10 @@ def test_dossier_429_raises_retry_needed():
         requests.get = original_get
 
 
-def test_dossier_budget_exhausted_raises_retry():
+def test_dossier_budget_exhausted_raises_retry(monkeypatch):
     """dossier with exhausted limiter should raise DossierRetryNeeded without calling GT."""
     import requests
+    monkeypatch.setattr(collect, "sol_top_wallet", _pass_sol_wallet)
     
     original_get = requests.get
     call_count = [0]
@@ -2370,6 +2377,7 @@ def test_dossier_normalizes_authority_fields(monkeypatch):
     """dossier should normalize mint_authority and freeze_authority and preserve raw values."""
     import requests
     from collect import dossier
+    monkeypatch.setattr(collect, "sol_top_wallet", _pass_sol_wallet)
     
     original_get = requests.get
     
@@ -3753,6 +3761,7 @@ def test_gt_rate_limiter_wait_if_needed_no_backoff_if_expired():
 
 def test_dossier_429_calls_record_429_on_limiter(monkeypatch):
     """dossier() should call limiter.record_429() when it gets a 429 response."""
+    monkeypatch.setattr(collect, "sol_top_wallet", _pass_sol_wallet)
     fake_time = [1000.0]
     
     def time_fn():
@@ -4005,7 +4014,7 @@ def test_dossier_captures_rpc_status(monkeypatch):
     assert result["top_wallet_percent"] is None
     assert result["rpc_ok"] is False
     assert "Too Many Requests" in result["rpc_error"]
-def test_dossier_waits_before_spending_on_retry():
+def test_dossier_waits_before_spending_on_retry(monkeypatch):
     """dossier() should wait for backoff BEFORE spending a slot (verifies fix for ~50ms bug).
     
     This test verifies the root cause fix: wait_if_needed() is called BEFORE spend()
@@ -4015,6 +4024,7 @@ def test_dossier_waits_before_spending_on_retry():
     before waiting, which could cause the retry to happen ~50ms after the first 429
     instead of honoring the Retry-After value.
     """
+    monkeypatch.setattr(collect, "sol_top_wallet", _pass_sol_wallet)
     fake_time = [1000.0]
     sleep_calls = []
     spend_calls = []
