@@ -79,6 +79,21 @@ def test_record_cycle_persists_required_fields(hist):
     assert c["source"] == "live"
 
 
+def test_gt_cache_counts_persist(hist):
+    hist.on_cycle(
+        _stats(gt_cache_hits=3, gt_cache_misses=7, gt_dossier_attempts=7, gt_dossier_ok=6),
+        now=ts(2026, 10, 9, 8), source="backfill",
+    )
+    c = hist.cycles_since(0)[0]
+    assert c["gt_cache_hits"] == 3
+    assert c["gt_cache_misses"] == 7
+    assert c["gt_dossier_attempts"] == 7
+    assert c["gt_dossier_ok"] == 6
+    w = hist.summarize_window(0, ts(2026, 10, 9, 9))
+    assert w["gt_cache_hits"] == 3
+    assert w["gt_cache_misses"] == 7
+
+
 def test_gt_defer_separate_from_gt_429(hist):
     stats = _stats(tokens=[
         {"tid": "a:1399811149", "stage": "chain", "reason": "requeued_429_backoff"},

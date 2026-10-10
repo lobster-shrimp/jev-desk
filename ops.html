@@ -1812,10 +1812,15 @@ function renderBriefing(data) {
   if (!anyKill) killDiv.innerHTML = '<div class="empty">No kills in the window</div>';
 
   const judged = w.judged_tokens || [];
+  const picksCount = (sh && sh.picks) ? sh.picks : 0;
   if (!judged.length) {
-    document.getElementById('briefing-judged').innerHTML = '<div class="empty">No tokens passed judge/picks</div>';
+    document.getElementById('briefing-judged').innerHTML =
+      `<div class="empty">passed judge/picks: ${picksCount}</div>` +
+      '<div class="empty">No tokens passed judge/picks</div>';
   } else {
-    document.getElementById('briefing-judged').innerHTML = `<table><thead><tr>
+    document.getElementById('briefing-judged').innerHTML =
+      `<div class="empty">passed judge/picks: ${picksCount}</div>` +
+      `<table><thead><tr>
       <th>Ticker</th><th>Chain</th><th>Age min</th><th>Momentum</th><th>Scores</th>
     </tr></thead><tbody>${judged.map(t => {
       const scores = t.soft_scores || {};
@@ -1845,7 +1850,7 @@ function renderBriefing(data) {
 
   const yo = w.young_outcomes || {};
   const labels = {deferred_429:'deferred on 429', chain:'chain kill', soft:'soft',
-                  judged:'passed judge/picks', trade:'trade', unevaluated:'unevaluated', other:'other'};
+                  judged:'young reached judge', trade:'trade', unevaluated:'unevaluated', other:'other'};
   const yoKeys = Object.keys(yo);
   if (!yoKeys.length) {
     document.getElementById('briefing-young').innerHTML = '<div class="empty">No young free-passers</div>';

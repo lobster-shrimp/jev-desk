@@ -9,6 +9,18 @@ import os
 import sqlite3
 
 
+@pytest.fixture(autouse=True)
+def isolate_gt_info_cache(tmp_path, monkeypatch):
+    """Point the GT /info cache at a per-test SQLite file. No leftover hits."""
+    monkeypatch.setenv("GT_INFO_CACHE_DB", str(tmp_path / "gt_info_cache.db"))
+    import gt_info_cache
+    gt_info_cache.reset()
+    gt_info_cache.set_time_fn(None)
+    yield
+    gt_info_cache.reset()
+    gt_info_cache.set_time_fn(None)
+
+
 @pytest.fixture
 def isolate_evm_state(monkeypatch):
     """

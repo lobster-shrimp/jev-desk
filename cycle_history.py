@@ -125,6 +125,10 @@ def _init_schema(db: sqlite3.Connection) -> None:
       unevaluated INTEGER NOT NULL DEFAULT 0,
       gt_429 INTEGER NOT NULL DEFAULT 0,
       gt_defer INTEGER NOT NULL DEFAULT 0,
+      gt_cache_hits INTEGER NOT NULL DEFAULT 0,
+      gt_cache_misses INTEGER NOT NULL DEFAULT 0,
+      gt_dossier_attempts INTEGER NOT NULL DEFAULT 0,
+      gt_dossier_ok INTEGER NOT NULL DEFAULT 0,
       source TEXT NOT NULL DEFAULT 'live'
     );
     CREATE INDEX IF NOT EXISTS idx_cycles_ts ON cycles(ts);
@@ -181,6 +185,14 @@ def _init_schema(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE cycles ADD COLUMN ts_sec INTEGER")
         db.execute("UPDATE cycles SET ts_sec = CAST(ts AS INTEGER) WHERE ts_sec IS NULL")
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cycles_ts_sec ON cycles(ts_sec)")
+    for name, decl in (
+        ("gt_cache_hits", "INTEGER NOT NULL DEFAULT 0"),
+        ("gt_cache_misses", "INTEGER NOT NULL DEFAULT 0"),
+        ("gt_dossier_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("gt_dossier_ok", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name not in cols:
+            db.execute(f"ALTER TABLE cycles ADD COLUMN {name} {decl}")
     db.commit()
 
 
@@ -398,8 +410,10 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
             """INSERT OR IGNORE INTO cycles (
                  ts, ts_iso, mode, seen, benched, judged, requeued,
                  free_json, trade_json, chain_json, soft_json,
-                 carry, unevaluated, gt_429, gt_defer, source, ts_sec
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 carry, unevaluated, gt_429, gt_defer,
+                 gt_cache_hits, gt_cache_misses, gt_dossier_attempts, gt_dossier_ok,
+                 source, ts_sec
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 now, _iso(now), mode,
                 int(stats.get("seen") or 0),
@@ -412,7 +426,12 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
                 _json(stats.get("soft") or {}),
                 int(stats.get("carry") or 0),
                 int(stats.get("unevaluated") or 0),
-                gt_429, gt_defer, source, int(now),
+                gt_429, gt_defer,
+                int(stats.get("gt_cache_hits") or 0),
+                int(stats.get("gt_cache_misses") or 0),
+                int(stats.get("gt_dossier_attempts") or 0),
+                int(stats.get("gt_dossier_ok") or 0),
+                source, int(now),
             ),
         )
         if cur.rowcount == 0 or cur.lastrowid == 0:
@@ -535,6 +554,10 @@ def _cycle_dict(r: sqlite3.Row) -> dict:
         "unevaluated": r["unevaluated"],
         "gt_429": r["gt_429"],
         "gt_defer": r["gt_defer"],
+        "gt_cache_hits": r["gt_cache_hits"] if "gt_cache_hits" in r.keys() else 0,
+        "gt_cache_misses": r["gt_cache_misses"] if "gt_cache_misses" in r.keys() else 0,
+        "gt_dossier_attempts": r["gt_dossier_attempts"] if "gt_dossier_attempts" in r.keys() else 0,
+        "gt_dossier_ok": r["gt_dossier_ok"] if "gt_dossier_ok" in r.keys() else 0,
         "source": r["source"],
     }
 
@@ -801,6 +824,10 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
         "unevaluated": sum(c["unevaluated"] for c in cycles),
         "gt_429": sum(c["gt_429"] for c in cycles),
         "gt_defer": sum(c["gt_defer"] for c in cycles),
+        "gt_cache_hits": sum(c.get("gt_cache_hits") or 0 for c in cycles),
+        "gt_cache_misses": sum(c.get("gt_cache_misses") or 0 for c in cycles),
+        "gt_dossier_attempts": sum(c.get("gt_dossier_attempts") or 0 for c in cycles),
+        "gt_dossier_ok": sum(c.get("gt_dossier_ok") or 0 for c in cycles),
         "kills": {"free": free, "trade": trade, "chain": chain, "soft": soft_kills},
         "kill_mix": mix,
         "judged_tokens": judged,
@@ -1041,6 +1068,8 @@ def render_briefing_md(payload: dict) -> str:
             lines.append(f"- {reason}: {count}")
     lines += ["", "## Passed judge/picks", ""]
     judged = w.get("judged_tokens") or []
+    picks = int((w.get("shadow") or {}).get("picks") or 0)
+    lines.append(f"- passed judge/picks: {picks}")
     if not judged:
         lines.append("No tokens passed judge/picks in the window.")
     else:
@@ -1068,7 +1097,7 @@ def render_briefing_md(payload: dict) -> str:
                     "deferred_429": "deferred on 429",
                     "chain": "chain kill",
                     "soft": "soft",
-                    "judged": "passed judge/picks",
+                    "judged": "young reached judge",
                     "trade": "trade",
                     "unevaluated": "unevaluated",
                     "other": "other",

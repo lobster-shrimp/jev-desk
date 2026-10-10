@@ -26,6 +26,7 @@ import book
 from collect import (
     universe, shortlist, trade_counts, dossier, social_state, GTRateLimiter,
     DossierRetryNeeded, DossierDeadlineExceeded, dex_canary_check, _clear_sol_owner_cache,
+    reset_gt_info_cycle_stats, gt_info_cycle_stats,
 )
 from filter import free_kill, trade_kill, chain_kill, soft_kill
 from fomo_api import FomoAuthError
@@ -119,6 +120,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     
     # Clear Solana owner cache at start of each cycle
     _clear_sol_owner_cache()
+    reset_gt_info_cycle_stats()
     
     # Item #13: Prune old EVM holder cache entries
     try:
@@ -142,6 +144,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     stats = {"seen": 0, "benched": 0, "free": {}, "trade": {},
              "chain": {}, "soft": {}, "judged": 0, "tokens": [], "requeued": 0,
              "gt_universe": 0, "gt_dossier_attempts": 0, "gt_dossier_ok": 0, "gt_retry": 0,
+             "gt_cache_hits": 0, "gt_cache_misses": 0,
              "free_passed": 0, "dossiered": 0}
     survivors = []
     dex_slots = DEX_BUDGET
@@ -438,9 +441,7 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
         try:
             d = None
             try:
-                stats["gt_dossier_attempts"] += 1  # F7: count attempts including 429s
                 d = dossier(t, limiter=gt_limiter)
-                stats["gt_dossier_ok"] += 1
                 stats["dossiered"] += 1
             except DossierDeadlineExceeded as e:
                 # F5: wait would cross deadline — carry this and later free-passers
@@ -468,10 +469,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                             _sleep(wait_needed)
                             
                             try:
-                                stats["gt_dossier_attempts"] += 1
                                 stats["gt_retry"] += 1
                                 d = dossier(t, limiter=gt_limiter)
-                                stats["gt_dossier_ok"] += 1
                                 stats["dossiered"] += 1
                                 log.info("young token %s dossier succeeded on in-cycle retry after %.1fs wait", 
                                          t["ticker"], wait_needed)
@@ -510,10 +509,8 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
                         log.info("young token %s (age %.1fm) retrying dossier (no backoff)", 
                                  t["ticker"], t.get("age_minutes", 0))
                         try:
-                            stats["gt_dossier_attempts"] += 1
                             stats["gt_retry"] += 1
                             d = dossier(t, limiter=gt_limiter)
-                            stats["gt_dossier_ok"] += 1
                             stats["dossiered"] += 1
                             log.info("young token %s dossier succeeded on immediate retry", t["ticker"])
                         except DossierDeadlineExceeded:
@@ -680,6 +677,11 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     
     # Count universe GT calls (from limiter's universe budget usage)
     stats["gt_universe"] = gt_limiter.universe_calls_used
+    info_stats = gt_info_cycle_stats()
+    stats["gt_dossier_attempts"] = info_stats["attempts"]
+    stats["gt_dossier_ok"] = info_stats["ok"]
+    stats["gt_cache_hits"] = info_stats["hits"]
+    stats["gt_cache_misses"] = info_stats["misses"]
     
     # Get carried count
     unevaluated_count = len(book.get_carry())
@@ -692,9 +694,10 @@ def run_once(fomo, judge, desk, bank, shadow=True, gt_dossier_reserve=GT_DOSSIER
     log.info("cycle summary: seen=%d benched=%d free_passed=%d dossiered=%d judged=%d requeued=%d carried=%d",
              stats["seen"], stats["benched"], stats["free_passed"], 
              stats["dossiered"], stats["judged"], stats["requeued"], unevaluated_count)
-    log.info("cycle GT calls: universe=%d dossier_attempts=%d dossier_ok=%d retry=%d 429s=%d wait_time=%.1fs",
+    log.info("cycle GT calls: universe=%d dossier_attempts=%d dossier_ok=%d retry=%d 429s=%d wait_time=%.1fs cache_hits=%d cache_misses=%d",
              stats["gt_universe"], stats["gt_dossier_attempts"], stats["gt_dossier_ok"], stats["gt_retry"],
-             gt_limiter.stats_429_count, gt_limiter.stats_wait_time)
+             gt_limiter.stats_429_count, gt_limiter.stats_wait_time,
+             stats["gt_cache_hits"], stats["gt_cache_misses"])
     log.info("cycle duration: %.1fs / %.1fs budget", cycle_duration, cycle_time_budget)
     stats["unevaluated"] = unevaluated_count
     raw_429 = getattr(gt_limiter, "stats_429_count", None)
