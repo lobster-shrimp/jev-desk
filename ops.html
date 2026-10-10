@@ -573,6 +573,19 @@ tr:hover td { background: #151515; }
   font-size: 11px;
 }
 .trend-flag.notable { color: #ef5350; font-weight: 600; }
+.regime-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  margin: 0 4px 4px 0;
+  border-radius: 3px;
+  background: #1a1a1a;
+  color: #90caf9;
+  font-size: 12px;
+}
+.regime-chip.risk_on { color: #66bb6a; }
+.regime-chip.risk_off { color: #ef5350; }
+.regime-chip.long_flush { color: #ffa726; }
+.regime-chip.neutral { color: #bdbdbd; }
 .solana-box {
   background: #0a0a0a;
   padding: 12px;
@@ -611,6 +624,8 @@ tr:hover td { background: #151515; }
   <div class="solana-box" id="briefing-solana"></div>
   <div class="section-title">Kill reasons (24h)</div>
   <div id="briefing-kills" class="histogram"></div>
+  <div class="section-title">Market regime (log-only)</div>
+  <div id="briefing-regime"></div>
   <div class="section-title">Momentum (judged + soft)</div>
   <div id="briefing-momentum"></div>
   <div class="section-title">Passed judge/picks (24h)</div>
@@ -1837,6 +1852,25 @@ function renderBriefing(data) {
   const momLine = momNames.length
     ? momNames.map(n => `${esc(n)} ${Number(momBy[n]).toFixed(3)}`).join(', ')
     : '—';
+  const rg = w.regime || {};
+  const latest = rg.latest || {};
+  const metrics = latest.metrics || {};
+  const agg = metrics.aggregates || {};
+  const tag = rg.tag || latest.regime || '—';
+  document.getElementById('briefing-regime').innerHTML = `<div class="pnl-grid">
+      <div class="pnl-stat"><div class="pnl-label">Tag</div>
+        <div class="pnl-value"><span class="regime-chip ${esc(tag)}">${esc(tag)}</span></div></div>
+      <div class="pnl-stat"><div class="pnl-label">Majors funding</div>
+        <div class="pnl-value">${agg.majors_funding_median == null ? '—' : Number(agg.majors_funding_median).toFixed(3)}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Meme funding</div>
+        <div class="pnl-value">${agg.memes_funding_median == null ? '—' : Number(agg.memes_funding_median).toFixed(3)}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">OI change</div>
+        <div class="pnl-value">${agg.oi_change_median == null ? '—' : Number(agg.oi_change_median).toFixed(3)}</div></div>
+      <div class="pnl-stat"><div class="pnl-label">Long-liq share</div>
+        <div class="pnl-value">${agg.long_liq_share == null ? '—' : Number(agg.long_liq_share).toFixed(2)}</div></div>
+    </div>
+    <div class="shadow-disclaimer">Log-only. Does not affect filtering or judging. ${esc(metrics.reason || 'No Coinalyze snapshot in this window.')}</div>`;
+
   document.getElementById('briefing-momentum').innerHTML = `<div class="pnl-grid">
       <div class="pnl-stat"><div class="pnl-label">Median (judged+soft)</div>
         <div class="pnl-value">${w.median_momentum == null ? '—' : Number(w.median_momentum).toFixed(3)}</div></div>
@@ -1908,7 +1942,9 @@ function renderTrends(trends) {
     chartsDiv.innerHTML = '<div class="empty">Not enough daily history for charts</div>';
     return;
   }
-  chartsDiv.innerHTML = series.map(([label, pick]) => {
+  const regimeRow = `<div class="trend-row" id="trends-regime"><div class="trend-label">regime / day</div>
+    <div>${days.map(d => `<span class="regime-chip ${esc(d.regime || 'neutral')}">${esc(d.date)} ${esc(d.regime || '—')}</span>`).join('')}</div></div>`;
+  chartsDiv.innerHTML = regimeRow + series.map(([label, pick]) => {
     const vals = days.map(pick).map(v => v == null ? 0 : Number(v));
     const max = Math.max(1, ...vals);
     const bars = days.map((d, i) => {

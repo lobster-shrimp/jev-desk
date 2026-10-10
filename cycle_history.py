@@ -86,6 +86,11 @@ def reset() -> None:
             pass
     _conn = None
     _conn_path = None
+    try:
+        import coinalyze
+        coinalyze.reset(hooks=False)
+    except Exception:
+        pass
 
 
 def _connect() -> sqlite3.Connection:
@@ -178,6 +183,26 @@ def _init_schema(db: sqlite3.Connection) -> None:
       generated_at_iso TEXT NOT NULL,
       markdown TEXT NOT NULL,
       payload_json TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS market_regimes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cycle_id INTEGER,
+      ts REAL NOT NULL,
+      ts_iso TEXT NOT NULL,
+      regime TEXT NOT NULL,
+      metrics_json TEXT NOT NULL,
+      symbols_json TEXT NOT NULL,
+      FOREIGN KEY (cycle_id) REFERENCES cycles(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_regimes_ts ON market_regimes(ts);
+    CREATE INDEX IF NOT EXISTS idx_regimes_cycle ON market_regimes(cycle_id);
+
+    CREATE TABLE IF NOT EXISTS coinalyze_symbol_cache (
+      ticker TEXT PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      exchange TEXT,
+      resolved_at REAL NOT NULL
     );
     """)
     cols = {row[1] for row in db.execute("PRAGMA table_info(cycles)")}
@@ -476,6 +501,10 @@ def on_cycle(stats: dict, *, shadow: bool = True, now: float | None = None,
     _pending_soft.clear()
     if source != "backfill":
         try:
+            _store_regime(cycle_id, now)
+        except Exception as e:
+            log.info("coinalyze: skipped (%s)", safe_err(e))
+        try:
             maybe_persist_briefing(now=now, localtime=localtime)
         except Exception as e:
             log.warning("morning briefing failed: %s", safe_err(e))
@@ -519,6 +548,109 @@ def _insert_token(db: sqlite3.Connection, cycle_id: int, row: dict) -> None:
             _json(scores),
         ),
     )
+
+
+def _load_symbol_cache() -> dict:
+    out = {}
+    try:
+        for r in _connect().execute(
+            "SELECT ticker, symbol, exchange, resolved_at FROM coinalyze_symbol_cache"
+        ):
+            out[r["ticker"]] = {
+                "symbol": r["symbol"],
+                "exchange": r["exchange"],
+                "resolved_at": r["resolved_at"],
+            }
+    except Exception:
+        return {}
+    return out
+
+
+def _save_symbol_cache(cache: dict) -> None:
+    if not cache:
+        return
+    try:
+        db = _connect()
+        for ticker, row in cache.items():
+            if not isinstance(row, dict) or not row.get("symbol"):
+                continue
+            db.execute(
+                """INSERT OR REPLACE INTO coinalyze_symbol_cache
+                   (ticker, symbol, exchange, resolved_at) VALUES (?,?,?,?)""",
+                (
+                    str(ticker), str(row["symbol"]), row.get("exchange"),
+                    float(row.get("resolved_at") or time.time()),
+                ),
+            )
+        db.commit()
+    except Exception as e:
+        log.info("coinalyze: skipped (%s)", safe_err(e))
+
+
+def _store_regime(cycle_id: int, now: float) -> None:
+    """LOG-ONLY. Capture and persist a Coinalyze snapshot. Never raises out."""
+    import coinalyze
+    snap = coinalyze.maybe_capture(now=now, cache=_load_symbol_cache())
+    if not snap:
+        return
+    try:
+        _save_symbol_cache(snap.get("symbols") or {})
+        db = _connect()
+        db.execute(
+            """INSERT INTO market_regimes (
+                 cycle_id, ts, ts_iso, regime, metrics_json, symbols_json
+               ) VALUES (?,?,?,?,?,?)""",
+            (
+                cycle_id, float(snap.get("ts") or now), _iso(float(snap.get("ts") or now)),
+                snap.get("regime") or "neutral",
+                _json(snap.get("metrics") or {}),
+                _json(snap.get("symbols") or {}),
+            ),
+        )
+        db.commit()
+    except Exception as e:
+        log.info("coinalyze: skipped (%s)", safe_err(e))
+
+
+def _regime_dict(r: sqlite3.Row) -> dict:
+    return {
+        "id": r["id"],
+        "cycle_id": r["cycle_id"],
+        "ts": r["ts"],
+        "ts_iso": r["ts_iso"],
+        "regime": r["regime"],
+        "metrics": _loads(r["metrics_json"]),
+        "symbols": _loads(r["symbols_json"]),
+    }
+
+
+def _regimes_since(since_ts: float, until_ts: float | None = None) -> list[dict]:
+    try:
+        if until_ts is None:
+            rows = _rows("SELECT * FROM market_regimes WHERE ts >= ? ORDER BY ts", (since_ts,))
+        else:
+            rows = _rows(
+                "SELECT * FROM market_regimes WHERE ts >= ? AND ts <= ? ORDER BY ts",
+                (since_ts, until_ts),
+            )
+        return [_regime_dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _regime_window(since_ts: float, until_ts: float) -> dict:
+    rows = _regimes_since(since_ts, until_ts)
+    counts: dict[str, int] = {}
+    for row in rows:
+        tag = row.get("regime") or "neutral"
+        counts[tag] = counts.get(tag, 0) + 1
+    latest = rows[-1] if rows else None
+    return {
+        "latest": latest,
+        "tag": None if latest is None else latest.get("regime"),
+        "counts": counts,
+        "n": len(rows),
+    }
 
 
 def _rows(sql: str, params=()) -> list[sqlite3.Row]:
@@ -843,6 +975,7 @@ def summarize_window(since_ts: float, now: float, *, localtime: Callable | None 
         "solana": per_chain["solana"],
         "uptime": uptime,
         "shadow": _shadow_window(since_ts, now),
+        "regime": _regime_window(since_ts, now),
     }
 
 
@@ -885,6 +1018,8 @@ def daily_aggregates(dates: Iterable[str], *, localtime: Callable | None = None)
             "gt_429": window["gt_429"],
             "chain_share": window["per_chain"]["judged_share"],
             "seen": window["seen"],
+            "regime": (window.get("regime") or {}).get("tag"),
+            "regime_counts": (window.get("regime") or {}).get("counts") or {},
         })
     return out
 
@@ -1009,6 +1144,52 @@ def build_trends(today_window: dict, today: str, *, localtime: Callable | None =
     }
 
 
+def _fmt_signed(value, digits=3) -> str:
+    if value is None:
+        return "—"
+    return f"{float(value):+.{digits}f}"
+
+
+def _render_regime_md(bundle: dict) -> list[str]:
+    latest = (bundle or {}).get("latest") or {}
+    tag = (bundle or {}).get("tag") or latest.get("regime") or "—"
+    metrics = latest.get("metrics") or {}
+    agg = metrics.get("aggregates") or {}
+    assets = metrics.get("assets") or {}
+    lines = [
+        f"- Tag: {tag}",
+        f"- Rules: {metrics.get('rules') or 'see coinalyze.REGIME_RULES'}",
+        "- This does not affect filtering or judging.",
+    ]
+    if latest.get("ts_iso") or metrics.get("reason"):
+        when = latest.get("ts_iso") or "—"
+        reason = metrics.get("reason") or latest.get("reason") or ""
+        extra = f" ({reason})" if reason else ""
+        lines.append(f"- Latest capture: {when}{extra}")
+    if agg:
+        lines.append(
+            f"- Majors funding median: {_fmt_signed(agg.get('majors_funding_median'))} · "
+            f"meme funding median: {_fmt_signed(agg.get('memes_funding_median'))}"
+        )
+        lines.append(
+            f"- OI change median: {_fmt_signed(agg.get('oi_change_median'))} · "
+            f"long/short median: {_fmt_signed(agg.get('ls_ratio_median'))} · "
+            f"long-liq share: {_fmt_signed(agg.get('long_liq_share'))}"
+        )
+    if assets:
+        parts = []
+        for name in sorted(assets):
+            a = assets[name] or {}
+            parts.append(
+                f"{name} fr={_fmt_signed(a.get('funding'))} "
+                f"oi={_fmt_signed(a.get('oi_change_pct'))}"
+            )
+        lines.append("- Perps: " + "; ".join(parts))
+    if not latest:
+        lines.append("- No Coinalyze snapshot in this window.")
+    return lines
+
+
 def render_briefing_md(payload: dict) -> str:
     w = payload.get("last_24h") or {}
     up = w.get("uptime") or {}
@@ -1116,6 +1297,11 @@ def render_briefing_md(payload: dict) -> str:
         f"({sh.get('closed_trades', 0)} closed, {sh.get('winning_trades', 0)}W/{sh.get('losing_trades', 0)}L)",
         f"- Open positions: {sh.get('open_positions', 0)}",
         "",
+        "## Market regime (log-only)",
+    ]
+    lines.extend(_render_regime_md(w.get("regime") or {}))
+    lines += [
+        "",
         "## Trends vs prior 7 days",
     ]
     trends = payload.get("trends") or {}
@@ -1148,6 +1334,11 @@ def render_briefing_md(payload: dict) -> str:
                     f"- {f['metric']}: {f.get('current')} vs {f.get('baseline')} "
                     f"({delta:+.3f})"
                 )
+    days = trends.get("days") or []
+    if days:
+        lines.append("- Regime per day: " + ", ".join(
+            f"{d.get('date', '—')}={d.get('regime') or '—'}" for d in days
+        ))
     lines.append("")
     return "\n".join(lines)
 
